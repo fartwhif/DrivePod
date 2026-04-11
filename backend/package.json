@@ -1,5 +1,5 @@
 {
-  "name": "yt-audio-queue-backend",
+  "name": "drivepod-backend",
   "version": "1.0.0",
   "scripts": {
     "start": "ts-node src/server.ts",
