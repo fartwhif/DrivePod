@@ -57,7 +57,7 @@ interface HarvestStatus {
   styleUrls: []
 })
 export class AppComponent implements OnInit, OnDestroy {
-  apiUrl = 'http://192.168.0.42:3000/api';
+  apiUrl = '/api';
   channels = signal<any[]>([]);
   playlist = signal<Video[]>([]);
   currentVideo = signal<Video | null>(null);
@@ -180,7 +180,7 @@ export class AppComponent implements OnInit, OnDestroy {
     this.currentVideo.set(video);
     this.updatePageTitle(video);
     const monoStr = this.preferredMono() ? '-mono' : '';
-    this.audio.src = `http://192.168.0.42:3000/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
+    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
     this.audio.load();
     this.audio.currentTime = video.progress || 0;
   }
