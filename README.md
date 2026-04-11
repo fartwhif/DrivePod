@@ -30,10 +30,14 @@ Full configuration panel including bitrate, mono toggle, harvest window, User-Ag
 *Channel management with ↑↑ ↑ ↓ ↓↓ priority controls and cookie upload*
 
 ### Import Tab
-Bulk import of channel IDs with instant results feedback.
+Bulk import of channel IDs with instant results feedback.  
 
 ![Import Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/import-tab.png?raw=true)  
 *Paste channel IDs → instant add/skip/failed results*
+
+### Obtaining a Channel ID
+the ID is the key to wiring up your DrivePod.  The manual way to obtain someone's channel ID is via their channel page.  I've created a helpful tampermonkey script for exporting the entire list in one shot: To obtain all of your subscribed-to Channel IDs in one go, use this [helper script](https://greasyfork.org/en/scripts/573430-youtube-subscription-channel-id-harvester).  If you're unfamiliar with tampermonkey that's OK, you can still use the settings or import tab to "subscribe" to individual channels one at a time.
+![Import Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/channel-id.png?raw=true)  
 
 ---
 
