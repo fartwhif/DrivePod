@@ -20,7 +20,7 @@ The main playlist view with thumbnails, channel info, publish dates, and one-tap
 ### Harvest Tab
 Live monitoring of the background harvesting process with concurrent channel progress.
 
-![Harvest Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/harvest-tab.png?raw=true)  
+![Harvest Tab](https://raw.githubusercontent.com/fartwhif/DrivePod/refs/heads/main/screenshots/harvest-tab.png?raw=true)  
 *Real-time "LIVE" status, currently processing items, and run statistics*
 
 ### Settings Tab
