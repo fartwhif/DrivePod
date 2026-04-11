@@ -15,9 +15,9 @@ const execPromise = promisify(exec);
 
 const app = express();
 const port = 3000;
-const CACHE_DIR = '/var/www/cache';
+const CACHE_DIR = process.env.CACHE_DIR || '/var/www/cache';
 const RSS_CACHE_DIR = path.join(CACHE_DIR, 'rss');
-const DATA_DIR = path.join(__dirname, '../../data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '../../data');
 const TEMP_COOKIES_FILE = path.join(DATA_DIR, 'cookies.txt');
 
 const prisma = new PrismaClient();
@@ -332,7 +332,7 @@ async function scrapeTab(channelId: string, tab: string, maxDays: number): Promi
   try {
     const { stdout } = await execPromise(
       `yt-dlp --flat-playlist --print "%(id)s|%(title)s|%(upload_date)s" ` +
-      `--dateafter today-${maxDays}d --ignore-errors "${url}"`
+      `--dateafter today-${maxDays}d --ignore-errors "${url}"`, { maxBuffer: 50 * 1024 * 1024 }
     );
     return stdout.trim().split('\n')
       .filter(l => l.trim())
@@ -402,7 +402,7 @@ async function downloadAndProcessVideo(
       `--js-runtimes node --remote-components ejs:github ` +
       `--user-agent "${userAgent}" ` +
       cookieFlag +
-      `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`
+      `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`, { maxBuffer: 50 * 1024 * 1024 }
     );
 
     let raw = path.join(videoDir, `${videoId}.webm`);
@@ -417,7 +417,7 @@ async function downloadAndProcessVideo(
     const args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '0', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
 
-    await execPromise(`ffmpeg ${args.join(' ')}`);
+    await execPromise(`ffmpeg ${args.join(' ')}`, { maxBuffer: 50 * 1024 * 1024 });
     if (fs.existsSync(raw)) fs.unlinkSync(raw);
 
     success = true;
@@ -459,7 +459,7 @@ async function downloadAndProcessVideo(
 
 async function getAudioDuration(filePath: string): Promise<number | null> {
   try {
-    const { stdout } = await execPromise(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`);
+    const { stdout } = await execPromise(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, { maxBuffer: 50 * 1024 * 1024 });
     const d = parseFloat(stdout.trim());
     return isNaN(d) ? null : Math.round(d * 10) / 10;
   } catch {
@@ -828,7 +828,6 @@ harvestAndPurge();
 
 app.listen(port, () => {
   console.log(`🚀 DrivePod Backend ready on http://localhost:${port}`);
-  console.log(`   • Configurable User-Agent`);
-  console.log(`   • Smart temporary cookies with auto-expiry clearing`);
-  console.log(`   • Clean live/premiere/age-gated skipping`);
+  console.log(`   Cache: ` + CACHE_DIR);
+  console.log(`   Data:  ` + DATA_DIR);
 });

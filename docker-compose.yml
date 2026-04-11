@@ -1,0 +1,13 @@
+services:
+  drivepod:
+    build: .
+    container_name: drivepod
+    restart: unless-stopped
+    ports:
+      - "8080:80"          # change 8080 to whatever port you want on the host
+    volumes:
+      - ./data:/app/data          # SQLite DB + any cookies
+      - ./cache:/var/www/cache    # all MP3s + thumbnails (this is your media cache)
+    environment:
+      - NODE_ENV=production
+      # Add any other env vars your backend reads (if you have any)
