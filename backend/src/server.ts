@@ -189,43 +189,49 @@ async function backfillChannelOrders() {
   console.log(`✅ Channel order backfill complete`);
 }
 
-// === ROBUST CHANNEL TITLE FETCHING ===
-async function getChannelTitle(channelId: string): Promise<string> {
+// === HELPER: Channel title extraction (DRY) ===
+function extractChannelTitle(parsed: any): string {
+  return (
+    parsed.title?.trim() ||
+    parsed.author?.name?.trim() ||
+    parsed.feed?.title?.trim() ||
+    parsed.feed?.['title']?.trim() ||
+    'Unknown Channel'
+  );
+}
+
+// === ROBUST CHANNEL TITLE FETCHING (with preferCache option) ===
+async function getChannelTitle(channelId: string, preferCache: boolean = false): Promise<string> {
   const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
   const cacheFile = path.join(RSS_CACHE_DIR, `${channelId}.xml`);
 
-  console.log(`🔍 [getChannelTitle] Fetching title for ${channelId}`);
+  console.log(`🔍 [getChannelTitle] Fetching title for ${channelId}${preferCache ? ' (preferCache=true → skipping live RSS)' : ''}`);
 
-  try {
-    const xml = await fetchRssRaw(rssUrl, channelId);
-    fs.writeFileSync(cacheFile, xml);
+  // Only attempt live RSS if we haven't been told it's unreliable
+  if (!preferCache) {
+    try {
+      const xml = await fetchRssRaw(rssUrl, channelId);
+      fs.writeFileSync(cacheFile, xml); // refresh cache while we have fresh data
 
-    const parsed = await parser.parseString(xml);
-    
-    const title = 
-      parsed.title?.trim() ||
-      parsed.author?.name?.trim() ||
-      parsed.feed?.title?.trim() ||
-      parsed.feed?.['title']?.trim() ||
-      'Unknown Channel';
+      const parsed = await parser.parseString(xml);
+      const title = extractChannelTitle(parsed);
 
-    console.log(`✅ [getChannelTitle] SUCCESS → "${title}" for ${channelId}`);
-    return title;
-  } catch (err: any) {
-    console.warn(`⚠️ [getChannelTitle] Live RSS failed for ${channelId}: ${err.message}`);
+      console.log(`✅ [getChannelTitle] LIVE SUCCESS → "${title}" for ${channelId}`);
+      return title;
+    } catch (err: any) {
+      console.warn(`⚠️ [getChannelTitle] Live RSS failed for ${channelId}: ${err.message}`);
+    }
+  } else {
+    console.log(`🔄 [getChannelTitle] Skipping live RSS (preferCache=true) for ${channelId}`);
   }
 
+  // === CACHE FALLBACK (always available when live fails or was skipped) ===
   if (fs.existsSync(cacheFile)) {
     try {
       const xml = fs.readFileSync(cacheFile, 'utf-8');
       const parsed = await parser.parseString(xml);
-      const title = 
-        parsed.title?.trim() ||
-        parsed.author?.name?.trim() ||
-        parsed.feed?.title?.trim() ||
-        parsed.feed?.['title']?.trim() ||
-        'Unknown Channel';
-      console.log(`✅ [getChannelTitle] Used cached title → "${title}" for ${channelId}`);
+      const title = extractChannelTitle(parsed);
+      console.log(`✅ [getChannelTitle] Used cached title → "${title}" for ${channelId} (age: ${getFileAge(cacheFile)})`);
       return title;
     } catch {}
   }
@@ -279,7 +285,8 @@ async function getRssFeedWithCache(channelId: string): Promise<{items: any[], ch
   try {
     console.log(`🔧 [${timestamp}] Alternative method started for ${channelId}`);
     const items = await getLatestVideosAlternative(channelId, maxDays);
-    const channelTitle = await getChannelTitle(channelId);
+    // We already know live RSS is down (that's why we're here), so force cache
+    const channelTitle = await getChannelTitle(channelId, true);
     return { items, channelTitle };
   } catch {
     console.warn(`⚠️ Alternative method failed → falling back to cached RSS`);
