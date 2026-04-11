@@ -1,0 +1,30 @@
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        root /var/www/drivepod;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /cache/ {
+        alias /var/www/cache/;
+        add_header Cross-Origin-Resource-Policy "cross-origin" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        types {
+            image/jpeg  jpg jpeg;
+            image/png   png;
+            image/webp  webp;
+            image/gif   gif;
+        }
+        default_type image/jpeg;
+    }
+}
