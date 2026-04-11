@@ -1,4 +1,3 @@
-```markdown
 # 🚙📻 DrivePod
 
 **Self-hosted YouTube-to-Audio Podcast Player • Built for the Road**
@@ -291,4 +290,3 @@ MIT License — feel free to fork, modify, and self-host!
 **Made with ❤️ for road warriors, podcast addicts, and YouTube hoarders.**
 
 Star ⭐ the repo if you love it — and share your setup!
-```
