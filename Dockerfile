@@ -6,55 +6,48 @@ RUN npm ci
 COPY frontend/ .
 RUN npm run build --configuration=production
 
-# Stage 2: Runtime image
+# Stage 2: Runtime
 FROM node:20-bookworm-slim AS runtime
-# Install system dependencies + nginx
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    curl \
-    nginx \
+    ffmpeg curl nginx \
     && rm -rf /var/lib/apt/lists/*
 
-# Install latest yt-dlp (static binary, exactly like your README)
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
     && chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
-# Backend
+# 1. Copy only package files first (for caching)
 COPY backend/package*.json ./backend/
+
+# 2. Install dependencies
 RUN cd backend && npm ci
 
-# Copy built frontend to the exact path your nginx config expects
-COPY --from=frontend-builder /app/frontend/dist/drivepod/browser /var/www/drivepod
-
-# Copy backend source + your existing nginx config
+# 3. Now copy the FULL backend source (tsconfig + src + prisma etc.)
 COPY backend/ ./backend/
+
+# 4. Build TypeScript to JavaScript
+RUN cd backend && npm run build
+
+# Copy built frontend
+COPY --from=frontend-builder /app/frontend/dist/frontend/browser /var/www/drivepod
+
+# Copy nginx config
 COPY drivepod-ngnix /etc/nginx/sites-available/drivepod
 
-# Create required directories (matching your current paths)
+# Create directories and permissions
 RUN mkdir -p /app/data /var/www/cache \
     && chown -R www-data:www-data /var/www/drivepod /var/www/cache /app/data
 
-# Enable your nginx site
+# Enable nginx site
 RUN ln -s /etc/nginx/sites-available/drivepod /etc/nginx/sites-enabled/ \
     && rm -f /etc/nginx/sites-enabled/default
 
-# Prisma setup
+# Generate Prisma client
 RUN cd backend && npx prisma generate
 
-# Expose only the web port
-EXPOSE 80
-
-# Simple entrypoint: start backend in background + nginx in foreground
-COPY <<EOF /app/entrypoint.sh
-#!/bin/bash
-cd /app/backend
-npx prisma db push --accept-data-loss  # safe on first run; SQLite is fast
-node --loader ts-node/esm src/server.ts &   # or node dist/server.js if you prefer building TS
-nginx -g 'daemon off;'
-EOF
-
+# Copy entrypoint
+COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-CMD ["/app/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
