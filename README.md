@@ -14,25 +14,25 @@ No ads. Barely sip data - listen while your phone data is throttled without buff
 ### Queue Tab
 The main playlist view with thumbnails, channel info, publish dates, and one-tap playback.
 
-![Queue Tab](https://via.placeholder.com/1200x700/18181b/22c55e?text=DrivePod+-+Queue+Tab)  
+![Queue Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/queue-tab.png?raw=true)  
 *Clean queue with currently playing indicator and direct YouTube links*
 
 ### Harvest Tab
 Live monitoring of the background harvesting process with concurrent channel progress.
 
-![Harvest Tab](https://via.placeholder.com/1200x700/18181b/10b981?text=DrivePod+-+Harvest+Tab)  
+![Harvest Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/harvest-tab.png?raw=true)  
 *Real-time "LIVE" status, currently processing items, and run statistics*
 
 ### Settings Tab
 Full configuration panel including bitrate, mono toggle, harvest window, User-Agent, cookies, and channel priority reordering.
 
-![Settings Tab](https://via.placeholder.com/1200x700/18181b/3b82f6?text=DrivePod+-+Settings+Tab)  
+![Settings Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/settings-tab.png?raw=true)  
 *Channel management with ↑↑ ↑ ↓ ↓↓ priority controls and cookie upload*
 
 ### Import Tab
 Bulk import of channel IDs with instant results feedback.
 
-![Import Tab](https://via.placeholder.com/1200x700/18181b/10b981?text=DrivePod+-+Import+Tab)  
+![Import Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/import-tab.png?raw=true)  
 *Paste channel IDs → instant add/skip/failed results*
 
 ---
@@ -144,6 +144,7 @@ pm2 startup                  # Follow the printed instructions for boot autostar
 pm2 status
 pm2 logs drivepod-backend
 pm2 restart drivepod-backend
+pm2 stop drivepod-backend
 ```
 
 ### 3. Nginx Configuration
@@ -219,17 +220,17 @@ All settings are stored in the database and editable in the **Settings** tab:
 ```
 drivepod/
 ├── backend/
-│   ├── server.ts
-│   ├── ecosystem.config.js
-│   ├── prisma/schema.prisma
+│   ├── ... (Node.js boilerplate)
+│   ├── ecosystem.config.js     ← PM2 configuration
+│   ├── src/server.ts           ← Harvesting daemon and API server
+│   ├── prisma/schema.prisma    ← Database schema
 ├── frontend/
 │   └── ... (Angular source)
 ├── deploy-frontend.sh          ← Production frontend deploy script
 ├── LICENSE                     ← MIT license
 ├── README.md                   ← This file
 ├── drivepod-ngnix              ← Nginx config (copy to /etc/nginx/sites-available/)
-├── cache/                      ← MP3s + thumbnails (served by Nginx)
-├── screenshots/                ← Example screenshots for readme.md
+├── screenshots/                ← Example screenshots for README.md
 └── data/
     └── database.db             ← Created by `npx prisma db push`
 ```
