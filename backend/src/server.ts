@@ -451,7 +451,7 @@ async function downloadAndProcessVideo(
   preferredMono: boolean,
   onStatusChange?: (status: string) => void
 ) {
-  const { videoId, title: videoTitle, author = 'Unknown' } = videoInfo;
+  const { videoId, title: videoTitle, author = 'Unknown', publishedAt } = videoInfo;
   const videoDir = path.join(CACHE_DIR, videoId);
   const mp3 = path.join(videoDir, `${videoId}.mp3`);
 
@@ -495,11 +495,19 @@ async function downloadAndProcessVideo(
  
     const safeTitle = videoTitle.replace(/"/g, '\\"');
     const safeAuthor = author.replace(/"/g, '\\"');
+    const dateStr = publishedAt instanceof Date
+      ? publishedAt.toISOString().split('T')[0]
+      : new Date().toISOString().split('T')[0];
+    const dateStr2 = publishedAt instanceof Date
+      ? publishedAt.toISOString()
+      : new Date().toISOString();
+    const commentData = { ...videoInfo, publishedAt: dateStr2 };
+    const safeComment = JSON.stringify(commentData).replace(/"/g, '\\"').replace(/[\r\n]/g, ' ');
     let args: string[];
     if (thumbPath) {
-      args = ['-i', raw, '-i', thumbPath, '-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic', '-id3v2_version', '3', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+      args = ['-i', raw, '-i', thumbPath, '-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic', '-id3v2_version', '3', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-metadata', `date="${dateStr}"`, '-metadata', `comment="${safeComment}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     } else {
-      args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+      args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-metadata', `date="${dateStr}"`, '-metadata', `comment="${safeComment}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     }
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
  
