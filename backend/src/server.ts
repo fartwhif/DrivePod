@@ -320,14 +320,15 @@ function cleanRssItems(items: any[]): any[] {
       const match = item.id.match(/yt:video:(.+)/);
       if (match) videoId = match[1];
     }
-
-    let pubDate = item.pubDate || item.published || item.updated || null;
-    if (pubDate) pubDate = new Date(pubDate);
-
+ 
+    let pubDateRaw = item.pubDate || item.published || item.updated || null;
+    let pubDate = pubDateRaw ? new Date(pubDateRaw) : new Date();
+    if (isNaN(pubDate.getTime())) pubDate = new Date();
+ 
     return {
       ...item,
       videoId,
-      pubDate: pubDate || new Date(),
+      pubDate,
       title: item.title || 'Untitled',
       link: item.link || `https://www.youtube.com/watch?v=${videoId}`
     };
@@ -337,21 +338,33 @@ function cleanRssItems(items: any[]): any[] {
 async function scrapeTab(channelId: string, tab: string, maxDays: number): Promise<any[]> {
   const url = `https://www.youtube.com/channel/${channelId}/${tab}`;
   try {
+    const date = new Date();
+    date.setDate(date.getDate() - maxDays);
+    const dateStr = date.toISOString().split('T')[0].replace(/-/g, '');
+
+    const cmd = `yt-dlp --break-on-reject --extractor-args "youtubetab:approximate_date" --no-progress --dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
+    // console.log(`🛠️ [yt-dlp] ${cmd}`);
     const { stdout } = await execPromise(
-      `yt-dlp --flat-playlist --print "%(id)s|%(title)s|%(upload_date)s" ` +
-      `--dateafter today-${maxDays}d --ignore-errors "${url}"`, { maxBuffer: 50 * 1024 * 1024 }
+      cmd, { maxBuffer: 50 * 1024 * 1024 }
     );
     return stdout.trim().split('\n')
       .filter(l => l.trim())
       .map(line => {
-        const [videoId, title, uploadDate] = line.split('|');
-        return {
-          videoId,
-          title: title || 'Untitled',
-          pubDate: uploadDate ? new Date(uploadDate) : new Date(),
-          link: `https://www.youtube.com/watch?v=${videoId}`
-        };
-      });
+        try {
+          const json = JSON.parse(line);
+          return {
+            videoId: json.id,
+            title: json.title || 'Untitled',
+            pubDate: (typeof json.upload_date === 'string' && json.upload_date.length === 8) ? new Date(
+              `${json.upload_date.slice(0, 4)}-${json.upload_date.slice(4, 6)}-${json.upload_date.slice(6, 8)}`
+            ) : new Date(),
+            link: `https://www.youtube.com/watch?v=${json.id}`
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter(item => item !== null);
   } catch {
     return [];
   }
@@ -403,13 +416,15 @@ async function downloadAndProcessVideo(
       console.log(`🍪 Using cookies for ${videoId}`);
     }
 
-    await execPromise(
-      `yt-dlp -f bestaudio/best --write-thumbnail --no-overwrites --continue ` +
+    const downloadCmd = `yt-dlp --no-progress -f bestaudio/best --write-thumbnail --no-overwrites --continue ` +
       `--match-filter "live_status != is_live & live_status != is_upcoming" ` +
       `--js-runtimes node --remote-components ejs:github ` +
       `--user-agent "${userAgent}" ` +
       cookieFlag +
-      `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`, { maxBuffer: 50 * 1024 * 1024 }
+      `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`;
+    // console.log(`🛠️ [yt-dlp] ${downloadCmd}`);
+    await execPromise(
+      downloadCmd, { maxBuffer: 50 * 1024 * 1024 }
     );
 
     let raw = path.join(videoDir, `${videoId}.webm`);
@@ -420,11 +435,22 @@ async function downloadAndProcessVideo(
 
     if (onStatusChange) onStatusChange('Transcoding');
     console.log(`🎚️ Transcoding ${videoId}...`);
-
-    const args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '0', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+ 
+    const files = fs.readdirSync(videoDir);
+    const thumbFile = files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
+    const thumbPath = thumbFile ? path.join(videoDir, thumbFile) : null;
+ 
+    let args: string[];
+    if (thumbPath) {
+      args = ['-i', raw, '-i', thumbPath, '-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic', '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+    } else {
+      args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '0', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+    }
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
-
-    await execPromise(`ffmpeg ${args.join(' ')}`, { maxBuffer: 50 * 1024 * 1024 });
+ 
+    const ffmpegCmd = `ffmpeg ${args.join(' ')}`;
+    // console.log(`🛠️ [ffmpeg] ${ffmpegCmd}`);
+    await execPromise(ffmpegCmd, { maxBuffer: 50 * 1024 * 1024 });
     if (fs.existsSync(raw)) fs.unlinkSync(raw);
 
     success = true;
@@ -701,23 +727,23 @@ app.get('/api/channels', async (_, res) => {
 app.post('/api/channels', async (req, res) => {
   let { channelId, title } = req.body;
   const trimmedTitle = (title || '').toString().trim();
-
+ 
   if (!trimmedTitle || trimmedTitle === 'Unknown Channel') {
     console.log(`🔍 Auto-fetching channel title for ${channelId}`);
     title = await getChannelTitle(channelId);
   } else {
     title = trimmedTitle;
   }
-
+ 
   const maxOrder = await prisma.channel.aggregate({ _max: { order: true } });
   const nextOrder = (maxOrder._max.order ?? 0) + 1;
-
+ 
   const channel = await prisma.channel.upsert({
     where: { channelId },
     update: { title },
     create: { channelId, title, order: nextOrder }
   });
-
+ 
   res.json(channel);
 });
 
