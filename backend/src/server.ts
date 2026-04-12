@@ -145,13 +145,18 @@ async function cleanupCorruptedFolders() {
 
     const isEmpty = files.length === 0;
     const mp3Count = files.filter(f => f.endsWith('.mp3')).length;
-    const thumbCount = files.filter(f => /\.(webp|jpg|png)$/.test(f)).length;
-    const otherCount = files.length - mp3Count - thumbCount;
+    const thumbCount = files.filter(f => /\.(webp|jpg|png)$/i.test(f)).length;
+    const jsonCount = files.filter(f => f === `${videoId}.json`).length;
+    const otherCount = files.length - mp3Count - thumbCount - jsonCount;
 
-    let isCorrupted = isEmpty || mp3Count === 0 || mp3Count > 1 || otherCount > 0;
+    let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 1 || otherCount > 0;
 
     if (isCorrupted) {
-      const reason = isEmpty ? 'Empty folder' : (mp3Count === 0 ? 'No .mp3 file' : (mp3Count > 1 ? 'Multiple .mp3 files' : 'Unexpected files'));
+      let reason = isEmpty ? 'Empty folder' : 'Unknown';
+      if (mp3Count !== 1) reason = mp3Count === 0 ? 'No .mp3 file' : 'Multiple .mp3 files';
+      else if (jsonCount !== 1) reason = jsonCount === 0 ? 'No .json file' : 'Multiple .json files';
+      else if (thumbCount > 1) reason = 'Multiple thumbnails';
+      else if (otherCount > 0) reason = 'Unexpected files';
       console.log(`   🚨 CORRUPTED: ${videoId} → ${reason}`);
       try {
         fs.rmSync(folderPath, { recursive: true, force: true });
@@ -440,13 +445,13 @@ async function getLatestVideosAlternative(channelId: string, maxDays: number, in
 
 // === DOWNLOAD + TRANSCODE ===
 async function downloadAndProcessVideo(
-  videoId: string,
+  videoInfo: any,
   videoUrl: string,
-  channelTitle: string,
   preferredBitrate: number,
   preferredMono: boolean,
   onStatusChange?: (status: string) => void
 ) {
+  const { videoId, title: videoTitle, author = 'Unknown' } = videoInfo;
   const videoDir = path.join(CACHE_DIR, videoId);
   const mp3 = path.join(videoDir, `${videoId}.mp3`);
 
@@ -456,7 +461,7 @@ async function downloadAndProcessVideo(
   let success = false;
 
   try {
-    console.log(`📥 Starting download: ${videoId} (${channelTitle})`);
+    console.log(`📥 Starting download: ${videoId} (${author})`);
 
     const cookies = await getCookies();
     const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
@@ -482,17 +487,19 @@ async function downloadAndProcessVideo(
     if (!fs.existsSync(raw)) throw new Error('No audio file was downloaded');
 
     if (onStatusChange) onStatusChange('Transcoding');
-    console.log(`🎚️ Transcoding ${videoId}...`);
+    console.log(`🎚️ Transcoding ${videoId} (${videoTitle})...`);
  
     const files = fs.readdirSync(videoDir);
     const thumbFile = files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
     const thumbPath = thumbFile ? path.join(videoDir, thumbFile) : null;
  
+    const safeTitle = videoTitle.replace(/"/g, '\\"');
+    const safeAuthor = author.replace(/"/g, '\\"');
     let args: string[];
     if (thumbPath) {
-      args = ['-i', raw, '-i', thumbPath, '-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic', '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+      args = ['-i', raw, '-i', thumbPath, '-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic', '-id3v2_version', '3', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     } else {
-      args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '0', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+      args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     }
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
  
@@ -632,6 +639,14 @@ async function harvestAndPurge() {
               if (ageMs < 0) publishedAt = new Date();
               if (ageMs / (1000 * 60 * 60) > maxDays * 24) continue;
 
+              let videoInfo: any = {
+                videoId,
+                channelId: currentChannel.channelId,
+                title: item.title || 'Untitled',
+                author: currentChannel.title || 'Unknown Channel',
+                publishedAt,
+              };
+
               const activeItem = harvestStatus.activeItems.find(i => i.channelId === currentChannel.channelId);
               if (activeItem) {
                 activeItem.videoId = videoId;
@@ -641,9 +656,8 @@ async function harvestAndPurge() {
               }
 
               const success = await downloadAndProcessVideo(
-                videoId,
+                videoInfo,
                 item.link || `https://www.youtube.com/watch?v=${videoId}`,
-                currentChannel.title || 'Unknown',
                 preferredBitrate,
                 preferredMono,
                 (newStatus) => {
@@ -667,15 +681,20 @@ async function harvestAndPurge() {
 
                 const duration = await getAudioDuration(audioPath) || undefined;
 
-                newVideosToInsert.push({
-                  videoId,
-                  channelId: currentChannel.channelId,
-                  title: item.title || 'Untitled',
-                  publishedAt,
-                  thumbnailPath,
-                  audioPath,
-                  duration,
-                });
+                videoInfo.thumbnailPath = thumbnailPath;
+                videoInfo.audioPath = audioPath;
+                videoInfo.duration = duration;
+
+                const jsonPath = path.join(videoDir, `${videoId}.json`);
+                try {
+                  fs.writeFileSync(jsonPath, JSON.stringify(videoInfo, null, 2));
+                  console.log(`📄 Wrote ${videoId}.json with metadata`);
+                } catch (e) {
+                  console.error(`Failed to write ${videoId}.json`);
+                }
+
+                delete (videoInfo as any).author;
+                newVideosToInsert.push(videoInfo);
               }
             }
 
