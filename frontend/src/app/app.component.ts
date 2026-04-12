@@ -95,7 +95,9 @@ export class AppComponent implements OnInit, OnDestroy {
   editTitle = signal('');
 
   private defaultPageTitle = '🎧 YT Drive Audio Queue';
-  private progressInterval: any = null;
+  private lastProgressSave = 0;
+  private readonly PROGRESS_SAVE_INTERVAL = 10000; // 10 seconds (car-friendly)
+
   private harvestPollInterval: any = null;
 
   constructor(
@@ -113,15 +115,62 @@ export class AppComponent implements OnInit, OnDestroy {
     this.loadChannels();
     this.loadPlaylist();
     this.activeTab.set('queue');
-    this.audio.ontimeupdate = () => this.currentTime.set(this.audio.currentTime);
-    this.audio.onended = () => this.markAsWatchedAndPlayNext();
-    setInterval(() => this.loadPlaylist(), 30000);
+
+    // Live time for UI scrubber
+    this.audio.ontimeupdate = () => {
+      this.currentTime.set(this.audio.currentTime);
+      this.throttledSaveProgress();
+    };
+
+    this.setupProgressListeners();
     this.setupMediaSessionHandlers();
+
+    setInterval(() => this.loadPlaylist(), 30000);
   }
 
   ngOnDestroy() {
     this.stopHarvestPolling();
-    if (this.progressInterval) clearInterval(this.progressInterval);
+    window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
+  }
+
+  private setupProgressListeners(): void {
+    // Save on important player events (handles phone/car disconnects)
+    this.audio.onpause = () => this.saveProgress(this.audio.currentTime);
+    this.audio.onended = () => {
+      this.saveProgress(this.audio.currentTime || this.audio.duration || 0);
+      this.markAsWatchedAndPlayNext();
+    };
+    this.audio.onseeked = () => this.saveProgress(this.audio.currentTime);
+
+    // Browser/tab close or phone sleep
+    window.addEventListener('beforeunload', this.handleBeforeUnload.bind(this));
+  }
+
+  private handleBeforeUnload(): void {
+    if (this.currentVideo()) {
+      this.saveProgress(this.audio.currentTime);
+    }
+  }
+
+  private throttledSaveProgress(): void {
+    if (!this.currentVideo()) return;
+
+    const now = Date.now();
+    if (now - this.lastProgressSave < this.PROGRESS_SAVE_INTERVAL) return;
+
+    this.lastProgressSave = now;
+    this.saveProgress(this.audio.currentTime);
+  }
+
+  private saveProgress(progress: number): void {
+    const video = this.currentVideo();
+    if (!video?.videoId) return;
+
+    this.http.patch(`${this.apiUrl}/video/${video.videoId}/progress`, {
+      progress: Math.floor(progress)
+    }).subscribe({
+      error: () => {} // silent fail - common in car environments
+    });
   }
 
   private startHarvestPolling() {
@@ -188,7 +237,7 @@ export class AppComponent implements OnInit, OnDestroy {
   playVideo(video: Video) {
     this.loadAndSeekVideo(video);
     this.audio.play();
-    this.startProgressSaving(video.videoId);
+    // No more interval needed - we use proper event listeners now
   }
 
   private tryResumeFromProgress(videos: Video[]) {
@@ -200,7 +249,7 @@ export class AppComponent implements OnInit, OnDestroy {
   markAsWatchedAndPlayNext() {
     if (!this.currentVideo()) return;
     const videoId = this.currentVideo()!.videoId;
-    this.stopProgressSaving();
+
     this.http.post(`${this.apiUrl}/video/${videoId}/watched`, {})
       .subscribe(() => {
         this.currentVideo.set(null);
@@ -213,7 +262,6 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   skipNext() {
-    this.stopProgressSaving();
     const idx = this.playlist().findIndex(v => v.videoId === this.currentVideo()?.videoId);
     if (idx < this.playlist().length - 1) {
       this.playVideo(this.playlist()[idx + 1]);
@@ -316,23 +364,6 @@ export class AppComponent implements OnInit, OnDestroy {
 
   scrubTo(value: string | number) {
     this.audio.currentTime = Number(value);
-  }
-
-  private startProgressSaving(videoId: string) {
-    if (this.progressInterval) clearInterval(this.progressInterval);
-    this.progressInterval = setInterval(() => {
-      const progress = this.audio.currentTime;
-      if (progress > 0 && !this.audio.paused) {
-        this.http.patch(`${this.apiUrl}/video/${videoId}/progress`, { progress }).subscribe({ error: () => {} });
-      }
-    }, 8000);
-  }
-
-  private stopProgressSaving() {
-    if (this.progressInterval) {
-      clearInterval(this.progressInterval);
-      this.progressInterval = null;
-    }
   }
 
   onImageError(event: Event) {
