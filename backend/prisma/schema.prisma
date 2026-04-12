@@ -8,12 +8,13 @@ datasource db {
 }
 
 model Channel {
-  id         String   @id @default(cuid())
-  channelId  String   @unique
-  title      String
-  order      Int      @default(0)     // ← Required for priority system
-  createdAt  DateTime @default(now())
-  videos     Video[]
+  id               String   @id @default(cuid())
+  channelId        String   @unique
+  title            String
+  order            Int      @default(0)
+  ignoreScrapeDone Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  videos           Video[]
 
   @@index([order])
 }
@@ -31,12 +32,15 @@ model Video {
   watched       Boolean  @default(false)
   progress      Float    @default(0)
   duration      Float?
+  ignored       Boolean  @default(false)
   createdAt     DateTime @default(now())
 
   channel       Channel  @relation(fields: [channelId], references: [channelId])
 
   @@index([publishedAt])
   @@index([watched])
+  @@index([ignored])
+  @@index([channelId, ignored])   // ← critical for fast per-channel ignored checks
 }
 
 model Config {

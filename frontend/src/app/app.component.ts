@@ -75,16 +75,12 @@ export class AppComponent implements OnInit, OnDestroy {
   cookies = signal('');
   currentVideoId = signal<string | null>(null);
 
-  // ==================== VERSION ====================
-  private readonly APP_VERSION = '1.5.3';   // ← bumped for independent channel loading
+  private readonly APP_VERSION = '1.5.4';
 
-  // Tabs
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
-  // Import
   importResults = signal<ImportResult[]>([]);
 
-  // Live Harvest Status
   harvestStatus = signal<HarvestStatus>({
     isRunning: false,
     startTime: null,
@@ -96,7 +92,6 @@ export class AppComponent implements OnInit, OnDestroy {
     lastUpdate: null
   });
 
-  // Channel renaming
   editingChannelId = signal<string | null>(null);
   editTitle = signal('');
 
@@ -105,7 +100,6 @@ export class AppComponent implements OnInit, OnDestroy {
   private readonly PROGRESS_SAVE_INTERVAL = 10000;
 
   private hasInitialized = false;
-
   private harvestPollInterval: any = null;
 
   constructor(
@@ -123,10 +117,8 @@ export class AppComponent implements OnInit, OnDestroy {
     this.titleService.setTitle(this.defaultPageTitle);
     this.activeTab.set('queue');
 
-    // Channels are completely independent → load immediately
     this.loadChannels();
 
-    // Wait for BOTH config AND playlist before restoring playback
     forkJoin({
       config: this.http.get<Config>(`${this.apiUrl}/config`),
       playlist: this.http.get<Video[]>(`${this.apiUrl}/playlist`)
@@ -169,7 +161,6 @@ export class AppComponent implements OnInit, OnDestroy {
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
   }
 
-  // ==================== CURRENT ITEM ====================
   private initializeCurrentVideo(videos: Video[]) {
     if (videos.length === 0) return;
 
@@ -180,7 +171,6 @@ export class AppComponent implements OnInit, OnDestroy {
         this.playVideo(savedVideo);
         return;
       }
-    } else {
     }
 
     this.playVideo(videos[0]);
@@ -191,7 +181,6 @@ export class AppComponent implements OnInit, OnDestroy {
     this.http.patch(`${this.apiUrl}/player/current`, { videoId }).subscribe({ error: () => {} });
   }
 
-  // ==================== PROGRESS & LISTENERS ====================
   private setupProgressListeners(): void {
     this.audio.onpause = () => this.saveProgress(this.audio.currentTime);
     this.audio.onended = () => {
@@ -223,7 +212,6 @@ export class AppComponent implements OnInit, OnDestroy {
     }).subscribe({ error: () => {} });
   }
 
-  // ==================== PLAYBACK ====================
   playVideo(video: Video) {
     this.loadAndSeekVideo(video);
     this.audio.play().catch(() => {});
@@ -271,12 +259,10 @@ export class AppComponent implements OnInit, OnDestroy {
     });
   }
 
-  // ==================== INDEPENDENT CHANNEL LOADING ====================
   loadChannels() {
     this.http.get(`${this.apiUrl}/channels`).subscribe(data => this.channels.set(data as any[]));
   }
 
-  // ==================== CONFIG REFRESH (for cookie upload) ====================
   private refreshConfig() {
     this.http.get<Config>(`${this.apiUrl}/config`).subscribe(config => {
       this.cookies.set(config.cookies || '');
@@ -446,9 +432,9 @@ export class AppComponent implements OnInit, OnDestroy {
 
   moveToTop(channelId: string) {
     const list = [...this.channels()];
-    const idx = list.findIndex(c => c.channelId === channelId);
-    if (idx <= 0) return;
-    const [item] = list.splice(idx, 1);
+    const index = list.findIndex(c => c.channelId === channelId);
+    if (index <= 0) return;
+    const [item] = list.splice(index, 1);
     list.unshift(item);
     this.channels.set(list);
     this.saveChannelOrder();
@@ -456,9 +442,9 @@ export class AppComponent implements OnInit, OnDestroy {
 
   moveToBottom(channelId: string) {
     const list = [...this.channels()];
-    const idx = list.findIndex(c => c.channelId === channelId);
-    if (idx === -1 || idx === list.length - 1) return;
-    const [item] = list.splice(idx, 1);
+    const index = list.findIndex(c => c.channelId === channelId);
+    if (index === -1 || index === list.length - 1) return;
+    const [item] = list.splice(index, 1);
     list.push(item);
     this.channels.set(list);
     this.saveChannelOrder();
@@ -466,18 +452,18 @@ export class AppComponent implements OnInit, OnDestroy {
 
   moveUp(channelId: string) {
     const list = [...this.channels()];
-    const idx = list.findIndex(c => c.channelId === channelId);
-    if (idx <= 0) return;
-    [list[idx], list[idx - 1]] = [list[idx - 1], list[idx]];
+    const index = list.findIndex(c => c.channelId === channelId);
+    if (index <= 0) return;
+    [list[index], list[index - 1]] = [list[index - 1], list[index]];
     this.channels.set(list);
     this.saveChannelOrder();
   }
 
   moveDown(channelId: string) {
     const list = [...this.channels()];
-    const idx = list.findIndex(c => c.channelId === channelId);
-    if (idx === -1 || idx >= list.length - 1) return;
-    [list[idx], list[idx + 1]] = [list[idx + 1], list[idx]];
+    const index = list.findIndex(c => c.channelId === channelId);
+    if (index === -1 || index >= list.length - 1) return;
+    [list[index], list[index + 1]] = [list[index + 1], list[index]];
     this.channels.set(list);
     this.saveChannelOrder();
   }
