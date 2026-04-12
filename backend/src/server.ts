@@ -651,14 +651,17 @@ app.get('/api/config', async (_, res) => {
   const preferredBitrate = await getConfig('preferredBitrate', '128');
   const preferredMono = await getConfig('preferredMono', 'false');
   const autoPurgeDays = await getConfig('autoPurgeDays', '30');
+  const currentVideoId = await getConfig('currentVideoId', '');
   const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   const cookies = await getCookies();
+  
 
   res.json({
     maxHarvestDays: parseInt(maxDays),
     preferredBitrate: parseInt(preferredBitrate),
     preferredMono: preferredMono === 'true',
     autoPurgeDays: parseInt(autoPurgeDays),
+    lastPlayedVideoId: currentVideoId || null,
     userAgent,
     cookies
   });
@@ -808,6 +811,17 @@ app.patch('/api/video/:videoId/progress', async (req, res) => {
 
 app.post('/api/video/:videoId/watched', async (req, res) => {
   await prisma.video.update({ where: { videoId: req.params.videoId }, data: { watched: true } });
+  res.json({ success: true });
+});
+
+app.get('/api/player/current', async (_, res) => {
+  const videoId = await getConfig('currentVideoId', '');
+  res.json({ videoId: videoId || null });
+});
+
+app.patch('/api/player/current', async (req, res) => {
+  const { videoId } = req.body;
+  await setConfig('currentVideoId', videoId || '');
   res.json({ success: true });
 });
 

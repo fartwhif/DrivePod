@@ -3,6 +3,7 @@ import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Title } from '@angular/platform-browser';
+import { forkJoin } from 'rxjs';
 
 interface Video {
   id: string;
@@ -22,6 +23,7 @@ interface Config {
   autoPurgeDays: number;
   userAgent: string;
   cookies: string;
+  lastPlayedVideoId?: string | null;
 }
 
 interface ImportResult {
@@ -70,7 +72,11 @@ export class AppComponent implements OnInit, OnDestroy {
   preferredMono = signal(false);
   autoPurgeDays = signal(30);
   userAgent = signal('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-  cookies = signal('');                     // display status only
+  cookies = signal('');
+  currentVideoId = signal<string | null>(null);
+
+  // ==================== VERSION ====================
+  private readonly APP_VERSION = '1.5.3';   // ← bumped for independent channel loading
 
   // Tabs
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
@@ -96,7 +102,9 @@ export class AppComponent implements OnInit, OnDestroy {
 
   private defaultPageTitle = '🎧 YT Drive Audio Queue';
   private lastProgressSave = 0;
-  private readonly PROGRESS_SAVE_INTERVAL = 10000; // 10 seconds (car-friendly)
+  private readonly PROGRESS_SAVE_INTERVAL = 10000;
+
+  private hasInitialized = false;
 
   private harvestPollInterval: any = null;
 
@@ -110,13 +118,41 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit() {
+    console.log(`%c🚙📻 DrivePod Frontend v${this.APP_VERSION} initializing`, 'font-weight: bold; color: #22c55e; font-size: 13px');
+
     this.titleService.setTitle(this.defaultPageTitle);
-    this.loadConfig();
-    this.loadChannels();
-    this.loadPlaylist();
     this.activeTab.set('queue');
 
-    // Live time for UI scrubber
+    // Channels are completely independent → load immediately
+    this.loadChannels();
+
+    // Wait for BOTH config AND playlist before restoring playback
+    forkJoin({
+      config: this.http.get<Config>(`${this.apiUrl}/config`),
+      playlist: this.http.get<Video[]>(`${this.apiUrl}/playlist`)
+    }).subscribe({
+      next: ({ config, playlist }) => {
+        this.maxHarvestDays.set(config.maxHarvestDays);
+        this.preferredBitrate.set(config.preferredBitrate);
+        this.preferredMono.set(config.preferredMono);
+        this.autoPurgeDays.set(config.autoPurgeDays);
+        this.userAgent.set(config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
+        this.cookies.set(config.cookies || '');
+        this.currentVideoId.set(config.lastPlayedVideoId || null);
+
+        this.playlist.set(playlist);
+
+        if (!this.currentVideo()) {
+          this.hasInitialized = true;
+          this.initializeCurrentVideo(playlist);
+        }
+      },
+      error: (err) => {
+        console.error('❌ Failed to load initial config + playlist:', err);
+        this.loadPlaylist();
+      }
+    });
+
     this.audio.ontimeupdate = () => {
       this.currentTime.set(this.audio.currentTime);
       this.throttledSaveProgress();
@@ -133,8 +169,30 @@ export class AppComponent implements OnInit, OnDestroy {
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
   }
 
+  // ==================== CURRENT ITEM ====================
+  private initializeCurrentVideo(videos: Video[]) {
+    if (videos.length === 0) return;
+
+    const savedId = this.currentVideoId();
+    if (savedId) {
+      const savedVideo = videos.find(v => v.videoId === savedId);
+      if (savedVideo) {
+        this.playVideo(savedVideo);
+        return;
+      }
+    } else {
+    }
+
+    this.playVideo(videos[0]);
+  }
+
+  private saveCurrentVideo(videoId: string | null) {
+    this.currentVideoId.set(videoId);
+    this.http.patch(`${this.apiUrl}/player/current`, { videoId }).subscribe({ error: () => {} });
+  }
+
+  // ==================== PROGRESS & LISTENERS ====================
   private setupProgressListeners(): void {
-    // Save on important player events (handles phone/car disconnects)
     this.audio.onpause = () => this.saveProgress(this.audio.currentTime);
     this.audio.onended = () => {
       this.saveProgress(this.audio.currentTime || this.audio.duration || 0);
@@ -142,22 +200,17 @@ export class AppComponent implements OnInit, OnDestroy {
     };
     this.audio.onseeked = () => this.saveProgress(this.audio.currentTime);
 
-    // Browser/tab close or phone sleep
     window.addEventListener('beforeunload', this.handleBeforeUnload.bind(this));
   }
 
   private handleBeforeUnload(): void {
-    if (this.currentVideo()) {
-      this.saveProgress(this.audio.currentTime);
-    }
+    if (this.currentVideo()) this.saveProgress(this.audio.currentTime);
   }
 
   private throttledSaveProgress(): void {
     if (!this.currentVideo()) return;
-
     const now = Date.now();
     if (now - this.lastProgressSave < this.PROGRESS_SAVE_INTERVAL) return;
-
     this.lastProgressSave = now;
     this.saveProgress(this.audio.currentTime);
   }
@@ -165,11 +218,68 @@ export class AppComponent implements OnInit, OnDestroy {
   private saveProgress(progress: number): void {
     const video = this.currentVideo();
     if (!video?.videoId) return;
-
     this.http.patch(`${this.apiUrl}/video/${video.videoId}/progress`, {
       progress: Math.floor(progress)
-    }).subscribe({
-      error: () => {} // silent fail - common in car environments
+    }).subscribe({ error: () => {} });
+  }
+
+  // ==================== PLAYBACK ====================
+  playVideo(video: Video) {
+    this.loadAndSeekVideo(video);
+    this.audio.play().catch(() => {});
+    this.saveCurrentVideo(video.videoId);
+  }
+
+  private loadAndSeekVideo(video: Video) {
+    this.currentVideo.set(video);
+    this.updatePageTitle(video);
+    const monoStr = this.preferredMono() ? '-mono' : '';
+    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
+    this.audio.load();
+    this.audio.currentTime = video.progress || 0;
+  }
+
+  markAsWatchedAndPlayNext() {
+    if (!this.currentVideo()) return;
+    const videoId = this.currentVideo()!.videoId;
+
+    this.saveCurrentVideo(null);
+
+    this.http.post(`${this.apiUrl}/video/${videoId}/watched`, {})
+      .subscribe(() => {
+        this.currentVideo.set(null);
+        this.updatePageTitle(null);
+        this.loadPlaylist();
+      });
+  }
+
+  skipNext() {
+    const idx = this.playlist().findIndex(v => v.videoId === this.currentVideo()?.videoId);
+    if (idx < this.playlist().length - 1) {
+      this.playVideo(this.playlist()[idx + 1]);
+    } else {
+      this.currentVideo.set(null);
+      this.updatePageTitle(null);
+      this.saveCurrentVideo(null);
+      this.loadPlaylist();
+    }
+  }
+
+  loadPlaylist() {
+    this.http.get<Video[]>(`${this.apiUrl}/playlist`).subscribe(data => {
+      this.playlist.set(data);
+    });
+  }
+
+  // ==================== INDEPENDENT CHANNEL LOADING ====================
+  loadChannels() {
+    this.http.get(`${this.apiUrl}/channels`).subscribe(data => this.channels.set(data as any[]));
+  }
+
+  // ==================== CONFIG REFRESH (for cookie upload) ====================
+  private refreshConfig() {
+    this.http.get<Config>(`${this.apiUrl}/config`).subscribe(config => {
+      this.cookies.set(config.cookies || '');
     });
   }
 
@@ -225,71 +335,6 @@ export class AppComponent implements OnInit, OnDestroy {
     else this.titleService.setTitle(this.defaultPageTitle);
   }
 
-  private loadAndSeekVideo(video: Video) {
-    this.currentVideo.set(video);
-    this.updatePageTitle(video);
-    const monoStr = this.preferredMono() ? '-mono' : '';
-    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
-    this.audio.load();
-    this.audio.currentTime = video.progress || 0;
-  }
-
-  playVideo(video: Video) {
-    this.loadAndSeekVideo(video);
-    this.audio.play();
-    // No more interval needed - we use proper event listeners now
-  }
-
-  private tryResumeFromProgress(videos: Video[]) {
-    if (this.currentVideo() || videos.length === 0) return;
-    const videoToResume = videos.find(v => v.progress > 0);
-    if (videoToResume) this.loadAndSeekVideo(videoToResume);
-  }
-
-  markAsWatchedAndPlayNext() {
-    if (!this.currentVideo()) return;
-    const videoId = this.currentVideo()!.videoId;
-
-    this.http.post(`${this.apiUrl}/video/${videoId}/watched`, {})
-      .subscribe(() => {
-        this.currentVideo.set(null);
-        this.updatePageTitle(null);
-        this.http.get<Video[]>(`${this.apiUrl}/playlist`).subscribe(data => {
-          this.playlist.set(data);
-          if (data.length > 0) this.playVideo(data[0]);
-        });
-      });
-  }
-
-  skipNext() {
-    const idx = this.playlist().findIndex(v => v.videoId === this.currentVideo()?.videoId);
-    if (idx < this.playlist().length - 1) {
-      this.playVideo(this.playlist()[idx + 1]);
-    } else {
-      this.currentVideo.set(null);
-      this.updatePageTitle(null);
-      this.loadPlaylist();
-    }
-  }
-
-  loadPlaylist() {
-    this.http.get<Video[]>(`${this.apiUrl}/playlist`).subscribe(data => {
-      this.playlist.set(data);
-      if (!this.currentVideo()) this.tryResumeFromProgress(data);
-    });
-  }
-
-  loadConfig() {
-    this.http.get<Config>(`${this.apiUrl}/config`).subscribe(config => {
-      this.maxHarvestDays.set(config.maxHarvestDays);
-      this.preferredBitrate.set(config.preferredBitrate);
-      this.preferredMono.set(config.preferredMono);
-      this.autoPurgeDays.set(config.autoPurgeDays);
-      this.userAgent.set(config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-      this.cookies.set(config.cookies || '');
-    });
-  }
-
   saveConfig() {
     this.http.post(`${this.apiUrl}/config`, {
       maxHarvestDays: this.maxHarvestDays(),
@@ -303,7 +348,6 @@ export class AppComponent implements OnInit, OnDestroy {
   onBitrateChange() { this.saveConfig(); }
   onMonoChange() { this.saveConfig(); }
 
-  // === Channel Renaming ===
   startEditing(channelId: string, currentTitle: string) {
     this.editingChannelId.set(channelId);
     this.editTitle.set(currentTitle);
@@ -329,7 +373,6 @@ export class AppComponent implements OnInit, OnDestroy {
       });
   }
 
-  // === Cookie upload ===
   uploadCookies(event: Event) {
     const input = event.target as HTMLInputElement;
     if (!input.files?.length) return;
@@ -340,13 +383,12 @@ export class AppComponent implements OnInit, OnDestroy {
     this.http.post(`${this.apiUrl}/cookies`, formData).subscribe({
       next: () => {
         alert('cookies.txt uploaded successfully');
-        this.loadConfig();
+        this.refreshConfig();
       },
       error: () => alert('Failed to upload cookies.txt')
     });
   }
 
-  // === Clear Cookies ===
   clearCookies() {
     if (!confirm('Remove all saved YouTube cookies?')) return;
     this.http.post(`${this.apiUrl}/config`, { cookies: '' }).subscribe({
@@ -356,10 +398,6 @@ export class AppComponent implements OnInit, OnDestroy {
       },
       error: () => alert('Failed to clear cookies')
     });
-  }
-
-  loadChannels() {
-    this.http.get(`${this.apiUrl}/channels`).subscribe(data => this.channels.set(data as any[]));
   }
 
   scrubTo(value: string | number) {
@@ -406,7 +444,6 @@ export class AppComponent implements OnInit, OnDestroy {
     });
   }
 
-  // Channel Reordering
   moveToTop(channelId: string) {
     const list = [...this.channels()];
     const idx = list.findIndex(c => c.channelId === channelId);
