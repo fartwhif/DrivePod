@@ -1,4 +1,4 @@
-import { Component, signal, OnInit, effect, OnDestroy } from '@angular/core';
+import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -58,7 +58,7 @@ interface HarvestStatus {
   templateUrl: './app.component.html',
   styleUrls: []
 })
-export class AppComponent implements OnInit, OnDestroy {
+export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   apiUrl = '/api';
   channels = signal<any[]>([]);
   playlist = signal<Video[]>([]);
@@ -92,6 +92,14 @@ export class AppComponent implements OnInit, OnDestroy {
     lastUpdate: null
   });
 
+  // Infinite Scroll
+  readonly PAGE_SIZE = 40;
+  isLoadingMore = signal(false);
+  hasMore = signal(true);
+
+  @ViewChild('loadMoreTrigger') loadMoreTrigger!: ElementRef<HTMLDivElement>;
+  private observer: IntersectionObserver | null = null;
+
   editingChannelId = signal<string | null>(null);
   editTitle = signal('');
 
@@ -120,10 +128,9 @@ export class AppComponent implements OnInit, OnDestroy {
     this.loadChannels();
 
     forkJoin({
-      config: this.http.get<Config>(`${this.apiUrl}/config`),
-      playlist: this.http.get<Video[]>(`${this.apiUrl}/playlist`)
+      config: this.http.get<Config>(`${this.apiUrl}/config`)
     }).subscribe({
-      next: ({ config, playlist }) => {
+      next: ({ config }) => {
         this.maxHarvestDays.set(config.maxHarvestDays);
         this.preferredBitrate.set(config.preferredBitrate);
         this.preferredMono.set(config.preferredMono);
@@ -132,17 +139,13 @@ export class AppComponent implements OnInit, OnDestroy {
         this.cookies.set(config.cookies || '');
         this.currentVideoId.set(config.lastPlayedVideoId || null);
 
-        this.playlist.set(playlist);
+        this.loadInitialPlaylist();
 
         if (!this.currentVideo()) {
           this.hasInitialized = true;
-          this.initializeCurrentVideo(playlist);
         }
       },
-      error: (err) => {
-        console.error('❌ Failed to load initial config + playlist:', err);
-        this.loadPlaylist();
-      }
+      error: () => this.loadInitialPlaylist()
     });
 
     this.audio.ontimeupdate = () => {
@@ -153,12 +156,59 @@ export class AppComponent implements OnInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
-    setInterval(() => this.loadPlaylist(), 30000);
+    // Refresh playlist every 30 seconds (newest videos appear at top)
+    setInterval(() => this.loadInitialPlaylist(), 30000);
+  }
+
+  ngAfterViewInit() {
+    this.setupInfiniteScroll();
   }
 
   ngOnDestroy() {
+    if (this.observer) this.observer.disconnect();
     this.stopHarvestPolling();
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
+  }
+
+  private loadInitialPlaylist() {
+    this.isLoadingMore.set(false);
+    this.hasMore.set(true);
+    this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=0`).subscribe({
+      next: (data) => {
+        this.playlist.set(data);
+        this.hasMore.set(data.length === this.PAGE_SIZE);
+      },
+      error: (err) => console.error('Failed to load playlist', err)
+    });
+  }
+
+  private loadMore() {
+    if (this.isLoadingMore() || !this.hasMore()) return;
+    const skip = this.playlist().length;
+    this.isLoadingMore.set(true);
+
+    this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`)
+      .subscribe({
+        next: (newVideos) => {
+          this.playlist.update(current => [...current, ...newVideos]);
+          this.hasMore.set(newVideos.length === this.PAGE_SIZE);
+          this.isLoadingMore.set(false);
+        },
+        error: () => this.isLoadingMore.set(false)
+      });
+  }
+
+  private setupInfiniteScroll() {
+    if (this.observer) this.observer.disconnect();
+    this.observer = new IntersectionObserver((entries) => {
+      if (entries[0]?.isIntersecting && this.hasMore() && !this.isLoadingMore()) {
+        this.loadMore();
+      }
+    }, { rootMargin: '400px' });
+
+    if (this.loadMoreTrigger?.nativeElement) {
+      this.observer.observe(this.loadMoreTrigger.nativeElement);
+    }
   }
 
   private initializeCurrentVideo(videos: Video[]) {
@@ -237,7 +287,7 @@ export class AppComponent implements OnInit, OnDestroy {
       .subscribe(() => {
         this.currentVideo.set(null);
         this.updatePageTitle(null);
-        this.loadPlaylist();
+        this.loadInitialPlaylist();   // refresh after marking watched
       });
   }
 
@@ -249,14 +299,8 @@ export class AppComponent implements OnInit, OnDestroy {
       this.currentVideo.set(null);
       this.updatePageTitle(null);
       this.saveCurrentVideo(null);
-      this.loadPlaylist();
+      this.loadInitialPlaylist();
     }
-  }
-
-  loadPlaylist() {
-    this.http.get<Video[]>(`${this.apiUrl}/playlist`).subscribe(data => {
-      this.playlist.set(data);
-    });
   }
 
   loadChannels() {
@@ -313,6 +357,11 @@ export class AppComponent implements OnInit, OnDestroy {
       this.startHarvestPolling();
     } else {
       this.stopHarvestPolling();
+    }
+
+    if (tab === 'queue') {
+      this.loadInitialPlaylist();
+      setTimeout(() => this.setupInfiniteScroll(), 300);
     }
   }
 
@@ -404,7 +453,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
   purgeAll() {
     if (!confirm('Delete ALL cached videos and clear the playlist?')) return;
-    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadPlaylist());
+    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadInitialPlaylist());
   }
 
   addChannel(channelId: string, title: string) {

@@ -38,7 +38,7 @@
     </button>
   </div>
 
-  <!-- Queue Tab -->
+  <!-- Queue Tab (Infinite Scroll) -->
   @if (activeTab() === 'queue') {
     <div class="grid gap-4">
       @for (v of playlist(); track v.videoId) {
@@ -70,12 +70,27 @@
           }
         </div>
       }
+
       @if (playlist().length === 0) {
         <div class="bg-zinc-900 p-12 rounded-3xl text-center text-zinc-400 text-lg">
           No videos in the queue yet.<br>
           <span class="text-sm">Add some channels in Settings or Import to start harvesting!</span>
         </div>
       }
+
+      <!-- Infinite Scroll Sentinel -->
+      <div #loadMoreTrigger class="col-span-full py-12 flex justify-center items-center text-zinc-400">
+        @if (isLoadingMore()) {
+          <div class="flex items-center gap-3">
+            <span class="animate-spin text-2xl">⟳</span>
+            <span>Loading older videos...</span>
+          </div>
+        } @else if (hasMore()) {
+          <div class="text-sm opacity-70">↓ Scroll for more videos</div>
+        } @else if (playlist().length > 0) {
+          <div class="text-sm opacity-70">🎉 End of queue</div>
+        }
+      </div>
     </div>
   }
 
