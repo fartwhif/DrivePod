@@ -459,6 +459,7 @@ async function downloadAndProcessVideo(
   if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
 
   let success = false;
+  const metadataPath = path.join(videoDir, `${videoId}_metadata.ffmeta`);
 
   try {
     console.log(`📥 Starting download: ${videoId} (${author})`);
@@ -501,13 +502,30 @@ async function downloadAndProcessVideo(
     const dateStr2 = publishedAt instanceof Date
       ? publishedAt.toISOString()
       : new Date().toISOString();
+
+    // === CREATE FFMETADATA FILE WITH FULL JSON COMMENT ===
     const commentData = { ...videoInfo, publishedAt: dateStr2 };
-    const safeComment = JSON.stringify(commentData).replace(/"/g, '\\"').replace(/[\r\n]/g, ' ');
+    const metadataContent = `;FFMETADATA1
+title=${escapeFFmetadata(videoTitle)}
+artist=${escapeFFmetadata(author)}
+date=${dateStr}
+comment=${JSON.stringify(commentData)}
+`;
+    fs.writeFileSync(metadataPath, metadataContent, 'utf-8');
+
     let args: string[];
     if (thumbPath) {
-      args = ['-i', raw, '-i', thumbPath, '-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic', '-id3v2_version', '3', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-metadata', `date="${dateStr}"`, '-metadata', `comment="${safeComment}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+      // 3 inputs: 0=audio, 1=thumbnail, 2=metadata
+      args = ['-i', raw, '-i', thumbPath, '-f', 'ffmetadata', '-i', metadataPath,
+              '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
+              '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
+              '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     } else {
-      args = ['-i', raw, '-map_metadata', '-1', '-map_chapters', '-1', '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact', '-vn', '-c:a', 'libmp3lame', '-metadata', `title="${safeTitle}"`, '-metadata', `artist="${safeAuthor}"`, '-metadata', `date="${dateStr}"`, '-metadata', `comment="${safeComment}"`, '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+      // 2 inputs: 0=audio, 1=metadata  ← now uses explicit -map 0:a
+      args = ['-i', raw, '-f', 'ffmetadata', '-i', metadataPath,
+              '-map', '0:a', '-map_metadata', '1',
+              '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact',
+              '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     }
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
  
@@ -543,13 +561,26 @@ async function downloadAndProcessVideo(
     console.error(`❌ Download failed for ${videoId}:`, err.message);
     return false;
   } finally {
+    // clean up metadata file
+    if (fs.existsSync(metadataPath)) {
+      try { fs.unlinkSync(metadataPath); } catch {}
+    }
+
     if (!success && fs.existsSync(videoDir) && !fs.existsSync(mp3)) {
       fs.rmSync(videoDir, { recursive: true, force: true });
       console.log(`🧹 Cleaned up incomplete folder for ${videoId}`);
     }
   }
 }
-
+// === FFMETADATA ESCAPER (handles pretty JSON safely) ===
+function escapeFFmetadata(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')           // backslashes first
+    .replace(/=/g, '\\=')
+    .replace(/;/g, '\\;')
+    .replace(/#/g, '\\#')
+    .replace(/\n/g, '\\\n');          // line continuation for pretty JSON
+}
 async function getAudioDuration(filePath: string): Promise<number | null> {
   try {
     const { stdout } = await execPromise(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, { maxBuffer: 50 * 1024 * 1024 });
@@ -887,12 +918,17 @@ app.post('/api/channels/import', async (req, res) => {
   res.json({ success: true, results });
 });
 
-app.get('/api/playlist', async (_, res) => {
+// === PAGINATED PLAYLIST (REQUIRED FOR INFINITE SCROLL) ===
+app.get('/api/playlist', async (req, res) => {
+  const take = Math.min(Math.max(parseInt(req.query.take as string) || 40, 10), 100);
+  const skip = parseInt(req.query.skip as string) || 0;
+
   const videos = await prisma.video.findMany({
     where: { watched: false, ignored: false },
     orderBy: { publishedAt: 'desc' },
     include: { channel: true },
-    take: 300
+    take,
+    skip
   });
   res.json(videos);
 });
