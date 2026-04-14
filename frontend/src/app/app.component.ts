@@ -139,13 +139,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.cookies.set(config.cookies || '');
         this.currentVideoId.set(config.lastPlayedVideoId || null);
 
-        this.loadInitialPlaylist();
+        this.loadInitialPlaylist(true);   // load playlist + autoplay (saved current OR first item)
 
         if (!this.currentVideo()) {
           this.hasInitialized = true;
         }
       },
-      error: () => this.loadInitialPlaylist()
+      error: () => this.loadInitialPlaylist(true)   // fallback with autoplay
     });
 
     this.audio.ontimeupdate = () => {
@@ -156,8 +156,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
-    // Refresh playlist every 30 seconds (newest videos appear at top)
-    setInterval(() => this.loadInitialPlaylist(), 30000);
+    // Refresh playlist every 30 seconds (newest videos appear at top) — NO autoplay on periodic refresh
+    setInterval(() => this.loadInitialPlaylist(false), 30000);
   }
 
   ngAfterViewInit() {
@@ -170,13 +170,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
   }
 
-  private loadInitialPlaylist() {
+  private loadInitialPlaylist(autoplayAfterLoad: boolean = false) {
     this.isLoadingMore.set(false);
     this.hasMore.set(true);
     this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=0`).subscribe({
       next: (data) => {
         this.playlist.set(data);
         this.hasMore.set(data.length === this.PAGE_SIZE);
+
+        // Autoplay logic only when explicitly requested (initial load or after video ends)
+        // and no video is currently playing
+        if (autoplayAfterLoad && !this.currentVideo()) {
+          this.initializeCurrentVideo(data);
+        }
       },
       error: (err) => console.error('Failed to load playlist', err)
     });
@@ -287,7 +293,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       .subscribe(() => {
         this.currentVideo.set(null);
         this.updatePageTitle(null);
-        this.loadInitialPlaylist();   // refresh after marking watched
+        this.loadInitialPlaylist(true);   // refresh playlist + autoplay newest item
       });
   }
 
@@ -299,7 +305,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.currentVideo.set(null);
       this.updatePageTitle(null);
       this.saveCurrentVideo(null);
-      this.loadInitialPlaylist();
+      this.loadInitialPlaylist(false);   // refresh only (no autoplay)
     }
   }
 
@@ -360,7 +366,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     if (tab === 'queue') {
-      this.loadInitialPlaylist();
+      this.loadInitialPlaylist(false);   // refresh view only
       setTimeout(() => this.setupInfiniteScroll(), 300);
     }
   }
@@ -453,7 +459,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   purgeAll() {
     if (!confirm('Delete ALL cached videos and clear the playlist?')) return;
-    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadInitialPlaylist());
+    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadInitialPlaylist(false));
   }
 
   addChannel(channelId: string, title: string) {
