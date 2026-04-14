@@ -221,7 +221,7 @@
            target="_blank" class="underline">Exporting YouTube cookies guide</a>
       </div>
 
-      @if (cookies()) {
+      @if (hasCookies()) {                                      <!-- ← updated condition -->
         <div class="mt-4 text-emerald-400 text-sm">✅ cookies.txt is currently loaded</div>
       } @else {
         <div class="mt-4 text-amber-400 text-sm">No cookies loaded</div>

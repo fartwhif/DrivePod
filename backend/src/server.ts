@@ -503,7 +503,6 @@ async function downloadAndProcessVideo(
       ? publishedAt.toISOString()
       : new Date().toISOString();
 
-    // === CREATE FFMETADATA FILE WITH FULL JSON COMMENT ===
     const commentData = { ...videoInfo, publishedAt: dateStr2 };
     const metadataContent = `;FFMETADATA1
 title=${escapeFFmetadata(videoTitle)}
@@ -515,13 +514,11 @@ comment=${JSON.stringify(commentData)}
 
     let args: string[];
     if (thumbPath) {
-      // 3 inputs: 0=audio, 1=thumbnail, 2=metadata
       args = ['-i', raw, '-i', thumbPath, '-f', 'ffmetadata', '-i', metadataPath,
               '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
               '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
               '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     } else {
-      // 2 inputs: 0=audio, 1=metadata  ← now uses explicit -map 0:a
       args = ['-i', raw, '-f', 'ffmetadata', '-i', metadataPath,
               '-map', '0:a', '-map_metadata', '1',
               '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact',
@@ -561,7 +558,6 @@ comment=${JSON.stringify(commentData)}
     console.error(`❌ Download failed for ${videoId}:`, err.message);
     return false;
   } finally {
-    // clean up metadata file
     if (fs.existsSync(metadataPath)) {
       try { fs.unlinkSync(metadataPath); } catch {}
     }
@@ -572,15 +568,16 @@ comment=${JSON.stringify(commentData)}
     }
   }
 }
-// === FFMETADATA ESCAPER (handles pretty JSON safely) ===
+
 function escapeFFmetadata(value: string): string {
   return value
-    .replace(/\\/g, '\\\\')           // backslashes first
+    .replace(/\\/g, '\\\\')
     .replace(/=/g, '\\=')
     .replace(/;/g, '\\;')
     .replace(/#/g, '\\#')
-    .replace(/\n/g, '\\\n');          // line continuation for pretty JSON
+    .replace(/\n/g, '\\\n');
 }
+
 async function getAudioDuration(filePath: string): Promise<number | null> {
   try {
     const { stdout } = await execPromise(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, { maxBuffer: 50 * 1024 * 1024 });
@@ -591,7 +588,7 @@ async function getAudioDuration(filePath: string): Promise<number | null> {
   }
 }
 
-// === HARVESTER (fully optimized for massive tables) ===
+// === HARVESTER ===
 async function harvestAndPurge() {
   if (isHarvesting) {
     console.log(`⏳ [${logTimestamp()}] Harvest already running — skipping`);
@@ -647,7 +644,6 @@ async function harvestAndPurge() {
 
         const promise = (async () => {
           try {
-            // === IGNORE SWEEP (if needed) ===
             if (!currentChannel.ignoreScrapeDone) {
               const activeItem = harvestStatus.activeItems.find(i => i.channelId === currentChannel.channelId);
               if (activeItem) activeItem.action = 'Ignore Sweep';
@@ -789,6 +785,7 @@ async function harvestAndPurge() {
 // ====================== API ROUTES ======================
 app.get('/api/harvest-status', (_, res) => res.json(harvestStatus));
 
+// ← SECURITY FIX: never send cookies string to browser
 app.get('/api/config', async (_, res) => {
   const maxDays = await getConfig('maxHarvestDays', '7');
   const preferredBitrate = await getConfig('preferredBitrate', '128');
@@ -796,7 +793,7 @@ app.get('/api/config', async (_, res) => {
   const autoPurgeDays = await getConfig('autoPurgeDays', '30');
   const currentVideoId = await getConfig('currentVideoId', '');
   const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-  const cookies = await getCookies();
+  const cookieContent = await getCookies();
   
   res.json({
     maxHarvestDays: parseInt(maxDays),
@@ -805,7 +802,7 @@ app.get('/api/config', async (_, res) => {
     autoPurgeDays: parseInt(autoPurgeDays),
     lastPlayedVideoId: currentVideoId || null,
     userAgent,
-    cookies
+    hasCookies: !!cookieContent.trim()   // ← only boolean, never the actual cookies string
   });
 });
 
@@ -817,7 +814,7 @@ app.post('/api/config', async (req, res) => {
   if (preferredMono !== undefined) await setConfig('preferredMono', String(preferredMono));
   if (autoPurgeDays !== undefined) await setConfig('autoPurgeDays', String(autoPurgeDays));
   if (userAgent !== undefined) await setConfig('userAgent', userAgent);
-  if (cookies !== undefined) await setConfig('cookies', cookies);
+  if (cookies !== undefined) await setConfig('cookies', cookies);   // still accept from upload/clear
 
   res.json({ success: true });
 });
@@ -918,7 +915,6 @@ app.post('/api/channels/import', async (req, res) => {
   res.json({ success: true, results });
 });
 
-// === PAGINATED PLAYLIST (REQUIRED FOR INFINITE SCROLL) ===
 app.get('/api/playlist', async (req, res) => {
   const take = Math.min(Math.max(parseInt(req.query.take as string) || 40, 10), 100);
   const skip = parseInt(req.query.skip as string) || 0;
@@ -1015,4 +1011,5 @@ app.listen(port, () => {
   console.log(`🚀 DrivePod Backend ready on http://localhost:${port}`);
   console.log(`   Cache: ` + CACHE_DIR);
   console.log(`   Data:  ` + DATA_DIR);
+  console.log(`   ✅ Security: cookies string is NEVER sent to the browser`);
 });
