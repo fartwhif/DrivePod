@@ -22,7 +22,7 @@ interface Config {
   preferredMono: boolean;
   autoPurgeDays: number;
   userAgent: string;
-  cookies: string;
+  hasCookies: boolean;          // ← changed: never receives the actual cookies string
   lastPlayedVideoId?: string | null;
 }
 
@@ -72,10 +72,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   preferredMono = signal(false);
   autoPurgeDays = signal(30);
   userAgent = signal('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-  cookies = signal('');
+  hasCookies = signal(false);           // ← security: only boolean, never the cookies string
   currentVideoId = signal<string | null>(null);
 
-  private readonly APP_VERSION = '1.5.4';
+  private readonly APP_VERSION = '1.5.5';   // bumped for security fix
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
@@ -136,16 +136,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.preferredMono.set(config.preferredMono);
         this.autoPurgeDays.set(config.autoPurgeDays);
         this.userAgent.set(config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-        this.cookies.set(config.cookies || '');
+        this.hasCookies.set(!!config.hasCookies);                    // ← only boolean
         this.currentVideoId.set(config.lastPlayedVideoId || null);
 
-        this.loadInitialPlaylist(true);   // load playlist + autoplay (saved current OR first item)
-
-        if (!this.currentVideo()) {
-          this.hasInitialized = true;
-        }
+        this.loadInitialPlaylist(true);
       },
-      error: () => this.loadInitialPlaylist(true)   // fallback with autoplay
+      error: () => this.loadInitialPlaylist(true)
     });
 
     this.audio.ontimeupdate = () => {
@@ -156,7 +152,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
-    // Refresh playlist every 30 seconds (newest videos appear at top) — NO autoplay on periodic refresh
     setInterval(() => this.loadInitialPlaylist(false), 30000);
   }
 
@@ -178,8 +173,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.playlist.set(data);
         this.hasMore.set(data.length === this.PAGE_SIZE);
 
-        // Autoplay logic only when explicitly requested (initial load or after video ends)
-        // and no video is currently playing
         if (autoplayAfterLoad && !this.currentVideo()) {
           this.initializeCurrentVideo(data);
         }
@@ -293,7 +286,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       .subscribe(() => {
         this.currentVideo.set(null);
         this.updatePageTitle(null);
-        this.loadInitialPlaylist(true);   // refresh playlist + autoplay newest item
+        this.loadInitialPlaylist(true);
       });
   }
 
@@ -305,7 +298,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.currentVideo.set(null);
       this.updatePageTitle(null);
       this.saveCurrentVideo(null);
-      this.loadInitialPlaylist(false);   // refresh only (no autoplay)
+      this.loadInitialPlaylist(false);
     }
   }
 
@@ -315,7 +308,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   private refreshConfig() {
     this.http.get<Config>(`${this.apiUrl}/config`).subscribe(config => {
-      this.cookies.set(config.cookies || '');
+      this.hasCookies.set(!!config.hasCookies);   // ← only boolean
     });
   }
 
@@ -366,7 +359,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     if (tab === 'queue') {
-      this.loadInitialPlaylist(false);   // refresh view only
+      this.loadInitialPlaylist(false);
       setTimeout(() => this.setupInfiniteScroll(), 300);
     }
   }
@@ -434,7 +427,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (!confirm('Remove all saved YouTube cookies?')) return;
     this.http.post(`${this.apiUrl}/config`, { cookies: '' }).subscribe({
       next: () => {
-        this.cookies.set('');
+        this.hasCookies.set(false);
         alert('Cookies have been cleared');
       },
       error: () => alert('Failed to clear cookies')
