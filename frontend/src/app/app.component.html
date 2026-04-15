@@ -1,5 +1,4 @@
-<div class="max-w-4xl mx-auto p-6 bg-zinc-950 text-white min-h-screen font-sans"
-     [class.pb-24]="currentVideo() !== null">
+<div class="max-w-4xl mx-auto p-6 bg-zinc-950 text-white min-h-screen font-sans">
   <h1 class="text-3xl font-bold mb-6 flex items-center gap-2">🚙📻 DrivePod</h1>
 
   <!-- Tabs -->
@@ -37,6 +36,64 @@
       <span>Import</span>
     </button>
   </div>
+
+  <!-- Now Playing Player - Integrated at the top, only visible when a video is loaded -->
+  @if (currentVideo(); as video) {
+    <div class="mb-8 bg-zinc-900 border border-zinc-700 rounded-3xl p-6">
+      <div class="flex flex-col lg:flex-row gap-6 items-start">
+        <!-- Thumbnail -->
+        <img [src]="video.thumbnailPath || ''" 
+             class="w-32 h-32 md:w-40 md:h-24 lg:w-48 lg:h-28 object-cover rounded-2xl flex-shrink-0 shadow-inner"
+             (error)="onImageError($event)">
+
+        <!-- Info + Progress -->
+        <div class="flex-1 min-w-0">
+          <div class="font-semibold text-xl leading-tight line-clamp-2 mb-1">{{ video.title }}</div>
+          <div class="text-zinc-400 mb-6">{{ video.channel.title }}</div>
+
+          <!-- Progress bar -->
+          <div class="mb-6">
+            <input type="range" 
+                   [value]="currentTime()" 
+                   [max]="audio.duration || 100" 
+                   (input)="scrubTo($event.target.value)" 
+                   class="w-full accent-green-500 cursor-pointer">
+            <div class="flex justify-between text-xs text-zinc-400 mt-1">
+              <span>{{ formatDuration(currentTime()) }}</span>
+              <span>{{ formatDuration(video.duration) }}</span>
+            </div>
+          </div>
+
+          <!-- Playback controls -->
+          <div class="flex items-center justify-center gap-8 text-4xl">
+            <button (click)="skipPrevious()" 
+                    class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏮️</button>
+            <button (click)="audio.paused ? audio.play() : audio.pause()" 
+                    class="text-5xl hover:scale-110 active:scale-95 transition">
+              {{ audio.paused ? '▶️' : '⏸️' }}
+            </button>
+            <button (click)="skipNext()" 
+                    class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏭️</button>
+          </div>
+        </div>
+
+        <!-- Extra info / link -->
+        <div class="flex flex-col items-end gap-3 lg:w-36">
+          <a [href]="'https://www.youtube.com/watch?v=' + video.videoId"
+             target="_blank"
+             rel="noopener noreferrer"
+             class="text-sky-400 hover:text-sky-300 text-3xl leading-none flex items-center gap-1">
+            🔗
+          </a>
+          @if (video.duration) {
+            <div class="text-xs text-zinc-400 px-3 py-1 bg-zinc-800 rounded-xl">
+              {{ formatDuration(video.duration) }}
+            </div>
+          }
+        </div>
+      </div>
+    </div>
+  }
 
   <!-- Queue Tab (Infinite Scroll) -->
   @if (activeTab() === 'queue') {
@@ -221,7 +278,7 @@
            target="_blank" class="underline">Exporting YouTube cookies guide</a>
       </div>
 
-      @if (hasCookies()) {                                      <!-- ← updated condition -->
+      @if (hasCookies()) {
         <div class="mt-4 text-emerald-400 text-sm">✅ cookies.txt is currently loaded</div>
       } @else {
         <div class="mt-4 text-amber-400 text-sm">No cookies loaded</div>
@@ -322,31 +379,6 @@
           </div>
         </div>
       }
-    </div>
-  }
-
-  <!-- Compact Player -->
-  @if (currentVideo()) {
-    <div class="fixed bottom-0 left-0 right-0 bg-zinc-900 border-t border-zinc-700 p-2.5 md:p-4">
-      <div class="max-w-4xl mx-auto flex items-start gap-3">
-        <div class="flex flex-col items-center gap-1.5 flex-shrink-0 pt-0.5">
-          <img [src]="currentVideo()!.thumbnailPath || ''" class="w-10 h-10 md:w-12 md:h-12 rounded-2xl object-cover" (error)="onImageError($event)">
-          <div class="flex gap-3 text-2xl md:text-4xl">
-            <button (click)="audio.paused ? audio.play() : audio.pause()" class="hover:scale-110 active:scale-95 transition">⏯️</button>
-            <button (click)="skipNext()" class="hover:scale-110 active:scale-95 transition">⏭️</button>
-          </div>
-        </div>
-        <div class="flex-1 min-w-0">
-          <div class="font-medium text-sm md:text-base leading-tight line-clamp-2">
-            {{ currentVideo()!.channel.title }} — {{ currentVideo()!.title }}
-          </div>
-          <input type="range" [value]="currentTime()" [max]="audio.duration || 100" (input)="scrubTo($event.target.value)" class="w-full accent-green-500 mt-1.5 md:mt-2">
-          <div class="flex justify-between text-xs text-zinc-400 mt-0.5">
-            <span>{{ formatDuration(currentTime()) }}</span>
-            <span>{{ formatDuration(currentVideo()!.duration) }}</span>
-          </div>
-        </div>
-      </div>
     </div>
   }
 </div>
