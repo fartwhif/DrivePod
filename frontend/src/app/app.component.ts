@@ -22,7 +22,7 @@ interface Config {
   preferredMono: boolean;
   autoPurgeDays: number;
   userAgent: string;
-  hasCookies: boolean;          // ← changed: never receives the actual cookies string
+  hasCookies: boolean;
   lastPlayedVideoId?: string | null;
 }
 
@@ -72,10 +72,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   preferredMono = signal(false);
   autoPurgeDays = signal(30);
   userAgent = signal('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-  hasCookies = signal(false);           // ← security: only boolean, never the cookies string
+  hasCookies = signal(false);
   currentVideoId = signal<string | null>(null);
 
-  private readonly APP_VERSION = '1.5.5';   // bumped for security fix
+  private readonly APP_VERSION = '1.5.5';
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
@@ -136,7 +136,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.preferredMono.set(config.preferredMono);
         this.autoPurgeDays.set(config.autoPurgeDays);
         this.userAgent.set(config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-        this.hasCookies.set(!!config.hasCookies);                    // ← only boolean
+        this.hasCookies.set(!!config.hasCookies);
         this.currentVideoId.set(config.lastPlayedVideoId || null);
 
         this.loadInitialPlaylist(true);
@@ -302,13 +302,32 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  // NEW: Previous track (used by UI button + media keys)
+  skipPrevious() {
+    if (!this.currentVideo()) return;
+    
+    const currentId = this.currentVideo()!.videoId;
+    const playlist = this.playlist();
+    const idx = playlist.findIndex(v => v.videoId === currentId);
+    
+    if (idx > 0) {
+      this.playVideo(playlist[idx - 1]);
+    } else {
+      // First track → restart current song from the beginning
+      this.audio.currentTime = 0;
+      if (this.audio.paused) {
+        this.audio.play();
+      }
+    }
+  }
+
   loadChannels() {
     this.http.get(`${this.apiUrl}/channels`).subscribe(data => this.channels.set(data as any[]));
   }
 
   private refreshConfig() {
     this.http.get<Config>(`${this.apiUrl}/config`).subscribe(config => {
-      this.hasCookies.set(!!config.hasCookies);   // ← only boolean
+      this.hasCookies.set(!!config.hasCookies);
     });
   }
 
@@ -327,11 +346,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  // UPDATED: Media keys fully wired (play/pause + next + previous)
   private setupMediaSessionHandlers() {
     if (!('mediaSession' in navigator)) return;
+
     navigator.mediaSession.setActionHandler('play', () => this.audio.play());
     navigator.mediaSession.setActionHandler('pause', () => this.audio.pause());
+    
+    // Forward / Next Track (hardware media key)
     navigator.mediaSession.setActionHandler('nexttrack', () => this.skipNext());
+    
+    // Back / Previous Track (hardware media key)
+    navigator.mediaSession.setActionHandler('previoustrack', () => this.skipPrevious());
   }
 
   private updateMediaSession(video: Video | null) {
