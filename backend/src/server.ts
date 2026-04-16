@@ -11,6 +11,8 @@ import path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import https from 'https';
+import compression from 'compression';
+import type { Request, Response } from 'express';
 
 const execPromise = promisify(exec);
 
@@ -32,10 +34,49 @@ const parser = new Parser({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// === SAFE EXEC WITH FULL ERROR LOGGING ===
+async function safeExec(cmd: string, context: string): Promise<{ stdout: string; stderr: string }> {
+  try {
+    const result = await execPromise(cmd, { maxBuffer: 50 * 1024 * 1024 });
+    return { stdout: result.stdout || '', stderr: result.stderr || '' };
+  } catch (err: any) {
+    console.error(`❌ [${context}] Command failed`);
+    console.error(`   Command: ${cmd}`);
+    if (err.stdout) console.error(`   stdout: ${err.stdout}`);
+    if (err.stderr) console.error(`   stderr: ${err.stderr}`);
+    console.error(`   Error: ${err.message}`);
+    throw err;
+  }
+}
+
+// === CRITICAL 56K MODEM OPTIMIZATIONS ===
+app.use(compression({
+  level: 6,
+  threshold: 512,
+  filter: (req: Request, res: Response) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
+
 app.use(cors());
 app.use(bodyParser.json());
 app.use(upload.single('cookies'));
-app.use('/cache', express.static(CACHE_DIR));
+
+app.use('/cache', express.static(CACHE_DIR, {
+  maxAge: '1d',
+  etag: true,
+  lastModified: true,
+  setHeaders: (res, filepath) => {
+    if (filepath.endsWith('.mp3')) {
+      res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+    } else if (/\.(jpe?g|webp|png)$/i.test(filepath)) {
+      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    } else {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    }
+  }
+}));
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 if (!fs.existsSync(RSS_CACHE_DIR)) fs.mkdirSync(RSS_CACHE_DIR, { recursive: true });
@@ -119,7 +160,7 @@ async function yieldToEventLoop() {
   return new Promise(resolve => setImmediate(resolve));
 }
 
-// === FULL CONSISTENCY CLEANUP ===
+// === FULL CONSISTENCY CLEANUP (allows 1 or 2 thumbnails) ===
 async function cleanupCorruptedFolders() {
   console.log(`🧹 [${logTimestamp()}] Starting full consistency cleanup...`);
   if (!fs.existsSync(CACHE_DIR)) return;
@@ -149,13 +190,13 @@ async function cleanupCorruptedFolders() {
     const jsonCount = files.filter(f => f === `${videoId}.json`).length;
     const otherCount = files.length - mp3Count - thumbCount - jsonCount;
 
-    let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 1 || otherCount > 0;
+    let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 2 || otherCount > 0;
 
     if (isCorrupted) {
       let reason = isEmpty ? 'Empty folder' : 'Unknown';
       if (mp3Count !== 1) reason = mp3Count === 0 ? 'No .mp3 file' : 'Multiple .mp3 files';
       else if (jsonCount !== 1) reason = jsonCount === 0 ? 'No .json file' : 'Multiple .json files';
-      else if (thumbCount > 1) reason = 'Multiple thumbnails';
+      else if (thumbCount > 2) reason = `Too many thumbnails (${thumbCount})`;
       else if (otherCount > 0) reason = 'Unexpected files';
       console.log(`   🚨 CORRUPTED: ${videoId} → ${reason}`);
       try {
@@ -349,9 +390,7 @@ async function scrapeTab(channelId: string, tab: string, maxDays: number): Promi
     const dateStr = date.toISOString().split('T')[0].replace(/-/g, '');
 
     const cmd = `yt-dlp --break-on-reject --extractor-args "youtubetab:approximate_date" --no-progress --dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
-    const { stdout } = await execPromise(
-      cmd, { maxBuffer: 50 * 1024 * 1024 }
-    );
+    const { stdout } = await safeExec(cmd, `scrapeTab ${tab} for ${channelId}`);
     return stdout.trim().split('\n')
       .filter(l => l.trim())
       .map(line => {
@@ -424,7 +463,7 @@ async function getLatestVideosAlternative(channelId: string, maxDays: number, in
       where: { channelId, ignored: true },
       select: { videoId: true }
     });
-    ignoredVideoIds = new Set(ignoredVideos.map(v => v.videoId));
+    ignoredVideoIds = new Set(ignoredVideos.map((v: { videoId: string }) => v.videoId));
   }
 
   const [videos, streams, shorts] = await Promise.all([
@@ -443,7 +482,7 @@ async function getLatestVideosAlternative(channelId: string, maxDays: number, in
   return uniqueItems;
 }
 
-// === DOWNLOAD + TRANSCODE ===
+// === DOWNLOAD + TRANSCODE (FIXED THUMBNAIL RESIZE) ===
 async function downloadAndProcessVideo(
   videoInfo: any,
   videoUrl: string,
@@ -479,7 +518,8 @@ async function downloadAndProcessVideo(
       `--user-agent "${userAgent}" ` +
       cookieFlag +
       `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`;
-    await execPromise(downloadCmd, { maxBuffer: 50 * 1024 * 1024 });
+    
+    await safeExec(downloadCmd, `yt-dlp download ${videoId}`);
 
     let raw = path.join(videoDir, `${videoId}.webm`);
     const alt = path.join(videoDir, `${videoId}.m4a`);
@@ -489,19 +529,30 @@ async function downloadAndProcessVideo(
 
     if (onStatusChange) onStatusChange('Transcoding');
     console.log(`🎚️ Transcoding ${videoId} (${videoTitle})...`);
- 
+
     const files = fs.readdirSync(videoDir);
-    const thumbFile = files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
-    const thumbPath = thumbFile ? path.join(videoDir, thumbFile) : null;
- 
+    let originalThumbFile = files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
+    let thumbnailPath: string | null = null;
+
+    if (originalThumbFile) {
+      const originalPath = path.join(videoDir, originalThumbFile);
+      const smallPath = path.join(videoDir, `${videoId}-small.webp`);
+
+      try {
+        // FIXED: Safe scaling (no pad filter)
+        await safeExec(`ffmpeg -i "${originalPath}" -vf "scale=400:225:force_original_aspect_ratio=decrease" -y "${smallPath}"`, `thumbnail resize ${videoId}`);
+        thumbnailPath = `/cache/${videoId}/${videoId}-small.webp`;
+        console.log(`📏 Created small thumbnail: ${videoId}-small.webp`);
+      } catch (e: any) {
+        console.warn(`⚠️ Could not create small thumbnail for ${videoId}`);
+        thumbnailPath = `/cache/${videoId}/${originalThumbFile}`;
+      }
+    }
+
     const safeTitle = videoTitle.replace(/"/g, '\\"');
     const safeAuthor = author.replace(/"/g, '\\"');
-    const dateStr = publishedAt instanceof Date
-      ? publishedAt.toISOString().split('T')[0]
-      : new Date().toISOString().split('T')[0];
-    const dateStr2 = publishedAt instanceof Date
-      ? publishedAt.toISOString()
-      : new Date().toISOString();
+    const dateStr = publishedAt instanceof Date ? publishedAt.toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+    const dateStr2 = publishedAt instanceof Date ? publishedAt.toISOString() : new Date().toISOString();
 
     const commentData = { ...videoInfo, publishedAt: dateStr2 };
     const metadataContent = `;FFMETADATA1
@@ -513,8 +564,15 @@ comment=${JSON.stringify(commentData)}
     fs.writeFileSync(metadataPath, metadataContent, 'utf-8');
 
     let args: string[];
-    if (thumbPath) {
-      args = ['-i', raw, '-i', thumbPath, '-f', 'ffmetadata', '-i', metadataPath,
+    if (thumbnailPath && thumbnailPath.includes('-small.webp')) {
+      const smallThumbPath = path.join(videoDir, `${videoId}-small.webp`);
+      args = ['-i', raw, '-i', smallThumbPath, '-f', 'ffmetadata', '-i', metadataPath,
+              '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
+              '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
+              '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+    } else if (originalThumbFile) {
+      const originalThumb = path.join(videoDir, originalThumbFile);
+      args = ['-i', raw, '-i', originalThumb, '-f', 'ffmetadata', '-i', metadataPath,
               '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
               '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
               '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
@@ -525,14 +583,16 @@ comment=${JSON.stringify(commentData)}
               '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     }
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
- 
+
     const ffmpegCmd = `ffmpeg ${args.join(' ')}`;
-    await execPromise(ffmpegCmd, { maxBuffer: 50 * 1024 * 1024 });
+    await safeExec(ffmpegCmd, `ffmpeg transcoding ${videoId}`);
+
     if (fs.existsSync(raw)) fs.unlinkSync(raw);
 
     success = true;
     return true;
   } catch (err: any) {
+    console.error(`❌ Download / FFmpeg failed for ${videoId}`);
     const errorMsg = (err.stderr || err.message || '').toLowerCase();
 
     if (errorMsg.includes('cookies are no longer valid') ||
@@ -555,7 +615,6 @@ comment=${JSON.stringify(commentData)}
       return false;
     }
 
-    console.error(`❌ Download failed for ${videoId}:`, err.message);
     return false;
   } finally {
     if (fs.existsSync(metadataPath)) {
@@ -580,7 +639,7 @@ function escapeFFmetadata(value: string): string {
 
 async function getAudioDuration(filePath: string): Promise<number | null> {
   try {
-    const { stdout } = await execPromise(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, { maxBuffer: 50 * 1024 * 1024 });
+    const { stdout } = await safeExec(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, `ffprobe duration ${filePath}`);
     const d = parseFloat(stdout.trim());
     return isNaN(d) ? null : Math.round(d * 10) / 10;
   } catch {
@@ -660,7 +719,7 @@ async function harvestAndPurge() {
               (await prisma.video.findMany({
                 where: { videoId: { in: candidateIds } },
                 select: { videoId: true }
-              })).map(v => v.videoId)
+              })).map((v: { videoId: string }) => v.videoId)
             );
 
             const newVideosToInsert: any[] = [];
@@ -710,7 +769,7 @@ async function harvestAndPurge() {
                 let thumbnailPath: string | null = null;
                 try {
                   const files = fs.readdirSync(videoDir);
-                  const thumbFile = files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
+                  const thumbFile = files.find(f => f.endsWith('-small.webp')) || files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
                   if (thumbFile) thumbnailPath = `/cache/${videoId}/${thumbFile}`;
                 } catch (e) {}
 
@@ -785,7 +844,6 @@ async function harvestAndPurge() {
 // ====================== API ROUTES ======================
 app.get('/api/harvest-status', (_, res) => res.json(harvestStatus));
 
-// ← SECURITY FIX: never send cookies string to browser
 app.get('/api/config', async (_, res) => {
   const maxDays = await getConfig('maxHarvestDays', '7');
   const preferredBitrate = await getConfig('preferredBitrate', '128');
@@ -802,7 +860,7 @@ app.get('/api/config', async (_, res) => {
     autoPurgeDays: parseInt(autoPurgeDays),
     lastPlayedVideoId: currentVideoId || null,
     userAgent,
-    hasCookies: !!cookieContent.trim()   // ← only boolean, never the actual cookies string
+    hasCookies: !!cookieContent.trim()
   });
 });
 
@@ -814,7 +872,7 @@ app.post('/api/config', async (req, res) => {
   if (preferredMono !== undefined) await setConfig('preferredMono', String(preferredMono));
   if (autoPurgeDays !== undefined) await setConfig('autoPurgeDays', String(autoPurgeDays));
   if (userAgent !== undefined) await setConfig('userAgent', userAgent);
-  if (cookies !== undefined) await setConfig('cookies', cookies);   // still accept from upload/clear
+  if (cookies !== undefined) await setConfig('cookies', cookies);
 
   res.json({ success: true });
 });
@@ -1012,4 +1070,5 @@ app.listen(port, () => {
   console.log(`   Cache: ` + CACHE_DIR);
   console.log(`   Data:  ` + DATA_DIR);
   console.log(`   ✅ Security: cookies string is NEVER sent to the browser`);
+  console.log(`   ✅ 56K MODEM OPTIMIZATIONS: compression + small thumbnails + full error logging enabled`);
 });

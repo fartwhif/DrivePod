@@ -75,7 +75,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   hasCookies = signal(false);
   currentVideoId = signal<string | null>(null);
 
-  private readonly APP_VERSION = '1.5.5';
+  // 56K MODEM OPTIMIZATIONS
+  lowBandwidthMode = signal(false);   // ← hides all thumbnails on slow connections
+
+  private readonly APP_VERSION = '1.5.6-56k';
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
@@ -120,12 +123,16 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   ngOnInit() {
-    console.log(`%c🚙📻 DrivePod Frontend v${this.APP_VERSION} initializing`, 'font-weight: bold; color: #22c55e; font-size: 13px');
+    console.log(`%c🚙📻 DrivePod Frontend v${this.APP_VERSION} (56K-optimized)`, 'font-weight: bold; color: #22c55e; font-size: 13px');
 
     this.titleService.setTitle(this.defaultPageTitle);
     this.activeTab.set('queue');
 
     this.loadChannels();
+
+    // Load low-bandwidth preference from localStorage
+    const savedLowBW = localStorage.getItem('drivepod-lowBandwidth');
+    if (savedLowBW !== null) this.lowBandwidthMode.set(savedLowBW === 'true');
 
     forkJoin({
       config: this.http.get<Config>(`${this.apiUrl}/config`)
@@ -152,7 +159,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
-    setInterval(() => this.loadInitialPlaylist(false), 30000);
+    // 56K OPTIMIZATION: reduced polling frequency
+    setInterval(() => this.loadInitialPlaylist(false), 120000);
   }
 
   ngAfterViewInit() {
@@ -302,7 +310,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  // NEW: Previous track (used by UI button + media keys)
   skipPrevious() {
     if (!this.currentVideo()) return;
     
@@ -313,7 +320,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (idx > 0) {
       this.playVideo(playlist[idx - 1]);
     } else {
-      // First track → restart current song from the beginning
       this.audio.currentTime = 0;
       if (this.audio.paused) {
         this.audio.play();
@@ -336,7 +342,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.harvestPollInterval = setInterval(() => {
       this.http.get<HarvestStatus>(`${this.apiUrl}/harvest-status`)
         .subscribe(status => this.harvestStatus.set(status));
-    }, 1000);
+    }, 4000);   // ← 56K friendly (was 1000ms)
   }
 
   private stopHarvestPolling() {
@@ -346,17 +352,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  // UPDATED: Media keys fully wired (play/pause + next + previous)
   private setupMediaSessionHandlers() {
     if (!('mediaSession' in navigator)) return;
 
     navigator.mediaSession.setActionHandler('play', () => this.audio.play());
     navigator.mediaSession.setActionHandler('pause', () => this.audio.pause());
-    
-    // Forward / Next Track (hardware media key)
     navigator.mediaSession.setActionHandler('nexttrack', () => this.skipNext());
-    
-    // Back / Previous Track (hardware media key)
     navigator.mediaSession.setActionHandler('previoustrack', () => this.skipPrevious());
   }
 
@@ -403,6 +404,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       autoPurgeDays: this.autoPurgeDays(),
       userAgent: this.userAgent()
     }).subscribe();
+  }
+
+  // NEW: Low-bandwidth toggle
+  toggleLowBandwidth() {
+    const newValue = !this.lowBandwidthMode();
+    this.lowBandwidthMode.set(newValue);
+    localStorage.setItem('drivepod-lowBandwidth', String(newValue));
   }
 
   onBitrateChange() { this.saveConfig(); }
