@@ -973,17 +973,50 @@ app.post('/api/channels/import', async (req, res) => {
   res.json({ success: true, results });
 });
 
+// === PLAYLIST ENDPOINT - exactly 20 per page + current-video guarantee on first page ===
 app.get('/api/playlist', async (req, res) => {
-  const take = Math.min(Math.max(parseInt(req.query.take as string) || 40, 10), 100);
+  const take = Math.min(Math.max(parseInt(req.query.take as string) || 20, 10), 100);
   const skip = parseInt(req.query.skip as string) || 0;
 
-  const videos = await prisma.video.findMany({
+  let videos = await prisma.video.findMany({
     where: { watched: false, ignored: false },
     orderBy: { publishedAt: 'desc' },
     include: { channel: true },
     take,
-    skip
+    skip,
   });
+
+  // If an unwatched item is marked as current but doesn't land on the FIRST page
+  // → either append it (if page has fewer than 20) OR replace the last item (oldest in page)
+  // to guarantee the "now playing" video is always visible while keeping page size exactly 20
+  if (skip === 0) {
+    const currentVideoId = await getConfig('currentVideoId', '');
+    if (currentVideoId) {
+      if (!videos.some(v => v.videoId === currentVideoId)) {
+        const currentVideo = await prisma.video.findUnique({
+          where: {
+            videoId: currentVideoId,
+            watched: false,
+            ignored: false
+          },
+          include: { channel: true },
+        });
+
+        if (currentVideo) {
+          if (videos.length >= take) {
+            // Page is full (20 items) → replace the last (oldest) item
+            videos[videos.length - 1] = currentVideo;
+            console.log(`📌 Replaced oldest item in first page with current video ${currentVideoId}`);
+          } else {
+            // Fewer than 20 items total → simply append
+            videos.push(currentVideo);
+            console.log(`📌 Appended current video ${currentVideoId} to first page`);
+          }
+        }
+      }
+    }
+  }
+
   res.json(videos);
 });
 
