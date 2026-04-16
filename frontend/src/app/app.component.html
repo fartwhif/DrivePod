@@ -57,7 +57,35 @@
         <!-- Info + Progress -->
         <div class="flex-1 min-w-0">
           <div class="font-semibold text-xl leading-tight line-clamp-2 mb-1">{{ video.title }}</div>
-          <div class="text-zinc-400 mb-6">{{ video.channel.title }}</div>
+          <div class="text-zinc-400 mb-4">{{ video.channel.title }}</div>
+
+          <!-- 3-WAY AUTOPLAY SWITCH -->
+          <div class="flex items-center justify-between mb-5 text-sm">
+            <span class="text-zinc-400">Autoplay after finish:</span>
+            <div class="flex bg-zinc-800 rounded-3xl p-px shadow-inner">
+              <button 
+                (click)="setAutoplayMode('newest')"
+                [class.bg-emerald-600]="autoplayMode() === 'newest'"
+                [class.text-white]="autoplayMode() === 'newest'"
+                class="px-6 py-1.5 text-xs font-medium rounded-3xl transition-all">
+                Newest
+              </button>
+              <button 
+                (click)="setAutoplayMode('next')"
+                [class.bg-emerald-600]="autoplayMode() === 'next'"
+                [class.text-white]="autoplayMode() === 'next'"
+                class="px-6 py-1.5 text-xs font-medium rounded-3xl transition-all">
+                Next
+              </button>
+              <button 
+                (click)="setAutoplayMode('none')"
+                [class.bg-emerald-600]="autoplayMode() === 'none'"
+                [class.text-white]="autoplayMode() === 'none'"
+                class="px-6 py-1.5 text-xs font-medium rounded-3xl transition-all">
+                None
+              </button>
+            </div>
+          </div>
 
           <!-- Progress bar -->
           <div class="mb-6">
@@ -109,7 +137,6 @@
     <div class="grid gap-4">
       @for (v of playlist(); track v.videoId) {
         <div (click)="playVideo(v)" class="flex gap-4 bg-zinc-900 hover:bg-zinc-800 p-4 rounded-2xl cursor-pointer transition items-start">
-          <!-- 56K OPTIMIZED THUMBNAIL -->
           @if (!lowBandwidthMode()) {
             <img [src]="v.thumbnailPath || ''" 
                  loading="lazy"
@@ -156,7 +183,6 @@
         </div>
       }
 
-      <!-- Infinite Scroll Sentinel -->
       <div #loadMoreTrigger class="col-span-full py-12 flex justify-center items-center text-zinc-400">
         @if (isLoadingMore()) {
           <div class="flex items-center gap-3">
@@ -271,7 +297,6 @@
                  class="bg-zinc-800 px-4 py-2 rounded-xl ml-3 text-white w-full max-w-md">
         </div>
 
-        <!-- 56K MODEM TOGGLE -->
         <div class="flex items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
           <label class="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" 
