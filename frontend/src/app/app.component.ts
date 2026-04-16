@@ -96,7 +96,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   });
 
   // Infinite Scroll
-  readonly PAGE_SIZE = 40;
+  readonly PAGE_SIZE = 20;
   isLoadingMore = signal(false);
   hasMore = signal(true);
 
