@@ -65,6 +65,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   currentVideo = signal<Video | null>(null);
   audio = new Audio();
   currentTime = signal(0);
+  isScrubbing = signal(false);
 
   // Config
   maxHarvestDays = signal(7);
@@ -76,7 +77,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   currentVideoId = signal<string | null>(null);
 
   // 56K MODEM OPTIMIZATIONS
-  lowBandwidthMode = signal(false);   // ← hides all thumbnails on slow connections
+  lowBandwidthMode = signal(false);
 
   private readonly APP_VERSION = '1.5.6-56k';
 
@@ -110,7 +111,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private lastProgressSave = 0;
   private readonly PROGRESS_SAVE_INTERVAL = 10000;
 
-  private hasInitialized = false;
+  // Deduplication for saveProgress
+  private lastSavedVideoId: string | null = null;
+  private lastSavedProgress: number = -1;
+
+  private saveDebounceTimer: any = null;
+
   private harvestPollInterval: any = null;
 
   constructor(
@@ -130,7 +136,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     this.loadChannels();
 
-    // Load low-bandwidth preference from localStorage
     const savedLowBW = localStorage.getItem('drivepod-lowBandwidth');
     if (savedLowBW !== null) this.lowBandwidthMode.set(savedLowBW === 'true');
 
@@ -159,7 +164,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
-    // 56K OPTIMIZATION: reduced polling frequency
     setInterval(() => this.loadInitialPlaylist(false), 120000);
   }
 
@@ -170,6 +174,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   ngOnDestroy() {
     if (this.observer) this.observer.disconnect();
     this.stopHarvestPolling();
+    if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
   }
 
@@ -244,7 +249,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.saveProgress(this.audio.currentTime || this.audio.duration || 0);
       this.markAsWatchedAndPlayNext();
     };
-    this.audio.onseeked = () => this.saveProgress(this.audio.currentTime);
+
+    this.audio.onseeked = () => {
+      this.isScrubbing.set(false);
+
+      if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
+
+      this.saveDebounceTimer = setTimeout(() => {
+        this.saveProgress(this.audio.currentTime);
+        this.saveDebounceTimer = null;
+      }, 300);
+    };
 
     window.addEventListener('beforeunload', this.handleBeforeUnload.bind(this));
   }
@@ -254,19 +269,48 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private throttledSaveProgress(): void {
-    if (!this.currentVideo()) return;
+    if (!this.currentVideo() || this.isScrubbing()) return;
     const now = Date.now();
     if (now - this.lastProgressSave < this.PROGRESS_SAVE_INTERVAL) return;
     this.lastProgressSave = now;
     this.saveProgress(this.audio.currentTime);
   }
 
+  // === DEDUPLICATED saveProgress ===
   private saveProgress(progress: number): void {
     const video = this.currentVideo();
     if (!video?.videoId) return;
+
+    const progressInt = Math.floor(progress);
+
+    // Discard if this is exactly the same video + same progress value as the last call
+    if (video.videoId === this.lastSavedVideoId && progressInt === this.lastSavedProgress) {
+      return;
+    }
+
+    // Update last saved values
+    this.lastSavedVideoId = video.videoId;
+    this.lastSavedProgress = progressInt;
+
     this.http.patch(`${this.apiUrl}/video/${video.videoId}/progress`, {
-      progress: Math.floor(progress)
+      progress: progressInt
     }).subscribe({ error: () => {} });
+  }
+
+  onRangeInput(value: string | number) {
+    this.isScrubbing.set(true);
+    const time = Number(value);
+    this.audio.currentTime = time;
+    this.currentTime.set(time);
+  }
+
+  onRangeChange(value: string | number) {
+    this.isScrubbing.set(false);
+    const time = Number(value);
+    this.audio.currentTime = time;
+    this.currentTime.set(time);
+    this.saveProgress(time);
+    this.lastProgressSave = Date.now();
   }
 
   playVideo(video: Video) {
@@ -342,7 +386,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.harvestPollInterval = setInterval(() => {
       this.http.get<HarvestStatus>(`${this.apiUrl}/harvest-status`)
         .subscribe(status => this.harvestStatus.set(status));
-    }, 4000);   // ← 56K friendly (was 1000ms)
+    }, 4000);
   }
 
   private stopHarvestPolling() {
@@ -406,7 +450,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }).subscribe();
   }
 
-  // NEW: Low-bandwidth toggle
   toggleLowBandwidth() {
     const newValue = !this.lowBandwidthMode();
     this.lowBandwidthMode.set(newValue);
@@ -466,10 +509,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       },
       error: () => alert('Failed to clear cookies')
     });
-  }
-
-  scrubTo(value: string | number) {
-    this.audio.currentTime = Number(value);
   }
 
   onImageError(event: Event) {

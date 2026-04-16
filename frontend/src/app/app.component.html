@@ -64,7 +64,8 @@
             <input type="range" 
                    [value]="currentTime()" 
                    [max]="audio.duration || 100" 
-                   (input)="scrubTo($event.target.value)" 
+                   (input)="onRangeInput($event.target.value)"
+                   (change)="onRangeChange($event.target.value)"
                    class="w-full accent-green-500 cursor-pointer">
             <div class="flex justify-between text-xs text-zinc-400 mt-1">
               <span>{{ formatDuration(currentTime()) }}</span>
