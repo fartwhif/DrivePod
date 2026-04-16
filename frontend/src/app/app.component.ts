@@ -79,7 +79,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // 56K MODEM OPTIMIZATIONS
   lowBandwidthMode = signal(false);
 
-  private readonly APP_VERSION = '1.5.6-56k';
+  // === NEW: 3-way Autoplay Mode ===
+  autoplayMode = signal<'newest' | 'next' | 'none'>('newest');
+
+  private readonly APP_VERSION = '1.5.7-56k';
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
@@ -111,7 +114,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private lastProgressSave = 0;
   private readonly PROGRESS_SAVE_INTERVAL = 10000;
 
-  // Deduplication for saveProgress
   private lastSavedVideoId: string | null = null;
   private lastSavedProgress: number = -1;
 
@@ -138,6 +140,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     const savedLowBW = localStorage.getItem('drivepod-lowBandwidth');
     if (savedLowBW !== null) this.lowBandwidthMode.set(savedLowBW === 'true');
+
+    // Load saved autoplay mode
+    const savedMode = localStorage.getItem('drivepod-autoplayMode');
+    if (savedMode && ['newest', 'next', 'none'].includes(savedMode)) {
+      this.autoplayMode.set(savedMode as 'newest' | 'next' | 'none');
+    }
 
     forkJoin({
       config: this.http.get<Config>(`${this.apiUrl}/config`)
@@ -276,19 +284,16 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.saveProgress(this.audio.currentTime);
   }
 
-  // === DEDUPLICATED saveProgress ===
   private saveProgress(progress: number): void {
     const video = this.currentVideo();
     if (!video?.videoId) return;
 
     const progressInt = Math.floor(progress);
 
-    // Discard if this is exactly the same video + same progress value as the last call
     if (video.videoId === this.lastSavedVideoId && progressInt === this.lastSavedProgress) {
       return;
     }
 
-    // Update last saved values
     this.lastSavedVideoId = video.videoId;
     this.lastSavedProgress = progressInt;
 
@@ -328,16 +333,59 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.audio.currentTime = video.progress || 0;
   }
 
+  setAutoplayMode(mode: 'newest' | 'next' | 'none') {
+    this.autoplayMode.set(mode);
+    localStorage.setItem('drivepod-autoplayMode', mode);
+  }
+
   markAsWatchedAndPlayNext() {
     if (!this.currentVideo()) return;
-    const videoId = this.currentVideo()!.videoId;
+    const finishedVideoId = this.currentVideo()!.videoId;
 
     this.saveCurrentVideo(null);
 
-    this.http.post(`${this.apiUrl}/video/${videoId}/watched`, {})
+    this.http.post(`${this.apiUrl}/video/${finishedVideoId}/watched`, {})
       .subscribe(() => {
         this.currentVideo.set(null);
         this.updatePageTitle(null);
+
+        const mode = this.autoplayMode();
+
+        if (mode === 'none') {
+          this.loadInitialPlaylist(false);
+          return;
+        }
+
+        if (mode === 'next') {
+          const playlist = this.playlist();
+          const idx = playlist.findIndex(v => v.videoId === finishedVideoId);
+
+          if (idx >= 0 && idx < playlist.length - 1) {
+            this.playVideo(playlist[idx + 1]);
+          } else if (this.hasMore()) {
+            const skip = playlist.length;
+            this.isLoadingMore.set(true);
+
+            this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`)
+              .subscribe({
+                next: (newVideos) => {
+                  this.playlist.update(current => [...current, ...newVideos]);
+                  this.hasMore.set(newVideos.length === this.PAGE_SIZE);
+                  this.isLoadingMore.set(false);
+                  if (newVideos.length > 0) this.playVideo(newVideos[0]);
+                },
+                error: () => {
+                  this.isLoadingMore.set(false);
+                  this.loadInitialPlaylist(false);
+                }
+              });
+          } else {
+            this.loadInitialPlaylist(false);
+          }
+          return;
+        }
+
+        // newest (default)
         this.loadInitialPlaylist(true);
       });
   }
