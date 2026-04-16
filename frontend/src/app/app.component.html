@@ -1,5 +1,5 @@
 <div class="max-w-4xl mx-auto p-6 bg-zinc-950 text-white min-h-screen font-sans">
-  <h1 class="text-3xl font-bold mb-6 flex items-center gap-2">🚙📻 DrivePod</h1>
+  <h1 class="text-3xl font-bold mb-6 flex items-center gap-2">🚙📻 DrivePod <span class="text-xs bg-emerald-900 text-emerald-300 px-2 py-px rounded font-mono">56K</span></h1>
 
   <!-- Tabs -->
   <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner">
@@ -37,14 +37,22 @@
     </button>
   </div>
 
-  <!-- Now Playing Player - Integrated at the top, only visible when a video is loaded -->
+  <!-- Now Playing Player -->
   @if (currentVideo(); as video) {
     <div class="mb-8 bg-zinc-900 border border-zinc-700 rounded-3xl p-6">
       <div class="flex flex-col lg:flex-row gap-6 items-start">
-        <!-- Thumbnail -->
-        <img [src]="video.thumbnailPath || ''" 
-             class="w-32 h-32 md:w-40 md:h-24 lg:w-48 lg:h-28 object-cover rounded-2xl flex-shrink-0 shadow-inner"
-             (error)="onImageError($event)">
+        <!-- Thumbnail - 56K optimized -->
+        @if (!lowBandwidthMode()) {
+          <img [src]="video.thumbnailPath || ''" 
+               loading="eager"
+               decoding="async"
+               width="192"
+               height="108"
+               class="w-32 h-32 md:w-40 md:h-24 lg:w-48 lg:h-28 object-cover rounded-2xl flex-shrink-0 shadow-inner"
+               (error)="onImageError($event)">
+        } @else {
+          <div class="w-32 h-32 md:w-40 md:h-24 lg:w-48 lg:h-28 bg-zinc-800 rounded-2xl flex items-center justify-center text-4xl flex-shrink-0">📻</div>
+        }
 
         <!-- Info + Progress -->
         <div class="flex-1 min-w-0">
@@ -95,12 +103,24 @@
     </div>
   }
 
-  <!-- Queue Tab (Infinite Scroll) -->
+  <!-- Queue Tab -->
   @if (activeTab() === 'queue') {
     <div class="grid gap-4">
       @for (v of playlist(); track v.videoId) {
         <div (click)="playVideo(v)" class="flex gap-4 bg-zinc-900 hover:bg-zinc-800 p-4 rounded-2xl cursor-pointer transition items-start">
-          <img [src]="v.thumbnailPath || ''" class="w-20 h-20 object-cover rounded-xl flex-shrink-0" (error)="onImageError($event)">
+          <!-- 56K OPTIMIZED THUMBNAIL -->
+          @if (!lowBandwidthMode()) {
+            <img [src]="v.thumbnailPath || ''" 
+                 loading="lazy"
+                 decoding="async"
+                 fetchpriority="low"
+                 width="80"
+                 height="80"
+                 class="w-20 h-20 object-cover rounded-xl flex-shrink-0" 
+                 (error)="onImageError($event)">
+          } @else {
+            <div class="w-20 h-20 bg-zinc-800 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">📻</div>
+          }
 
           <div class="flex-1 min-w-0">
             <div class="font-medium line-clamp-2">{{ v.title }}</div>
@@ -248,6 +268,17 @@
           <span class="font-medium">User-Agent:</span>
           <input [(ngModel)]="userAgent" (ngModelChange)="saveConfig()" 
                  class="bg-zinc-800 px-4 py-2 rounded-xl ml-3 text-white w-full max-w-md">
+        </div>
+
+        <!-- 56K MODEM TOGGLE -->
+        <div class="flex items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" 
+                   [ngModel]="lowBandwidthMode()" 
+                   (ngModelChange)="toggleLowBandwidth()">
+            <span class="font-medium">Low Bandwidth Mode</span>
+          </label>
+          <span class="text-xs text-amber-400">(hides thumbnails • 56K modem friendly)</span>
         </div>
       </div>
     </div>
