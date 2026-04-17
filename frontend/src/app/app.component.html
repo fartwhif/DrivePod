@@ -1,13 +1,13 @@
-<div class="max-w-4xl mx-auto p-6 bg-zinc-950 text-white min-h-screen font-sans">
-  <h1 class="text-3xl font-bold mb-6 flex items-center gap-2">🚙📻 DrivePod <span class="text-xs bg-emerald-900 text-emerald-300 px-2 py-px rounded font-mono">56K</span></h1>
+<div class="max-w-4xl mx-auto p-3 sm:p-6 bg-zinc-950 text-white min-h-screen font-sans">
+  <h1 class="text-3xl font-bold mb-6 flex items-center gap-2">🚙📻 DrivePod</h1>
 
   <!-- Tabs -->
-  <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner">
+  <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner overflow-x-auto">
     <button
       (click)="setTab('queue')"
       [class.bg-zinc-800]="activeTab() === 'queue'"
       [class.text-white]="activeTab() === 'queue'"
-      class="flex-1 py-3 px-6 text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2">
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
       <span>📜</span>
       <span>Queue</span>
     </button>
@@ -15,7 +15,7 @@
       (click)="setTab('harvest')"
       [class.bg-zinc-800]="activeTab() === 'harvest'"
       [class.text-white]="activeTab() === 'harvest'"
-      class="flex-1 py-3 px-6 text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2">
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
       <span>🔄</span>
       <span>Harvest</span>
     </button>
@@ -23,7 +23,7 @@
       (click)="setTab('settings')"
       [class.bg-zinc-800]="activeTab() === 'settings'"
       [class.text-white]="activeTab() === 'settings'"
-      class="flex-1 py-3 px-6 text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2">
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
       <span>⚙️</span>
       <span>Settings</span>
     </button>
@@ -31,92 +31,38 @@
       (click)="setTab('import')"
       [class.bg-zinc-800]="activeTab() === 'import'"
       [class.text-white]="activeTab() === 'import'"
-      class="flex-1 py-3 px-6 text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2">
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
       <span>📥</span>
       <span>Import</span>
     </button>
   </div>
 
-  <!-- Now Playing Player -->
+  <!-- Now Playing Player - RIGID LAYOUT (no responsive direction changes, link will never disappear) -->
   @if (currentVideo(); as video) {
-    <div class="mb-8 bg-zinc-900 border border-zinc-700 rounded-3xl p-6">
-      <div class="flex flex-col lg:flex-row gap-6 items-start">
-        <!-- Thumbnail - 56K optimized -->
+    <div class="mb-8 bg-zinc-900 border border-zinc-700 rounded-3xl p-3">
+
+      <!-- TOP ROW: Thumbnail left + (immediately to its right) playback buttons + link icon -->
+      <!-- Fixed horizontal layout - no flex-col ever, no md: breakpoints, no wrapping -->
+      <div class="flex items-center gap-4">
+        
+        <!-- Thumbnail (exactly the size you liked) -->
         @if (!lowBandwidthMode()) {
           <img [src]="video.thumbnailPath || ''" 
                loading="eager"
                decoding="async"
                width="192"
                height="108"
-               class="w-32 h-32 md:w-40 md:h-24 lg:w-48 lg:h-28 object-cover rounded-2xl flex-shrink-0 shadow-inner"
+               class="w-32 h-32 object-cover rounded-2xl flex-shrink-0 shadow-inner"
                (error)="onImageError($event)">
         } @else {
-          <div class="w-32 h-32 md:w-40 md:h-24 lg:w-48 lg:h-28 bg-zinc-800 rounded-2xl flex items-center justify-center text-4xl flex-shrink-0">📻</div>
+          <div class="w-32 h-32 bg-zinc-800 rounded-2xl flex items-center justify-center text-4xl flex-shrink-0">📻</div>
         }
 
-        <!-- Info + Progress -->
-        <div class="flex-1 min-w-0">
-          <div class="font-semibold text-xl leading-tight line-clamp-2 mb-1">{{ video.title }}</div>
-          <div class="text-zinc-400 mb-4">{{ video.channel.title }}</div>
-
-          <!-- 5-WAY AUTOPLAY SWITCH -->
-          <div class="flex items-center justify-between mb-5 text-sm">
-            <span class="text-zinc-400">Autoplay mode:</span>
-            <div class="flex bg-zinc-800 rounded-3xl p-px shadow-inner text-xs">
-              <button 
-                (click)="setAutoplayMode('newest')"
-                [class.bg-emerald-600]="autoplayMode() === 'newest'"
-                [class.text-white]="autoplayMode() === 'newest'"
-                class="px-4 py-1.5 font-medium rounded-3xl transition-all">
-                Newest
-              </button>
-              <button 
-                (click)="setAutoplayMode('newer')"
-                [class.bg-emerald-600]="autoplayMode() === 'newer'"
-                [class.text-white]="autoplayMode() === 'newer'"
-                class="px-4 py-1.5 font-medium rounded-3xl transition-all">
-                Newer
-              </button>
-              <button 
-                (click)="setAutoplayMode('older')"
-                [class.bg-emerald-600]="autoplayMode() === 'older'"
-                [class.text-white]="autoplayMode() === 'older'"
-                class="px-4 py-1.5 font-medium rounded-3xl transition-all">
-                Older
-              </button>
-              <button 
-                (click)="setAutoplayMode('oldest')"
-                [class.bg-emerald-600]="autoplayMode() === 'oldest'"
-                [class.text-white]="autoplayMode() === 'oldest'"
-                class="px-4 py-1.5 font-medium rounded-3xl transition-all">
-                Oldest
-              </button>
-              <button 
-                (click)="setAutoplayMode('off')"
-                [class.bg-emerald-600]="autoplayMode() === 'off'"
-                [class.text-white]="autoplayMode() === 'off'"
-                class="px-4 py-1.5 font-medium rounded-3xl transition-all">
-                Off
-              </button>
-            </div>
-          </div>
-
-          <!-- Progress bar -->
-          <div class="mb-6">
-            <input type="range" 
-                   [value]="currentTime()" 
-                   [max]="audio.duration || 100" 
-                   (input)="onRangeInput($event.target.value)"
-                   (change)="onRangeChange($event.target.value)"
-                   class="w-full accent-green-500 cursor-pointer">
-            <div class="flex justify-between text-xs text-zinc-400 mt-1">
-              <span>{{ formatDuration(currentTime()) }}</span>
-              <span>{{ formatDuration(video.duration) }}</span>
-            </div>
-          </div>
-
-          <!-- Playback controls -->
-          <div class="flex items-center justify-center gap-8 text-4xl">
+        <!-- Everything to the right of thumbnail (rigid) -->
+        <div class="flex-1 flex items-center">
+          
+          <!-- Playback buttons (compact gap so link always fits on iPhone XR) -->
+          <div class="flex items-center gap-0 text-4xl">
             <button (click)="skipPrevious()" 
                     class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏮️</button>
             <button (click)="audio.paused ? audio.play() : audio.pause()" 
@@ -125,32 +71,46 @@
             </button>
             <button (click)="skipNext()" 
                     class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏭️</button>
+            <div class="ml-auto flex flex-col items-end gap-1">
+              <a [href]="'https://www.youtube.com/watch?v=' + video.videoId"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-sky-400 hover:text-sky-300 text-3xl leading-none flex items-center gap-1">
+                🔗
+              </a>
+            </div>
           </div>
         </div>
+      </div>
 
-        <!-- Extra info / link -->
-        <div class="flex flex-col items-end gap-3 lg:w-36">
-          <a [href]="'https://www.youtube.com/watch?v=' + video.videoId"
-             target="_blank"
-             rel="noopener noreferrer"
-             class="text-sky-400 hover:text-sky-300 text-3xl leading-none flex items-center gap-1">
-            🔗
-          </a>
-          @if (video.duration) {
-            <div class="text-xs text-zinc-400 px-3 py-1 bg-zinc-800 rounded-xl">
-              {{ formatDuration(video.duration) }}
-            </div>
-          }
+      <!-- MIDDLE ROW: Progress bar (full width of card) -->
+      <div class="mt-2">
+        <input type="range" 
+               [value]="currentTime()" 
+               [max]="audio.duration || 100" 
+               (input)="onRangeInput($event.target.value)"
+               (change)="onRangeChange($event.target.value)"
+               class="w-full accent-green-500 cursor-pointer">
+        <div class="flex justify-between text-xs text-zinc-400 mt-0">
+          <span>{{ formatDuration(currentTime()) }}</span>
+          <span>{{ formatDuration(video.duration) }}</span>
         </div>
       </div>
+
+      <!-- LAST ROW: Title + author (full width of card) -->
+      <div class="mt-2">
+        <div class="font-semibold text-xl leading-tight line-clamp-2">{{ video.title }}</div>
+        <div class="text-zinc-400 mt-1">{{ video.channel.title }}</div>
+      </div>
+
     </div>
   }
 
   <!-- Queue Tab -->
   @if (activeTab() === 'queue') {
-    <div class="grid gap-4">
+    <div class="grid gap-3">
       @for (v of playlist(); track v.videoId) {
-        <div (click)="playVideo(v)" class="flex gap-4 bg-zinc-900 hover:bg-zinc-800 p-4 rounded-2xl cursor-pointer transition items-start">
+        <div (click)="playVideo(v)" class="flex gap-3 bg-zinc-900 hover:bg-zinc-800 p-3 rounded-2xl cursor-pointer transition items-start">
           @if (!lowBandwidthMode()) {
             <img [src]="v.thumbnailPath || ''" 
                  loading="lazy"
@@ -165,9 +125,12 @@
           }
 
           <div class="flex-1 min-w-0">
-            <div class="font-medium line-clamp-2">{{ v.title }}</div>
+            <div class="font-medium line-clamp-2 leading-tight">{{ v.title }}</div>
             <div class="text-zinc-400 text-sm">
-              {{ v.channel.title }} • {{ v.publishedAt | date:'mediumDate' }} | {{ getTimeAgo(v.publishedAt) }}
+              {{ v.channel.title }} • {{ v.publishedAt | date:'mediumDate' }}
+            </div>
+            <div class="text-zinc-400 text-sm">
+              {{ getTimeAgo(v.publishedAt) }}
             </div>
           </div>
 
@@ -179,14 +142,11 @@
                target="_blank"
                rel="noopener noreferrer"
                (click)="$event.stopImmediatePropagation()"
-               class="text-sky-400 hover:text-sky-300 text-xl leading-none">
-              🔗
-            </a>
+               class="text-sky-400 hover:text-sky-300 text-xl leading-none self-center">🔗</a>
+            @if (currentVideo()?.videoId === v.videoId) {
+              <span class="text-green-400 self-center text-3xl">▶️</span>
+            }
           </div>
-
-          @if (currentVideo()?.videoId === v.videoId) {
-            <span class="text-green-400 self-center text-3xl">▶️</span>
-          }
         </div>
       }
 
@@ -276,6 +236,51 @@
   <!-- Settings Tab -->
   @if (activeTab() === 'settings') {
     <div class="mb-8 bg-zinc-900 p-5 rounded-2xl border border-zinc-700">
+      <!-- 5-WAY AUTOPLAY SWITCH - at top of Settings -->
+      <div class="mb-8">
+        <div class="flex items-center justify-between text-sm mb-3">
+          <span class="font-medium text-zinc-300">Autoplay mode</span>
+        </div>
+        <div class="flex bg-zinc-800 rounded-3xl p-px shadow-inner text-xs flex-wrap gap-px">
+          <button 
+            (click)="setAutoplayMode('newest')"
+            [class.bg-emerald-600]="autoplayMode() === 'newest'"
+            [class.text-white]="autoplayMode() === 'newest'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Newest
+          </button>
+          <button 
+            (click)="setAutoplayMode('newer')"
+            [class.bg-emerald-600]="autoplayMode() === 'newer'"
+            [class.text-white]="autoplayMode() === 'newer'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Newer
+          </button>
+          <button 
+            (click)="setAutoplayMode('older')"
+            [class.bg-emerald-600]="autoplayMode() === 'older'"
+            [class.text-white]="autoplayMode() === 'older'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Older
+          </button>
+          <button 
+            (click)="setAutoplayMode('oldest')"
+            [class.bg-emerald-600]="autoplayMode() === 'oldest'"
+            [class.text-white]="autoplayMode() === 'oldest'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Oldest
+          </button>
+          <button 
+            (click)="setAutoplayMode('off')"
+            [class.bg-emerald-600]="autoplayMode() === 'off'"
+            [class.text-white]="autoplayMode() === 'off'"
+            class="flex-1 px-4 py-3 font-medium rounded-3xl transition-all">
+            Off
+          </button>
+        </div>
+      </div>
+
+      <!-- Original settings content -->
       <div class="flex flex-wrap gap-8 items-center">
         <div>
           <span class="font-medium">Bitrate:</span>
