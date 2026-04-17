@@ -79,10 +79,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // 56K MODEM OPTIMIZATIONS
   lowBandwidthMode = signal(false);
 
-  // === NEW: 3-way Autoplay Mode ===
+  // 3-way Autoplay Mode
   autoplayMode = signal<'newest' | 'next' | 'none'>('newest');
 
-  private readonly APP_VERSION = '1.5.7-56k';
+  private readonly APP_VERSION = '1.5.9-56k';
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
@@ -141,7 +141,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const savedLowBW = localStorage.getItem('drivepod-lowBandwidth');
     if (savedLowBW !== null) this.lowBandwidthMode.set(savedLowBW === 'true');
 
-    // Load saved autoplay mode
     const savedMode = localStorage.getItem('drivepod-autoplayMode');
     if (savedMode && ['newest', 'next', 'none'].includes(savedMode)) {
       this.autoplayMode.set(savedMode as 'newest' | 'next' | 'none');
@@ -327,10 +326,23 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private loadAndSeekVideo(video: Video) {
     this.currentVideo.set(video);
     this.updatePageTitle(video);
+
     const monoStr = this.preferredMono() ? '-mono' : '';
     this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
+
+    const targetProgress = video.progress || 0;
+
+    this.audio.onloadedmetadata = () => {
+      if (targetProgress > 0) {
+        if (targetProgress < (this.audio.duration || Infinity) * 0.98) {
+          this.audio.currentTime = targetProgress;
+          console.log(`✅ Resumed ${video.videoId} from ${targetProgress.toFixed(1)}s`);
+        }
+      }
+      this.audio.onloadedmetadata = null;
+    };
+
     this.audio.load();
-    this.audio.currentTime = video.progress || 0;
   }
 
   setAutoplayMode(mode: 'newest' | 'next' | 'none') {
@@ -338,6 +350,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     localStorage.setItem('drivepod-autoplayMode', mode);
   }
 
+  // === UPDATED: Immediate removal from playlist on completion ===
   markAsWatchedAndPlayNext() {
     if (!this.currentVideo()) return;
     const finishedVideoId = this.currentVideo()!.videoId;
@@ -348,6 +361,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       .subscribe(() => {
         this.currentVideo.set(null);
         this.updatePageTitle(null);
+
+        // NEW: Instantly remove the finished item from the playlist UI
+        this.playlist.update(current => 
+          current.filter(v => v.videoId !== finishedVideoId)
+        );
 
         const mode = this.autoplayMode();
 
