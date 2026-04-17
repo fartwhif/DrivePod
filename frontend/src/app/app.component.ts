@@ -79,8 +79,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // 56K MODEM OPTIMIZATIONS
   lowBandwidthMode = signal(false);
 
-  // 3-way Autoplay Mode
-  autoplayMode = signal<'newest' | 'next' | 'none'>('newest');
+  // 5-WAY AUTOPLAY MODE
+  autoplayMode = signal<'newest' | 'newer' | 'older' | 'oldest' | 'off'>('newest');
 
   private readonly APP_VERSION = '1.5.9-56k';
 
@@ -118,7 +118,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private lastSavedProgress: number = -1;
 
   private saveDebounceTimer: any = null;
-
   private harvestPollInterval: any = null;
 
   constructor(
@@ -141,9 +140,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const savedLowBW = localStorage.getItem('drivepod-lowBandwidth');
     if (savedLowBW !== null) this.lowBandwidthMode.set(savedLowBW === 'true');
 
+    // Autoplay mode migration
     const savedMode = localStorage.getItem('drivepod-autoplayMode');
-    if (savedMode && ['newest', 'next', 'none'].includes(savedMode)) {
-      this.autoplayMode.set(savedMode as 'newest' | 'next' | 'none');
+    let targetMode: 'newest' | 'newer' | 'older' | 'oldest' | 'off' = 'newest';
+    if (savedMode === 'next') targetMode = 'older';
+    else if (savedMode === 'none') targetMode = 'off';
+    else if (['newest', 'newer', 'older', 'oldest', 'off'].includes(savedMode || '')) {
+      targetMode = savedMode as 'newest' | 'newer' | 'older' | 'oldest' | 'off';
+    }
+    this.autoplayMode.set(targetMode);
+    if (savedMode && savedMode !== targetMode) {
+      localStorage.setItem('drivepod-autoplayMode', targetMode);
     }
 
     forkJoin({
@@ -158,9 +165,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.hasCookies.set(!!config.hasCookies);
         this.currentVideoId.set(config.lastPlayedVideoId || null);
 
-        this.loadInitialPlaylist(true);
+        this.loadInitialPlaylist(config.lastPlayedVideoId || null, true);
       },
-      error: () => this.loadInitialPlaylist(true)
+      error: () => this.loadInitialPlaylist(null, true)
     });
 
     this.audio.ontimeupdate = () => {
@@ -171,7 +178,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
-    setInterval(() => this.loadInitialPlaylist(false), 120000);
+    // Playlist auto-refresh every 2 minutes
+    setInterval(() => this.loadInitialPlaylist(null, false), 120000);
   }
 
   ngAfterViewInit() {
@@ -185,20 +193,36 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
   }
 
-  private loadInitialPlaylist(autoplayAfterLoad: boolean = false) {
+  private loadInitialPlaylist(targetVideoId: string | null = null, autoplayAfterLoad: boolean = false) {
     this.isLoadingMore.set(false);
     this.hasMore.set(true);
-    this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=0`).subscribe({
-      next: (data) => {
-        this.playlist.set(data);
-        this.hasMore.set(data.length === this.PAGE_SIZE);
 
-        if (autoplayAfterLoad && !this.currentVideo()) {
-          this.initializeCurrentVideo(data);
+    const loadPage = (skip: number, accumulated: Video[] = []) => {
+      this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`).subscribe({
+        next: (data) => {
+          const newList = [...accumulated, ...data];
+          this.playlist.set(newList);
+          this.hasMore.set(data.length === this.PAGE_SIZE);
+
+          const targetFound = !targetVideoId || newList.some(v => v.videoId === targetVideoId);
+
+          if (targetFound || data.length < this.PAGE_SIZE) {
+            if (autoplayAfterLoad && !this.currentVideo()) {
+              this.initializeCurrentVideo(newList);
+            }
+          } else if (targetVideoId) {
+            loadPage(skip + this.PAGE_SIZE, newList);
+          }
+        },
+        error: (err) => {
+          console.error('Failed to load playlist', err);
+          this.playlist.set(accumulated);
+          this.hasMore.set(false);
         }
-      },
-      error: (err) => console.error('Failed to load playlist', err)
-    });
+      });
+    };
+
+    loadPage(0);
   }
 
   private loadMore() {
@@ -345,15 +369,28 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.audio.load();
   }
 
-  setAutoplayMode(mode: 'newest' | 'next' | 'none') {
+  setAutoplayMode(mode: 'newest' | 'newer' | 'older' | 'oldest' | 'off') {
     this.autoplayMode.set(mode);
     localStorage.setItem('drivepod-autoplayMode', mode);
   }
 
-  // === UPDATED: Immediate removal from playlist on completion ===
+  private getCandidate(playlist: Video[], mode: 'newer' | 'older', finishedTime: number): Video | undefined {
+    if (mode === 'older') {
+      return playlist.find(v => new Date(v.publishedAt).getTime() < finishedTime);
+    }
+    if (mode === 'newer') {
+      const newerOnes = playlist.filter(v => new Date(v.publishedAt).getTime() > finishedTime);
+      if (newerOnes.length > 0) return newerOnes[newerOnes.length - 1];
+    }
+    return undefined;
+  }
+
+  // === UPDATED: oldest now loads EVERY page until absolute oldest video is reached ===
   markAsWatchedAndPlayNext() {
     if (!this.currentVideo()) return;
-    const finishedVideoId = this.currentVideo()!.videoId;
+    const finishedVideo = this.currentVideo()!;
+    const finishedVideoId = finishedVideo.videoId;
+    const finishedPublishedAt = new Date(finishedVideo.publishedAt).getTime();
 
     this.saveCurrentVideo(null);
 
@@ -362,50 +399,69 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.currentVideo.set(null);
         this.updatePageTitle(null);
 
-        // NEW: Instantly remove the finished item from the playlist UI
-        this.playlist.update(current => 
-          current.filter(v => v.videoId !== finishedVideoId)
-        );
+        this.playlist.update(current => current.filter(v => v.videoId !== finishedVideoId));
 
         const mode = this.autoplayMode();
 
-        if (mode === 'none') {
-          this.loadInitialPlaylist(false);
+        if (mode === 'off') {
+          this.loadInitialPlaylist(null, false);
           return;
         }
 
-        if (mode === 'next') {
-          const playlist = this.playlist();
-          const idx = playlist.findIndex(v => v.videoId === finishedVideoId);
-
-          if (idx >= 0 && idx < playlist.length - 1) {
-            this.playVideo(playlist[idx + 1]);
-          } else if (this.hasMore()) {
-            const skip = playlist.length;
-            this.isLoadingMore.set(true);
-
-            this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`)
-              .subscribe({
-                next: (newVideos) => {
-                  this.playlist.update(current => [...current, ...newVideos]);
-                  this.hasMore.set(newVideos.length === this.PAGE_SIZE);
-                  this.isLoadingMore.set(false);
-                  if (newVideos.length > 0) this.playVideo(newVideos[0]);
-                },
-                error: () => {
-                  this.isLoadingMore.set(false);
-                  this.loadInitialPlaylist(false);
-                }
-              });
-          } else {
-            this.loadInitialPlaylist(false);
-          }
+        if (mode === 'newest') {
+          this.loadInitialPlaylist(null, true);
           return;
         }
 
-        // newest (default)
-        this.loadInitialPlaylist(true);
+        this.loadPlaylistForAutoplay(mode, finishedPublishedAt);
       });
+  }
+
+  private loadPlaylistForAutoplay(mode: 'newer' | 'older' | 'oldest', finishedTime: number) {
+    const playlist = this.playlist();
+    const isFullyLoaded = !this.hasMore();
+
+    let candidate: Video | undefined;
+
+    if (mode === 'oldest') {
+      // For absolute oldest we ONLY pick the final video AFTER the entire playlist is loaded
+      if (isFullyLoaded && playlist.length > 0) {
+        candidate = playlist[playlist.length - 1];
+      }
+    } else {
+      candidate = this.getCandidate(playlist, mode, finishedTime);
+    }
+
+    if (candidate) {
+      this.playVideo(candidate);
+      return;
+    }
+
+    if (isFullyLoaded) {
+      // Nothing found even after full load → safe fallback
+      if (playlist.length > 0) this.playVideo(playlist[0]);
+      else this.loadInitialPlaylist(null, false);
+      return;
+    }
+
+    // Load next page and continue (this is what makes "oldest" fetch every page)
+    this.isLoadingMore.set(true);
+    const skip = playlist.length;
+
+    this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`).subscribe({
+      next: (newVideos) => {
+        this.playlist.update(current => [...current, ...newVideos]);
+        this.hasMore.set(newVideos.length === this.PAGE_SIZE);
+        this.isLoadingMore.set(false);
+
+        // Recurse – for "oldest" this will keep going until the end
+        this.loadPlaylistForAutoplay(mode, finishedTime);
+      },
+      error: () => {
+        this.isLoadingMore.set(false);
+        this.loadInitialPlaylist(null, false);
+      }
+    });
   }
 
   skipNext() {
@@ -416,7 +472,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.currentVideo.set(null);
       this.updatePageTitle(null);
       this.saveCurrentVideo(null);
-      this.loadInitialPlaylist(false);
+      this.loadInitialPlaylist(null, false);
     }
   }
 
@@ -431,9 +487,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.playVideo(playlist[idx - 1]);
     } else {
       this.audio.currentTime = 0;
-      if (this.audio.paused) {
-        this.audio.play();
-      }
+      if (this.audio.paused) this.audio.play();
     }
   }
 
@@ -496,7 +550,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     if (tab === 'queue') {
-      this.loadInitialPlaylist(false);
+      this.loadInitialPlaylist(null, false);
       setTimeout(() => this.setupInfiniteScroll(), 300);
     }
   }
@@ -591,7 +645,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   purgeAll() {
     if (!confirm('Delete ALL cached videos and clear the playlist?')) return;
-    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadInitialPlaylist(false));
+    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadInitialPlaylist(null, false));
   }
 
   addChannel(channelId: string, title: string) {
