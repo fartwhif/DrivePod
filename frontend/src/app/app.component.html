@@ -235,7 +235,7 @@
   @if (activeTab() === 'settings') {
     <div class="mb-8 bg-zinc-900 p-5 rounded-2xl border border-zinc-700">
       <!-- 5-WAY AUTOPLAY SWITCH - at top of Settings -->
-      <div class="mb-8">
+      <div>
         <div class="flex items-center justify-between text-sm mb-3">
           <span class="font-medium text-zinc-300">Autoplay mode</span>
         </div>
@@ -277,9 +277,17 @@
           </button>
         </div>
       </div>
-
+      <div class="flex items-center mt-4 gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" 
+                  [ngModel]="lowBandwidthMode()" 
+                  (ngModelChange)="toggleLowBandwidth()">
+          <span class="font-medium">Low Bandwidth Mode</span>
+        </label>
+        <span class="text-xs text-amber-400">(hides thumbnails • 56K modem friendly)</span>
+      </div>
       <!-- Original settings content -->
-      <div class="flex flex-wrap gap-8 items-center">
+      <div class="flex flex-wrap mt-4 gap-8 items-center">
         <div>
           <span class="font-medium">Bitrate:</span>
           <select [(ngModel)]="preferredBitrate" (ngModelChange)="onBitrateChange()" class="bg-zinc-800 px-4 py-2 rounded-xl ml-3 text-white">
@@ -312,16 +320,6 @@
           <span class="font-medium">User-Agent:</span>
           <input [(ngModel)]="userAgent" (ngModelChange)="saveConfig()" 
                  class="bg-zinc-800 px-4 py-2 rounded-xl ml-3 text-white w-full max-w-md">
-        </div>
-
-        <div class="flex items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
-          <label class="flex items-center gap-2 cursor-pointer">
-            <input type="checkbox" 
-                   [ngModel]="lowBandwidthMode()" 
-                   (ngModelChange)="toggleLowBandwidth()">
-            <span class="font-medium">Low Bandwidth Mode</span>
-          </label>
-          <span class="text-xs text-amber-400">(hides thumbnails • 56K modem friendly)</span>
         </div>
       </div>
     </div>
