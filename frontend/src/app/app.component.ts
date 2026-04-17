@@ -638,9 +638,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   formatDuration(seconds?: number): string {
     if (!seconds) return '--:--';
-    const min = Math.floor(seconds / 60);
-    const sec = Math.floor(seconds % 60);
-    return `${min}:${sec < 10 ? '0' : ''}${sec}`;
+    const totalSeconds = Math.floor(seconds);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const secs = totalSeconds % 60;
+
+    if (hours > 0) {
+      // H:MM:SS (no leading zero on hours)
+      return `${hours}:${minutes < 10 ? '0' : ''}${minutes}:${secs < 10 ? '0' : ''}${secs}`;
+    } else {
+      // MM:SS
+      return `${minutes}:${secs < 10 ? '0' : ''}${secs}`;
+    }
   }
 
   purgeAll() {

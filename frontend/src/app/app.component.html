@@ -1,43 +1,5 @@
 <div class="max-w-4xl mx-auto p-3 sm:p-6 bg-zinc-950 text-white min-h-screen font-sans">
-  <h1 class="text-3xl font-bold mb-6 flex items-center gap-2">🚙📻 DrivePod</h1>
-
-  <!-- Tabs -->
-  <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner overflow-x-auto">
-    <button
-      (click)="setTab('queue')"
-      [class.bg-zinc-800]="activeTab() === 'queue'"
-      [class.text-white]="activeTab() === 'queue'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
-      <span>📜</span>
-      <span>Queue</span>
-    </button>
-    <button
-      (click)="setTab('harvest')"
-      [class.bg-zinc-800]="activeTab() === 'harvest'"
-      [class.text-white]="activeTab() === 'harvest'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
-      <span>🔄</span>
-      <span>Harvest</span>
-    </button>
-    <button
-      (click)="setTab('settings')"
-      [class.bg-zinc-800]="activeTab() === 'settings'"
-      [class.text-white]="activeTab() === 'settings'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
-      <span>⚙️</span>
-      <span>Settings</span>
-    </button>
-    <button
-      (click)="setTab('import')"
-      [class.bg-zinc-800]="activeTab() === 'import'"
-      [class.text-white]="activeTab() === 'import'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
-      <span>📥</span>
-      <span>Import</span>
-    </button>
-  </div>
-
-  <!-- Now Playing Player - RIGID LAYOUT (no responsive direction changes, link will never disappear) -->
+  <!-- Now Playing Player - FIRST ELEMENT ON PAGE -->
   @if (currentVideo(); as video) {
     <div class="mb-8 bg-zinc-900 border border-zinc-700 rounded-3xl p-3">
 
@@ -106,6 +68,42 @@
     </div>
   }
 
+  <!-- Tabs -->
+  <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner overflow-x-auto">
+    <button
+      (click)="setTab('queue')"
+      [class.bg-zinc-800]="activeTab() === 'queue'"
+      [class.text-white]="activeTab() === 'queue'"
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      <span>📜</span>
+      <span>Queue</span>
+    </button>
+    <button
+      (click)="setTab('harvest')"
+      [class.bg-zinc-800]="activeTab() === 'harvest'"
+      [class.text-white]="activeTab() === 'harvest'"
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      <span>🔄</span>
+      <span>Harvest</span>
+    </button>
+    <button
+      (click)="setTab('settings')"
+      [class.bg-zinc-800]="activeTab() === 'settings'"
+      [class.text-white]="activeTab() === 'settings'"
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      <span>⚙️</span>
+      <span>Settings</span>
+    </button>
+    <button
+      (click)="setTab('import')"
+      [class.bg-zinc-800]="activeTab() === 'import'"
+      [class.text-white]="activeTab() === 'import'"
+      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      <span>📥</span>
+      <span>Import</span>
+    </button>
+  </div>
+
   <!-- Queue Tab -->
   @if (activeTab() === 'queue') {
     <div class="grid gap-3">
@@ -135,16 +133,16 @@
           </div>
 
           <div class="flex flex-col items-end gap-0">
-            <div class="text-right text-zinc-400 text-sm self-center">
+            <div class="text-right text-zinc-400 text-sm self-center w-[50px]">
               {{ formatDuration(v.duration) }}
             </div>
             <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
                target="_blank"
                rel="noopener noreferrer"
                (click)="$event.stopImmediatePropagation()"
-               class="text-sky-400 hover:text-sky-300 text-xl leading-none self-center">🔗</a>
+               class="text-sky-400 hover:text-sky-300 text-xl leading-none text-right">🔗</a>
             @if (currentVideo()?.videoId === v.videoId) {
-              <span class="text-green-400 self-center text-3xl">▶️</span>
+              <span class="inline-block text-right text-green-400 text-3xl -mr-1 pt-0.5">▶️</span>
             }
           </div>
         </div>
