@@ -1,3 +1,4 @@
+<!-- UPDATED app.component.html -->
 <div class="max-w-4xl mx-auto p-3 sm:p-6 bg-zinc-950 text-white min-h-screen font-sans">
   <!-- Now Playing Player - FIRST ELEMENT ON PAGE -->
   @if (currentVideo(); as video) {
@@ -363,14 +364,26 @@
       </button>
     </div>
 
-    <!-- Channels with priority reordering -->
+    <!-- Channels with priority reordering - FIXED RESPONSIVE LAYOUT -->
     <div class="mb-10 bg-zinc-900 p-5 rounded-2xl">
       <h2 class="text-xl mb-4">Monitored YouTube Channels <span class="text-zinc-400 text-sm font-normal">(top = highest priority)</span></h2>
-      <div class="flex gap-3 mb-4">
-        <input #chanId placeholder="Channel ID (UC...)" class="flex-1 bg-zinc-800 px-4 py-3 rounded-xl outline-none">
-        <input #chanTitle placeholder="Channel Title (leave blank to autofetch)" class="flex-1 bg-zinc-800 px-4 py-3 rounded-xl outline-none">
-        <button (click)="addChannel(chanId.value, chanTitle.value)" class="bg-blue-600 hover:bg-blue-700 px-8 rounded-xl font-medium">Add</button>
+      
+      <!-- FIXED: flex-col on mobile → no crushing. Inputs stack full-width on narrow screens, side-by-side on sm+ -->
+      <div class="flex flex-col sm:flex-row gap-3 mb-4">
+        <input #chanId 
+               placeholder="Channel ID (UC...)" 
+               class="flex-1 bg-zinc-800 px-4 py-3 rounded-xl outline-none min-w-0">
+        
+        <input #chanTitle 
+               placeholder="Channel Title (leave blank to autofetch)" 
+               class="flex-1 bg-zinc-800 px-4 py-3 rounded-xl outline-none min-w-0">
+        
+        <button (click)="addChannel(chanId.value, chanTitle.value)" 
+                class="bg-blue-600 hover:bg-blue-700 px-8 py-3 rounded-xl font-medium whitespace-nowrap flex-shrink-0">
+          Add
+        </button>
       </div>
+
       <ul class="space-y-2">
         @for (c of channels(); track c.channelId) {
           <li class="flex justify-between items-center bg-zinc-800 px-4 py-3 rounded-xl">
