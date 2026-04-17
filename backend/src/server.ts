@@ -160,7 +160,7 @@ async function yieldToEventLoop() {
   return new Promise(resolve => setImmediate(resolve));
 }
 
-// === FULL CONSISTENCY CLEANUP (allows 1 or 2 thumbnails) ===
+// === FULL CONSISTENCY CLEANUP ===
 async function cleanupCorruptedFolders() {
   console.log(`🧹 [${logTimestamp()}] Starting full consistency cleanup...`);
   if (!fs.existsSync(CACHE_DIR)) return;
@@ -482,7 +482,7 @@ async function getLatestVideosAlternative(channelId: string, maxDays: number, in
   return uniqueItems;
 }
 
-// === DOWNLOAD + TRANSCODE (FIXED THUMBNAIL RESIZE) ===
+// === DOWNLOAD + TRANSCODE ===
 async function downloadAndProcessVideo(
   videoInfo: any,
   videoUrl: string,
@@ -539,7 +539,6 @@ async function downloadAndProcessVideo(
       const smallPath = path.join(videoDir, `${videoId}-small.webp`);
 
       try {
-        // FIXED: Safe scaling (no pad filter)
         await safeExec(`ffmpeg -i "${originalPath}" -vf "scale=400:225:force_original_aspect_ratio=decrease" -y "${smallPath}"`, `thumbnail resize ${videoId}`);
         thumbnailPath = `/cache/${videoId}/${videoId}-small.webp`;
         console.log(`📏 Created small thumbnail: ${videoId}-small.webp`);
@@ -915,21 +914,53 @@ app.post('/api/channels', async (req, res) => {
   res.json(channel);
 });
 
+// === FIXED DELETE CHANNEL ENDPOINT ===
 app.delete('/api/channels/:channelId', async (req, res) => {
   const channelId = req.params.channelId;
   try {
-    const videos = await prisma.video.findMany({ where: { channelId } });
+    console.log(`🗑️ Deleting channel: ${channelId}`);
+
+    const videos = await prisma.video.findMany({
+      where: { channelId },
+      select: { videoId: true }
+    });
+
     for (const video of videos) {
       const dir = path.join(CACHE_DIR, video.videoId);
-      if (fs.existsSync(dir)) try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-      await prisma.video.delete({ where: { videoId: video.videoId } });
+      if (fs.existsSync(dir)) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+          console.log(`   🗑️ Deleted folder: ${video.videoId}`);
+        } catch (e) {
+          console.warn(`   ⚠️ Could not delete folder ${video.videoId}`);
+        }
+      }
     }
+
+    const deletedVideos = await prisma.video.deleteMany({
+      where: { channelId }
+    });
+    console.log(`   ✅ Deleted ${deletedVideos.count} video records`);
+
     const rssFile = path.join(RSS_CACHE_DIR, `${channelId}.xml`);
-    if (fs.existsSync(rssFile)) fs.unlinkSync(rssFile);
+    if (fs.existsSync(rssFile)) {
+      try {
+        fs.unlinkSync(rssFile);
+        console.log(`   🗑️ Deleted RSS cache: ${channelId}.xml`);
+      } catch {}
+    }
+
     await prisma.channel.delete({ where: { channelId } });
-    res.json({ success: true });
+
+    console.log(`✅ Channel ${channelId} fully deleted`);
+    res.json({ success: true, deletedVideos: deletedVideos.count });
+
   } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
+    console.error(`❌ Failed to delete channel ${channelId}:`, e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
   }
 });
 
@@ -973,7 +1004,6 @@ app.post('/api/channels/import', async (req, res) => {
   res.json({ success: true, results });
 });
 
-// === PLAYLIST ENDPOINT - exactly 20 per page + current-video guarantee on first page ===
 app.get('/api/playlist', async (req, res) => {
   const take = Math.min(Math.max(parseInt(req.query.take as string) || 20, 10), 100);
   const skip = parseInt(req.query.skip as string) || 0;
@@ -986,9 +1016,6 @@ app.get('/api/playlist', async (req, res) => {
     skip,
   });
 
-  // If an unwatched item is marked as current but doesn't land on the FIRST page
-  // → either append it (if page has fewer than 20) OR replace the last item (oldest in page)
-  // to guarantee the "now playing" video is always visible while keeping page size exactly 20
   if (skip === 0) {
     const currentVideoId = await getConfig('currentVideoId', '');
     if (currentVideoId) {
@@ -1004,11 +1031,9 @@ app.get('/api/playlist', async (req, res) => {
 
         if (currentVideo) {
           if (videos.length >= take) {
-            // Page is full (20 items) → replace the last (oldest) item
             videos[videos.length - 1] = currentVideo;
             console.log(`📌 Replaced oldest item in first page with current video ${currentVideoId}`);
           } else {
-            // Fewer than 20 items total → simply append
             videos.push(currentVideo);
             console.log(`📌 Appended current video ${currentVideoId} to first page`);
           }
@@ -1037,9 +1062,26 @@ app.post('/api/channels/reorder', async (req, res) => {
   }
 });
 
+// === UPDATED PROGRESS ENDPOINT - also sets current video ===
 app.patch('/api/video/:videoId/progress', async (req, res) => {
-  await prisma.video.update({ where: { videoId: req.params.videoId }, data: { progress: req.body.progress } });
-  res.json({ success: true });
+  const videoId = req.params.videoId;
+  const progress = req.body.progress;
+
+  try {
+    await prisma.video.update({
+      where: { videoId },
+      data: { progress }
+    });
+
+    // NEW: Also mark this video as the current one
+    await setConfig('currentVideoId', videoId);
+    console.log(`📌 Progress saved for ${videoId} → set as current video`);
+
+    res.json({ success: true });
+  } catch (e: any) {
+    console.error(`❌ Failed to save progress for ${videoId}:`, e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/video/:videoId/watched', async (req, res) => {
