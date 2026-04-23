@@ -87,6 +87,9 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const MAX_CONCURRENT_CHANNELS = 2;
 let isHarvesting = false;
 
+// === FOR TESTING: Force alternative discovery method (yt-dlp scraping) instead of RSS ===
+const FORCE_ALTERNATIVE_DISCOVERY = false;   // ← Set to `true` to force yt-dlp method for testing
+
 // === LIVE HARVEST STATUS ===
 let harvestStatus = {
   isRunning: false,
@@ -315,10 +318,25 @@ async function getRssFeedWithCache(channelId: string): Promise<{items: any[], ch
   const timestamp = logTimestamp();
   const maxDays = parseInt(await getConfig('maxHarvestDays', '7'));
 
+  // === FORCE ALTERNATIVE DISCOVERY FOR TESTING ===
+  if (FORCE_ALTERNATIVE_DISCOVERY) {
+    console.log(`[${timestamp}] FORCE_ALTERNATIVE_DISCOVERY=true — skipping RSS and using ALTERNATIVE METHOD for ${channelId}`);
+    try {
+      const items = await getLatestVideosAlternative(channelId, maxDays, false);
+      const channelTitle = await getChannelTitle(channelId, true);
+      console.log(`[${timestamp}] Forced alternative method succeeded for ${channelId} (${items.length} items)`);
+      return { items, channelTitle };
+    } catch (e) {
+      console.error(`[${timestamp}] Forced alternative method failed for ${channelId}:`, e);
+      // fall through to normal RSS path if forced method fails
+    }
+  }
+
+  // Normal flow (RSS first, then alternative, then cache)
   try {
     const xml = await fetchRssRaw(rssUrl, channelId);
     fs.writeFileSync(cacheFile, xml);
-    console.log(`💾 Fresh RSS cached for ${channelId}`);
+    console.log(`Fresh RSS cached for ${channelId}`);
     const parsed = await parser.parseString(xml);
     const channelTitle = 
       parsed.title?.trim() ||
@@ -328,16 +346,16 @@ async function getRssFeedWithCache(channelId: string): Promise<{items: any[], ch
       'Unknown Channel';
     return { items: cleanRssItems(parsed.items || []), channelTitle };
   } catch {
-    console.warn(`⚠️ Live RSS failed for ${channelId} → trying ALTERNATIVE METHOD`);
+    console.warn(`Live RSS failed for ${channelId} → trying ALTERNATIVE METHOD`);
   }
 
   try {
-    console.log(`🔧 [${timestamp}] Alternative method started for ${channelId}`);
+    console.log(`[${timestamp}] Alternative method started for ${channelId}`);
     const items = await getLatestVideosAlternative(channelId, maxDays, false);
     const channelTitle = await getChannelTitle(channelId, true);
     return { items, channelTitle };
   } catch {
-    console.warn(`⚠️ Alternative method failed → falling back to cached RSS`);
+    console.warn(`Alternative method failed → falling back to cached RSS`);
   }
 
   if (fs.existsSync(cacheFile)) {
@@ -350,14 +368,14 @@ async function getRssFeedWithCache(channelId: string): Promise<{items: any[], ch
         parsed.feed?.title?.trim() ||
         parsed.feed?.['title']?.trim() ||
         'Unknown Channel';
-      console.log(`✅ Used cached RSS for ${channelId} (age: ${getFileAge(cacheFile)})`);
+      console.log(`Used cached RSS for ${channelId} (age: ${getFileAge(cacheFile)})`);
       return { items: cleanRssItems(parsed.items || []), channelTitle };
     } catch {
-      console.error(`❌ Cache parse failed for ${channelId}`);
+      console.error(`Cache parse failed for ${channelId}`);
     }
   }
 
-  console.error(`🚨 All methods failed for ${channelId}`);
+  console.error(`All methods failed for ${channelId}`);
   return { items: [], channelTitle: 'Unknown Channel' };
 }
 
@@ -383,6 +401,81 @@ function cleanRssItems(items: any[]): any[] {
   }).filter(item => item.videoId);
 }
 
+/**
+ * Parses yt-dlp JSON duration info.
+ * Priority: numeric `duration` (already in seconds) → parse `duration_string`
+ * Supports: "2:00:08", "8:43", "45", etc.
+ * Returns duration in seconds (number) or undefined.
+ */
+function parseYtDlpDuration(json: any): number | undefined {
+  // 1. Prefer direct numeric duration (seconds, may be float like 7208.0)
+  if (typeof json.duration === 'number' && !isNaN(json.duration) && json.duration > 0) {
+    return Math.round(json.duration);
+  }
+
+  // 2. Fallback to duration_string
+  const durStr = json?.duration_string;
+  if (typeof durStr === 'string' && durStr.trim()) {
+    const parts = durStr.trim().split(':').map(p => parseFloat(p.trim())).filter(p => !isNaN(p));
+    if (parts.length === 3) {
+      // HH:MM:SS
+      return Math.round(parts[0] * 3600 + parts[1] * 60 + parts[2]);
+    } else if (parts.length === 2) {
+      // MM:SS
+      return Math.round(parts[0] * 60 + parts[1]);
+    } else if (parts.length === 1) {
+      // SS (or just a plain number as string)
+      return Math.round(parts[0]);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Helper: If a date resolves to *today at midnight* (00:00:00), return current time instead.
+ * This fixes yt-dlp's common behavior on brand-new videos that only report the day.
+ */
+function applyTodayMidnightRule(date: Date): Date {
+  const now = new Date();
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  
+  if (date.getTime() === todayMidnight.getTime()) {
+    return now;
+  }
+  return date;
+}
+
+/**
+ * Updated parseYtDlpPubDate — applies the midnight rule to BOTH timestamp AND upload_date
+ */
+function parseYtDlpPubDate(json: any): Date {
+  // 1. Prefer timestamp (Unix timestamp in seconds) — now with midnight rule
+  if (typeof json?.timestamp === 'number' && json.timestamp > 0) {
+    const date = new Date(json.timestamp * 1000);
+    if (!isNaN(date.getTime())) {
+      return applyTodayMidnightRule(date);
+    }
+  }
+
+  // 2. Fallback to upload_date (YYYYMMDD format)
+  if (typeof json?.upload_date === 'string' && json.upload_date.length === 8) {
+    const year = parseInt(json.upload_date.slice(0, 4), 10);
+    const month = parseInt(json.upload_date.slice(4, 6), 10) - 1; // JS months are 0-based
+    const day = parseInt(json.upload_date.slice(6, 8), 10);
+
+    if (!isNaN(year) && !isNaN(month) && !isNaN(day)) {
+      const candidateDate = new Date(year, month, day);
+      if (!isNaN(candidateDate.getTime())) {
+        return applyTodayMidnightRule(candidateDate);
+      }
+    }
+  }
+
+  // Ultimate fallback
+  return new Date();
+}
+
+// === UPDATED scrapeTab function (replace the entire existing function) ===
 async function scrapeTab(channelId: string, tab: string, maxDays: number): Promise<any[]> {
   const url = `https://www.youtube.com/channel/${channelId}/${tab}`;
   try {
@@ -391,20 +484,31 @@ async function scrapeTab(channelId: string, tab: string, maxDays: number): Promi
     const dateStr = date.toISOString().split('T')[0].replace(/-/g, '');
 
     const cmd = `yt-dlp --break-on-reject --extractor-args "youtubetab:approximate_date" --no-progress --dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
+    
+    if (FORCE_ALTERNATIVE_DISCOVERY) {
+      console.log(`[TEST] req: ${cmd}`);
+    }
     const { stdout } = await safeExec(cmd, `scrapeTab ${tab} for ${channelId}`);
     return stdout.trim().split('\n')
       .filter(l => l.trim())
       .map(line => {
         try {
           const json = JSON.parse(line);
-          return {
+          if (FORCE_ALTERNATIVE_DISCOVERY) {
+            console.log(`[TEST] res: ${JSON.stringify(json)}`);
+          }
+          let res = {
             videoId: json.id,
             title: json.title || 'Untitled',
-            pubDate: (typeof json.upload_date === 'string' && json.upload_date.length === 8) ? new Date(
-              `${json.upload_date.slice(0, 4)}-${json.upload_date.slice(4, 6)}-${json.upload_date.slice(6, 8)}`
-            ) : new Date(),
+            pubDate: parseYtDlpPubDate(json),
+            duration: parseYtDlpDuration(json),   // ← NEW: duration in seconds (number)
             link: `https://www.youtube.com/watch?v=${json.id}`
           };
+          if (FORCE_ALTERNATIVE_DISCOVERY) {
+            console.log(`[TEST] res: ${JSON.stringify(res)}`);
+          }
+          return res;
+
         } catch {
           return null;
         }
