@@ -1,3 +1,4 @@
+// FULL UPDATED server.ts
 import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
@@ -679,6 +680,7 @@ async function harvestAndPurge() {
     const preferredBitrate = parseInt(await getConfig('preferredBitrate', '128'));
     const preferredMono = (await getConfig('preferredMono', 'false')) === 'true';
     const autoPurgeDays = parseInt(await getConfig('autoPurgeDays', '30'));
+    const onePerHours = parseInt(await getConfig('onePerHours', '12'));   // NEW: user-configurable hours
 
     const channels = await prisma.channel.findMany({ orderBy: { order: 'asc' } });
     harvestStatus.totalChannels = channels.length;
@@ -690,6 +692,27 @@ async function harvestAndPurge() {
       while (running.length < MAX_CONCURRENT_CHANNELS && queue.length > 0) {
         const currentChannel = queue.shift()!;
 
+        // === EARLY CHANNEL SKIP: configurable "one video per X hours" ===
+        if (onePerHours > 0) {
+          const lastDownload = await prisma.video.findFirst({
+            where: {
+              channelId: currentChannel.channelId,
+              ignored: false
+            },
+            orderBy: { createdAt: 'desc' },
+            select: { createdAt: true }
+          });
+
+          const cooldownMs = onePerHours * 60 * 60 * 1000;
+          if (lastDownload && (Date.now() - lastDownload.createdAt.getTime() < cooldownMs)) {
+            console.log(`⏭️ [One Per ${onePerHours}h Limit] Skipping entire channel "${currentChannel.title}" (${currentChannel.channelId}) — already downloaded within last ${onePerHours} hours`);
+            harvestStatus.channelsProcessed++;
+            harvestStatus.lastUpdate = new Date().toISOString();
+            continue;   // ← completely skip this channel
+          }
+        }
+
+        // Normal processing starts here
         harvestStatus.activeItems.push({
           channelId: currentChannel.channelId,
           channelTitle: currentChannel.title,
@@ -722,10 +745,11 @@ async function harvestAndPurge() {
             );
 
             const newVideosToInsert: any[] = [];
-
+            let oneDone:boolean = false;
             for (const item of items) {
               const videoId = item.videoId || '';
               if (!videoId || existingIds.has(videoId)) continue;
+              if (oneDone) continue;
 
               let publishedAt = new Date(item.pubDate || Date.now());
               const ageMs = Date.now() - publishedAt.getTime();
@@ -762,6 +786,9 @@ async function harvestAndPurge() {
               );
 
               if (success) {
+                if (onePerHours > 0) {
+                  oneDone = true;
+                }
                 const videoDir = path.join(CACHE_DIR, videoId);
                 const audioPath = path.join(videoDir, `${videoId}.mp3`);
 
@@ -827,7 +854,6 @@ async function harvestAndPurge() {
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
       await prisma.video.delete({ where: { videoId: video.videoId } });
     }
-    // === CLEAR STALE currentVideoId if it was purged ===
     const currentVideoId = await getConfig('currentVideoId', '');
     if (currentVideoId && oldVideos.some(v => v.videoId === currentVideoId)) {
       await setConfig('currentVideoId', '');
@@ -854,6 +880,7 @@ app.get('/api/config', async (_, res) => {
   const preferredBitrate = await getConfig('preferredBitrate', '128');
   const preferredMono = await getConfig('preferredMono', 'false');
   const autoPurgeDays = await getConfig('autoPurgeDays', '30');
+  const onePerHours = await getConfig('onePerHours', '12');           // NEW
   const currentVideoId = await getConfig('currentVideoId', '');
   const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   const cookieContent = await getCookies();
@@ -863,6 +890,7 @@ app.get('/api/config', async (_, res) => {
     preferredBitrate: parseInt(preferredBitrate),
     preferredMono: preferredMono === 'true',
     autoPurgeDays: parseInt(autoPurgeDays),
+    onePerHours: parseInt(onePerHours),                               // NEW
     lastPlayedVideoId: currentVideoId || null,
     userAgent,
     hasCookies: !!cookieContent.trim()
@@ -870,13 +898,14 @@ app.get('/api/config', async (_, res) => {
 });
 
 app.post('/api/config', async (req, res) => {
-  const { maxHarvestDays, preferredBitrate, preferredMono, autoPurgeDays, userAgent, cookies } = req.body;
+  const { maxHarvestDays, preferredBitrate, preferredMono, autoPurgeDays, userAgent, cookies, onePerHours } = req.body;
 
   if (maxHarvestDays !== undefined) await setConfig('maxHarvestDays', String(maxHarvestDays));
   if (preferredBitrate !== undefined) await setConfig('preferredBitrate', String(preferredBitrate));
   if (preferredMono !== undefined) await setConfig('preferredMono', String(preferredMono));
   if (autoPurgeDays !== undefined) await setConfig('autoPurgeDays', String(autoPurgeDays));
   if (userAgent !== undefined) await setConfig('userAgent', userAgent);
+  if (onePerHours !== undefined) await setConfig('onePerHours', String(onePerHours));   // NEW
   if (cookies !== undefined) await setConfig('cookies', cookies);
 
   res.json({ success: true });
@@ -920,13 +949,12 @@ app.post('/api/channels', async (req, res) => {
   res.json(channel);
 });
 
-// === ROBUST CHANNEL DELETE ENDPOINT (P2025 + stale currentVideoId safe) ===
+// === ROBUST CHANNEL DELETE ENDPOINT ===
 app.delete('/api/channels/:channelId', async (req, res) => {
   const channelId = req.params.channelId;
   console.log(`🗑️ Deleting channel: ${channelId}`);
 
   try {
-    // 1. Get video IDs so we can clean up folders + check currentVideoId
     const videos = await prisma.video.findMany({
       where: { channelId },
       select: { videoId: true }
@@ -934,7 +962,6 @@ app.delete('/api/channels/:channelId', async (req, res) => {
 
     const videoIds = videos.map(v => v.videoId);
 
-    // 2. Delete folders on disk
     for (const videoId of videoIds) {
       const dir = path.join(CACHE_DIR, videoId);
       if (fs.existsSync(dir)) {
@@ -947,20 +974,17 @@ app.delete('/api/channels/:channelId', async (req, res) => {
       }
     }
 
-    // 3. Delete video records
     const deletedVideos = await prisma.video.deleteMany({
       where: { channelId }
     });
     console.log(`   ✅ Deleted ${deletedVideos.count} video records`);
 
-    // 4. Clear stale currentVideoId if it belonged to this channel
     const currentVideoId = await getConfig('currentVideoId', '');
     if (currentVideoId && videoIds.includes(currentVideoId)) {
       await setConfig('currentVideoId', '');
       console.log(`   🧹 Cleared stale currentVideoId → ${currentVideoId} (channel deleted)`);
     }
 
-    // 5. Delete RSS cache
     const rssFile = path.join(RSS_CACHE_DIR, `${channelId}.xml`);
     if (fs.existsSync(rssFile)) {
       try {
@@ -971,7 +995,6 @@ app.delete('/api/channels/:channelId', async (req, res) => {
       }
     }
 
-    // 6. Delete channel (use deleteMany so it doesn't throw P2025 if already gone)
     const deletedChannel = await prisma.channel.deleteMany({
       where: { channelId }
     });
@@ -1095,7 +1118,6 @@ app.post('/api/channels/reorder', async (req, res) => {
   }
 });
 
-// === ROBUST PROGRESS ENDPOINT (fixed P2025 crash) ===
 app.patch('/api/video/:videoId/progress', async (req, res) => {
   const videoId = req.params.videoId;
   const progress = req.body.progress;
@@ -1107,14 +1129,13 @@ app.patch('/api/video/:videoId/progress', async (req, res) => {
     });
 
     if (result.count === 0) {
-      // Video was purged/deleted — clean up stale currentVideoId
       const currentId = await getConfig('currentVideoId', '');
       if (currentId === videoId) {
         await setConfig('currentVideoId', '');
         console.log(`🧹 Cleared stale currentVideoId → ${videoId} no longer exists`);
       }
       console.warn(`⚠️ Progress update skipped (video ${videoId} was purged/deleted)`);
-      return res.json({ success: true }); // Graceful for frontend
+      return res.json({ success: true });
     }
 
     await setConfig('currentVideoId', videoId);
@@ -1199,4 +1220,5 @@ app.listen(port, () => {
   console.log(`   Data:  ` + DATA_DIR);
   console.log(`   ✅ Security: cookies string is NEVER sent to the browser`);
   console.log(`   ✅ 56K MODEM OPTIMIZATIONS: compression + small thumbnails + full error logging enabled`);
+  console.log(`   ✅ One-video-per-X-hours limit is now user-configurable (default 12h)`);
 });

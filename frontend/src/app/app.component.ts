@@ -1,3 +1,4 @@
+// FULL UPDATED app.component.ts
 import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
@@ -24,6 +25,7 @@ interface Config {
   userAgent: string;
   hasCookies: boolean;
   lastPlayedVideoId?: string | null;
+  onePerHours: number;          // NEW: configurable hours for "one per" limit
 }
 
 interface ImportResult {
@@ -71,6 +73,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   maxHarvestDays = signal(7);
   preferredBitrate = signal(128);
   preferredMono = signal(false);
+  onePerHours = signal(12);                    // NEW: default 12 hours
+  limitOnePerDay = signal(true);               // kept for backward UI compatibility (now means "enable limit")
   autoPurgeDays = signal(30);
   userAgent = signal('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   hasCookies = signal(false);
@@ -82,7 +86,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // 5-WAY AUTOPLAY MODE
   autoplayMode = signal<'newest' | 'newer' | 'older' | 'oldest' | 'off'>('newest');
 
-  private readonly APP_VERSION = '1.6.0';
+  private readonly APP_VERSION = '1.8.0';
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
@@ -122,7 +126,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
   private lastPositionUpdate = 0;
-  private readonly POSITION_UPDATE_INTERVAL = 1800; // ~1.8 seconds - smooth but not spammy
+  private readonly POSITION_UPDATE_INTERVAL = 1800;
 
   constructor(
     private http: HttpClient,
@@ -164,6 +168,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.maxHarvestDays.set(config.maxHarvestDays);
         this.preferredBitrate.set(config.preferredBitrate);
         this.preferredMono.set(config.preferredMono);
+        this.onePerHours.set(config.onePerHours ?? 12);           // NEW
+        this.limitOnePerDay.set(true);                            // enabled by default
         this.autoPurgeDays.set(config.autoPurgeDays);
         this.userAgent.set(config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
         this.hasCookies.set(!!config.hasCookies);
@@ -180,11 +186,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       error: () => this.loadInitialPlaylist(null, true)
     });
 
-    // UPDATED: ontimeupdate now includes realtime MediaSession position updates
     this.audio.ontimeupdate = () => {
       this.currentTime.set(this.audio.currentTime);
       this.throttledSaveProgress();
-      this.throttledUpdateMediaPosition();   // ← realtime duration + elapsed time for car Sync
+      this.throttledUpdateMediaPosition();
     };
 
     this.setupProgressListeners();
@@ -289,7 +294,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private setupProgressListeners(): void {
     this.audio.onpause = () => {
       this.saveProgress(this.audio.currentTime);
-      this.setMediaPlaybackState('paused');   // ← MediaSession enhancement
+      this.setMediaPlaybackState('paused');
     };
 
     this.audio.onended = () => {
@@ -308,7 +313,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       }, 300);
     };
 
-    // NEW: play/pause handlers for MediaSession playbackState (car status sync)
     this.audio.onplay = () => this.setMediaPlaybackState('playing');
 
     window.addEventListener('beforeunload', this.handleBeforeUnload.bind(this));
@@ -358,7 +362,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.currentTime.set(time);
     this.saveProgress(time);
     this.lastProgressSave = Date.now();
-    this.updateMediaPositionState();   // ← immediate car display update after scrub
+    this.updateMediaPositionState();
   }
 
   playVideo(video: Video) {
@@ -383,7 +387,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           console.log(`✅ Resumed ${video.videoId} from ${targetProgress.toFixed(1)}s`);
         }
       }
-      this.updateMediaPositionState();   // ← send full duration + initial position to car
+      this.updateMediaPositionState();
       this.setMediaPlaybackState('playing');
       this.audio.onloadedmetadata = null;
     };
@@ -541,7 +545,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     navigator.mediaSession.setActionHandler('previoustrack', () => this.skipPrevious());
   }
 
-  // UPDATED: full MediaMetadata + realtime position support for Ford Sync
   private updateMediaSession(video: Video | null) {
     if (!('mediaSession' in navigator)) return;
     if (!video) {
@@ -551,15 +554,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: video.title,
       artist: video.channel.title,
-      album: '',                    // ← third metadata line on Sync (empty = "Unknown" or blank on most Sync versions)
+      album: '',
       artwork: video.thumbnailPath ? [{ src: video.thumbnailPath, sizes: '320x180', type: 'image/jpeg' }] : []
     });
 
-    // initial position state right after metadata update
     setTimeout(() => this.updateMediaPositionState(), 100);
   }
 
-  // FIXED: Realtime duration + elapsed/remaining time for car display (no more TypeError)
   private updateMediaPositionState(): void {
     if (!('mediaSession' in navigator) || !this.audio) return;
 
@@ -572,7 +573,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     if (duration <= 0) return;
 
-    // CRITICAL FIX: position MUST be <= duration or the browser throws
     const rawPosition = Math.floor(this.audio.currentTime || 0);
     const position = Math.min(Math.max(0, rawPosition), duration);
 
@@ -583,7 +583,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         playbackRate: this.audio.playbackRate || 1.0
       });
     } catch (e) {
-      // Graceful fallback - should never hit now
       console.debug('MediaSession setPositionState skipped', e);
     }
   }
@@ -599,9 +598,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (!('mediaSession' in navigator)) return;
     try {
       navigator.mediaSession.playbackState = state;
-    } catch (e) {
-      // ignore - not all browsers expose this
-    }
+    } catch (e) {}
   }
 
   setTab(tab: 'queue' | 'harvest' | 'settings' | 'import') {
@@ -630,6 +627,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       maxHarvestDays: this.maxHarvestDays(),
       preferredBitrate: this.preferredBitrate(),
       preferredMono: this.preferredMono(),
+      onePerHours: this.onePerHours(),           // NEW
       autoPurgeDays: this.autoPurgeDays(),
       userAgent: this.userAgent()
     }).subscribe();
