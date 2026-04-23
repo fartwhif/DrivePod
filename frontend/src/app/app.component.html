@@ -1,11 +1,10 @@
-<!-- UPDATED app.component.html -->
+<!-- FULL UPDATED app.component.html -->
 <div class="max-w-4xl mx-auto p-3 sm:p-6 bg-zinc-950 text-white min-h-screen font-sans">
   <!-- Now Playing Player - FIRST ELEMENT ON PAGE -->
   @if (currentVideo(); as video) {
     <div class="mb-8 bg-zinc-900 border border-zinc-700 rounded-3xl p-3">
 
       <!-- TOP ROW: Thumbnail left + (immediately to its right) playback buttons + link icon -->
-      <!-- Fixed horizontal layout - no flex-col ever, no md: breakpoints, no wrapping -->
       <div class="flex items-center gap-4">
         
         <!-- Thumbnail (exactly the size you liked) -->
@@ -278,6 +277,7 @@
           </button>
         </div>
       </div>
+
       <div class="flex items-center mt-4 gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
         <label class="flex items-center gap-2 cursor-pointer">
           <input type="checkbox" 
@@ -287,6 +287,24 @@
         </label>
         <span class="text-xs text-amber-400">(hides thumbnails • 56K modem friendly)</span>
       </div>
+
+      <!-- NEW: Configurable "one video per X hours" setting -->
+      <div class="flex items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" 
+                 [(ngModel)]="limitOnePerDay" 
+                 (ngModelChange)="saveConfig()">
+          <span class="font-medium">Limit channels to 1 video per</span>
+        </label>
+        <input type="number" 
+               [(ngModel)]="onePerHours" 
+               (ngModelChange)="saveConfig()" 
+               class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-16 text-center outline-none" 
+               min="1" max="168">
+        <span class="font-medium">hours</span>
+        <span class="text-xs text-amber-400 ml-auto">(channel item limiter)</span>
+      </div>
+
       <!-- Original settings content -->
       <div class="flex flex-wrap mt-4 gap-8 items-center">
         <div>
