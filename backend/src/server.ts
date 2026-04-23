@@ -827,6 +827,12 @@ async function harvestAndPurge() {
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
       await prisma.video.delete({ where: { videoId: video.videoId } });
     }
+    // === CLEAR STALE currentVideoId if it was purged ===
+    const currentVideoId = await getConfig('currentVideoId', '');
+    if (currentVideoId && oldVideos.some(v => v.videoId === currentVideoId)) {
+      await setConfig('currentVideoId', '');
+      console.log(`🧹 Cleared currentVideoId because it was auto-purged`);
+    }
   } catch (err: any) {
     console.error(`🚨 Unexpected error in harvest:`, err.message);
   } finally {
@@ -914,46 +920,73 @@ app.post('/api/channels', async (req, res) => {
   res.json(channel);
 });
 
-// === FIXED DELETE CHANNEL ENDPOINT ===
+// === ROBUST CHANNEL DELETE ENDPOINT (P2025 + stale currentVideoId safe) ===
 app.delete('/api/channels/:channelId', async (req, res) => {
   const channelId = req.params.channelId;
-  try {
-    console.log(`🗑️ Deleting channel: ${channelId}`);
+  console.log(`🗑️ Deleting channel: ${channelId}`);
 
+  try {
+    // 1. Get video IDs so we can clean up folders + check currentVideoId
     const videos = await prisma.video.findMany({
       where: { channelId },
       select: { videoId: true }
     });
 
-    for (const video of videos) {
-      const dir = path.join(CACHE_DIR, video.videoId);
+    const videoIds = videos.map(v => v.videoId);
+
+    // 2. Delete folders on disk
+    for (const videoId of videoIds) {
+      const dir = path.join(CACHE_DIR, videoId);
       if (fs.existsSync(dir)) {
         try {
           fs.rmSync(dir, { recursive: true, force: true });
-          console.log(`   🗑️ Deleted folder: ${video.videoId}`);
+          console.log(`   🗑️ Deleted folder: ${videoId}`);
         } catch (e) {
-          console.warn(`   ⚠️ Could not delete folder ${video.videoId}`);
+          console.warn(`   ⚠️ Could not delete folder ${videoId}`);
         }
       }
     }
 
+    // 3. Delete video records
     const deletedVideos = await prisma.video.deleteMany({
       where: { channelId }
     });
     console.log(`   ✅ Deleted ${deletedVideos.count} video records`);
 
+    // 4. Clear stale currentVideoId if it belonged to this channel
+    const currentVideoId = await getConfig('currentVideoId', '');
+    if (currentVideoId && videoIds.includes(currentVideoId)) {
+      await setConfig('currentVideoId', '');
+      console.log(`   🧹 Cleared stale currentVideoId → ${currentVideoId} (channel deleted)`);
+    }
+
+    // 5. Delete RSS cache
     const rssFile = path.join(RSS_CACHE_DIR, `${channelId}.xml`);
     if (fs.existsSync(rssFile)) {
       try {
         fs.unlinkSync(rssFile);
         console.log(`   🗑️ Deleted RSS cache: ${channelId}.xml`);
-      } catch {}
+      } catch (e) {
+        console.warn(`   ⚠️ Could not delete RSS cache`);
+      }
     }
 
-    await prisma.channel.delete({ where: { channelId } });
+    // 6. Delete channel (use deleteMany so it doesn't throw P2025 if already gone)
+    const deletedChannel = await prisma.channel.deleteMany({
+      where: { channelId }
+    });
 
-    console.log(`✅ Channel ${channelId} fully deleted`);
-    res.json({ success: true, deletedVideos: deletedVideos.count });
+    if (deletedChannel.count === 0) {
+      console.warn(`   ⚠️ Channel ${channelId} was already deleted or did not exist`);
+    } else {
+      console.log(`✅ Channel ${channelId} fully deleted`);
+    }
+
+    res.json({ 
+      success: true, 
+      deletedVideos: deletedVideos.count,
+      deletedChannel: deletedChannel.count 
+    });
 
   } catch (e: any) {
     console.error(`❌ Failed to delete channel ${channelId}:`, e.message);
@@ -1062,21 +1095,30 @@ app.post('/api/channels/reorder', async (req, res) => {
   }
 });
 
-// === UPDATED PROGRESS ENDPOINT - also sets current video ===
+// === ROBUST PROGRESS ENDPOINT (fixed P2025 crash) ===
 app.patch('/api/video/:videoId/progress', async (req, res) => {
   const videoId = req.params.videoId;
   const progress = req.body.progress;
 
   try {
-    await prisma.video.update({
+    const result = await prisma.video.updateMany({
       where: { videoId },
-      data: { progress }
+      data: { progress: progress ?? undefined }
     });
 
-    // NEW: Also mark this video as the current one
+    if (result.count === 0) {
+      // Video was purged/deleted — clean up stale currentVideoId
+      const currentId = await getConfig('currentVideoId', '');
+      if (currentId === videoId) {
+        await setConfig('currentVideoId', '');
+        console.log(`🧹 Cleared stale currentVideoId → ${videoId} no longer exists`);
+      }
+      console.warn(`⚠️ Progress update skipped (video ${videoId} was purged/deleted)`);
+      return res.json({ success: true }); // Graceful for frontend
+    }
+
     await setConfig('currentVideoId', videoId);
     console.log(`📌 Progress saved for ${videoId} → set as current video`);
-
     res.json({ success: true });
   } catch (e: any) {
     console.error(`❌ Failed to save progress for ${videoId}:`, e.message);
@@ -1085,8 +1127,19 @@ app.patch('/api/video/:videoId/progress', async (req, res) => {
 });
 
 app.post('/api/video/:videoId/watched', async (req, res) => {
-  await prisma.video.update({ where: { videoId: req.params.videoId }, data: { watched: true } });
-  res.json({ success: true });
+  try {
+    const result = await prisma.video.updateMany({
+      where: { videoId: req.params.videoId },
+      data: { watched: true }
+    });
+    if (result.count === 0) {
+      console.warn(`⚠️ Mark watched skipped — video ${req.params.videoId} not found`);
+    }
+    res.json({ success: true });
+  } catch (e: any) {
+    console.error(`❌ Failed to mark watched:`, e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.get('/api/player/current', async (_, res) => {
