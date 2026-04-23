@@ -150,7 +150,7 @@
 
       @if (playlist().length === 0) {
         <div class="bg-zinc-900 p-12 rounded-3xl text-center text-zinc-400 text-lg">
-          No videos in the queue yet.<br>
+          No items in the queue yet.<br>
           <span class="text-sm">Add some channels in Settings or Import to start harvesting!</span>
         </div>
       }
@@ -159,10 +159,10 @@
         @if (isLoadingMore()) {
           <div class="flex items-center gap-3">
             <span class="animate-spin text-2xl">⟳</span>
-            <span>Loading older videos...</span>
+            <span>Loading older items...</span>
           </div>
         } @else if (hasMore()) {
-          <div class="text-sm opacity-70">↓ Scroll for more videos</div>
+          <div class="text-sm opacity-70">↓ Scroll for more items</div>
         } @else if (playlist().length > 0) {
           <div class="text-sm opacity-70">🎉 End of queue</div>
         }
@@ -217,11 +217,11 @@
       <div class="grid grid-cols-3 gap-4">
         <div class="bg-zinc-800 p-5 rounded-2xl text-center">
           <div class="text-5xl font-bold text-sky-400">{{ harvestStatus().processedVideos }}</div>
-          <div class="text-zinc-400 text-sm mt-1">Videos Processed</div>
+          <div class="text-zinc-400 text-sm mt-1">Items Processed</div>
         </div>
         <div class="bg-zinc-800 p-5 rounded-2xl text-center">
           <div class="text-5xl font-bold text-emerald-400">{{ harvestStatus().totalVideosThisRun }}</div>
-          <div class="text-zinc-400 text-sm mt-1">Total Videos Found</div>
+          <div class="text-zinc-400 text-sm mt-1">Total Items Found</div>
         </div>
         <div class="bg-zinc-800 p-5 rounded-2xl text-center">
           <div class="text-5xl font-bold">{{ harvestStatus().channelsProcessed }} / {{ harvestStatus().totalChannels }}</div>
@@ -288,21 +288,30 @@
         <span class="text-xs text-amber-400">(hides thumbnails • 56K modem friendly)</span>
       </div>
 
-      <!-- NEW: Configurable "one video per X hours" setting -->
-      <div class="flex items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
-        <label class="flex items-center gap-2 cursor-pointer">
+      <div class="flex flex-col sm:flex-row items-start sm:items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
+        <label class="flex items-center gap-2 cursor-pointer flex-shrink-0">
           <input type="checkbox" 
-                 [(ngModel)]="limitOnePerDay" 
-                 (ngModelChange)="saveConfig()">
-          <span class="font-medium">Limit channels to 1 video per</span>
+                 [ngModel]="limitEnabled()" 
+                 (ngModelChange)="limitEnabled.set($event); saveConfig()">
+          <span class="font-medium">Enable rate limit</span>
         </label>
-        <input type="number" 
-               [(ngModel)]="onePerHours" 
-               (ngModelChange)="saveConfig()" 
-               class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-16 text-center outline-none" 
-               min="1" max="168">
-        <span class="font-medium">hours</span>
-        <span class="text-xs text-amber-400 ml-auto">(channel item limiter)</span>
+        
+        <div class="flex items-center gap-2 flex-1 flex-wrap">
+          <span class="font-medium whitespace-nowrap">Allow</span>
+          <input type="number" 
+                 [(ngModel)]="limitVideos" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-16 text-center outline-none" 
+                 min="1" max="20">
+          <span class="font-medium whitespace-nowrap">items per</span>
+          <input type="number" 
+                 [(ngModel)]="limitHours" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-20 text-center outline-none" 
+                 min="1" max="720">
+          <span class="font-medium">hours</span>
+          <span class="text-xs text-amber-400 ml-auto">(per channel • prevents over-harvesting)</span>
+        </div>
       </div>
 
       <!-- Original settings content -->
@@ -326,7 +335,7 @@
           </label>
         </div>
         <div>
-          <span class="font-medium">Harvest videos from last</span>
+          <span class="font-medium">Harvest items from last</span>
           <input type="number" [(ngModel)]="maxHarvestDays" (ngModelChange)="saveConfig()" class="bg-zinc-800 px-4 py-2 rounded-xl w-16 text-center mx-2" min="1" max="30">
           <span class="font-medium">days</span>
         </div>
@@ -345,7 +354,7 @@
 
     <!-- Cookie Management Section -->
     <div class="mb-8 bg-zinc-900 p-5 rounded-2xl border border-zinc-700">
-      <h3 class="font-medium mb-3">YouTube Cookies (for age-restricted & private videos)</h3>
+      <h3 class="font-medium mb-3">YouTube Cookies (for age-restricted & private)</h3>
       
       <div class="flex items-center gap-4 flex-wrap">
         <input type="file" accept=".txt" (change)="uploadCookies($event)" class="hidden" #cookieFile>
@@ -382,11 +391,10 @@
       </button>
     </div>
 
-    <!-- Channels with priority reordering - FIXED RESPONSIVE LAYOUT -->
+    <!-- Channels with priority reordering -->
     <div class="mb-10 bg-zinc-900 p-5 rounded-2xl">
       <h2 class="text-xl mb-4">Monitored YouTube Channels <span class="text-zinc-400 text-sm font-normal">(top = highest priority)</span></h2>
       
-      <!-- FIXED: flex-col on mobile → no crushing. Inputs stack full-width on narrow screens, side-by-side on sm+ -->
       <div class="flex flex-col sm:flex-row gap-3 mb-4">
         <input #chanId 
                placeholder="Channel ID (UC...)" 

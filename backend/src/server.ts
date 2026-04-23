@@ -680,7 +680,11 @@ async function harvestAndPurge() {
     const preferredBitrate = parseInt(await getConfig('preferredBitrate', '128'));
     const preferredMono = (await getConfig('preferredMono', 'false')) === 'true';
     const autoPurgeDays = parseInt(await getConfig('autoPurgeDays', '30'));
-    const onePerHours = parseInt(await getConfig('onePerHours', '12'));   // NEW: user-configurable hours
+
+    // NEW: X videos per Y hours rate limit (default: OFF, 2 videos per 6 hours)
+    const limitEnabled = (await getConfig('limitEnabled', 'false')) === 'true';
+    const limitVideos = parseInt(await getConfig('limitVideos', '2'));
+    const limitHours = parseInt(await getConfig('limitHours', '6'));
 
     const channels = await prisma.channel.findMany({ orderBy: { order: 'asc' } });
     harvestStatus.totalChannels = channels.length;
@@ -692,27 +696,25 @@ async function harvestAndPurge() {
       while (running.length < MAX_CONCURRENT_CHANNELS && queue.length > 0) {
         const currentChannel = queue.shift()!;
 
-        // === EARLY CHANNEL SKIP: configurable "one video per X hours" ===
-        if (onePerHours > 0) {
-          const lastDownload = await prisma.video.findFirst({
+        // === CHANNEL-LEVEL RATE LIMIT (skip entire channel if already at limit) ===
+        if (limitEnabled) {
+          const cutoff = new Date(Date.now() - limitHours * 60 * 60 * 1000);
+          const recentCount = await prisma.video.count({
             where: {
               channelId: currentChannel.channelId,
-              ignored: false
-            },
-            orderBy: { createdAt: 'desc' },
-            select: { createdAt: true }
+              ignored: false,
+              createdAt: { gte: cutoff }
+            }
           });
 
-          const cooldownMs = onePerHours * 60 * 60 * 1000;
-          if (lastDownload && (Date.now() - lastDownload.createdAt.getTime() < cooldownMs)) {
-            console.log(`⏭️ [One Per ${onePerHours}h Limit] Skipping entire channel "${currentChannel.title}" (${currentChannel.channelId}) — already downloaded within last ${onePerHours} hours`);
+          if (recentCount >= limitVideos) {
+            console.log(`⏭️ [Rate Limit ${limitVideos}/${limitHours}h] Skipping entire channel "${currentChannel.title}" (${currentChannel.channelId}) — already ${recentCount} videos in last ${limitHours} hours`);
             harvestStatus.channelsProcessed++;
             harvestStatus.lastUpdate = new Date().toISOString();
-            continue;   // ← completely skip this channel
+            continue;
           }
         }
 
-        // Normal processing starts here
         harvestStatus.activeItems.push({
           channelId: currentChannel.channelId,
           channelTitle: currentChannel.title,
@@ -745,11 +747,30 @@ async function harvestAndPurge() {
             );
 
             const newVideosToInsert: any[] = [];
-            let oneDone:boolean = false;
+            let downloadedThisRun = 0;   // NEW: track successful downloads this run for this channel
+
+            let recentCount : number = 0
+            if (limitEnabled) {
+              const cutoff = new Date(Date.now() - limitHours * 60 * 60 * 1000);
+              recentCount = await prisma.video.count({
+                where: {
+                  channelId: currentChannel.channelId,
+                  ignored: false,
+                  createdAt: { gte: cutoff }
+                }
+              });
+            }
             for (const item of items) {
               const videoId = item.videoId || '';
               if (!videoId || existingIds.has(videoId)) continue;
-              if (oneDone) continue;
+
+              // === PER-ITEM RATE LIMIT CHECK (DB count + this-run count) ===
+              if (limitEnabled) {
+                if (recentCount + downloadedThisRun >= limitVideos) {
+                  console.log(`⏹️ [Rate Limit ${limitVideos}/${limitHours}h] Reached limit for channel "${currentChannel.title}" (${recentCount + downloadedThisRun}/${limitVideos} total) — stopping further downloads for this channel`);
+                  break;   // exit the item loop for this channel
+                }
+              }
 
               let publishedAt = new Date(item.pubDate || Date.now());
               const ageMs = Date.now() - publishedAt.getTime();
@@ -786,9 +807,7 @@ async function harvestAndPurge() {
               );
 
               if (success) {
-                if (onePerHours > 0) {
-                  oneDone = true;
-                }
+                downloadedThisRun++;   // increment successful download counter for this run
                 const videoDir = path.join(CACHE_DIR, videoId);
                 const audioPath = path.join(videoDir, `${videoId}.mp3`);
 
@@ -880,33 +899,44 @@ app.get('/api/config', async (_, res) => {
   const preferredBitrate = await getConfig('preferredBitrate', '128');
   const preferredMono = await getConfig('preferredMono', 'false');
   const autoPurgeDays = await getConfig('autoPurgeDays', '30');
-  const onePerHours = await getConfig('onePerHours', '12');           // NEW
-  const currentVideoId = await getConfig('currentVideoId', '');
   const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   const cookieContent = await getCookies();
   
+  // NEW rate limit fields
+  const limitEnabled = await getConfig('limitEnabled', 'false');
+  const limitVideos = await getConfig('limitVideos', '2');
+  const limitHours = await getConfig('limitHours', '6');
+  const currentVideoId = await getConfig('currentVideoId', '');
+
   res.json({
     maxHarvestDays: parseInt(maxDays),
     preferredBitrate: parseInt(preferredBitrate),
     preferredMono: preferredMono === 'true',
     autoPurgeDays: parseInt(autoPurgeDays),
-    onePerHours: parseInt(onePerHours),                               // NEW
-    lastPlayedVideoId: currentVideoId || null,
     userAgent,
-    hasCookies: !!cookieContent.trim()
+    hasCookies: !!cookieContent.trim(),
+    lastPlayedVideoId: currentVideoId || null,
+    limitEnabled: limitEnabled === 'true',
+    limitVideos: parseInt(limitVideos),
+    limitHours: parseInt(limitHours)
   });
 });
 
 app.post('/api/config', async (req, res) => {
-  const { maxHarvestDays, preferredBitrate, preferredMono, autoPurgeDays, userAgent, cookies, onePerHours } = req.body;
+  const { maxHarvestDays, preferredBitrate, preferredMono, autoPurgeDays, userAgent, cookies,
+          limitEnabled, limitVideos, limitHours } = req.body;
 
   if (maxHarvestDays !== undefined) await setConfig('maxHarvestDays', String(maxHarvestDays));
   if (preferredBitrate !== undefined) await setConfig('preferredBitrate', String(preferredBitrate));
   if (preferredMono !== undefined) await setConfig('preferredMono', String(preferredMono));
   if (autoPurgeDays !== undefined) await setConfig('autoPurgeDays', String(autoPurgeDays));
   if (userAgent !== undefined) await setConfig('userAgent', userAgent);
-  if (onePerHours !== undefined) await setConfig('onePerHours', String(onePerHours));   // NEW
   if (cookies !== undefined) await setConfig('cookies', cookies);
+
+  // NEW rate limit config
+  if (limitEnabled !== undefined) await setConfig('limitEnabled', String(limitEnabled));
+  if (limitVideos !== undefined) await setConfig('limitVideos', String(limitVideos));
+  if (limitHours !== undefined) await setConfig('limitHours', String(limitHours));
 
   res.json({ success: true });
 });
@@ -1139,7 +1169,7 @@ app.patch('/api/video/:videoId/progress', async (req, res) => {
     }
 
     await setConfig('currentVideoId', videoId);
-    console.log(`📌 Progress saved for ${videoId} → set as current video`);
+    // console.log(`📌 Progress saved for ${videoId} → set as current video`);
     res.json({ success: true });
   } catch (e: any) {
     console.error(`❌ Failed to save progress for ${videoId}:`, e.message);
@@ -1218,7 +1248,4 @@ app.listen(port, () => {
   console.log(`🚀 DrivePod Backend ready on http://localhost:${port}`);
   console.log(`   Cache: ` + CACHE_DIR);
   console.log(`   Data:  ` + DATA_DIR);
-  console.log(`   ✅ Security: cookies string is NEVER sent to the browser`);
-  console.log(`   ✅ 56K MODEM OPTIMIZATIONS: compression + small thumbnails + full error logging enabled`);
-  console.log(`   ✅ One-video-per-X-hours limit is now user-configurable (default 12h)`);
 });
