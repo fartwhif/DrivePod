@@ -25,7 +25,9 @@ interface Config {
   userAgent: string;
   hasCookies: boolean;
   lastPlayedVideoId?: string | null;
-  onePerHours: number;          // NEW: configurable hours for "one per" limit
+  limitEnabled: boolean;
+  limitVideos: number;
+  limitHours: number;
 }
 
 interface ImportResult {
@@ -73,8 +75,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   maxHarvestDays = signal(7);
   preferredBitrate = signal(128);
   preferredMono = signal(false);
-  onePerHours = signal(12);                    // NEW: default 12 hours
-  limitOnePerDay = signal(true);               // kept for backward UI compatibility (now means "enable limit")
+  limitEnabled = signal(false);      // NEW: rate limit toggle (default OFF)
+  limitVideos = signal(2);           // NEW: default 2 videos
+  limitHours = signal(6);            // NEW: default 6 hours
   autoPurgeDays = signal(30);
   userAgent = signal('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   hasCookies = signal(false);
@@ -86,7 +89,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // 5-WAY AUTOPLAY MODE
   autoplayMode = signal<'newest' | 'newer' | 'older' | 'oldest' | 'off'>('newest');
 
-  private readonly APP_VERSION = '1.8.0';
+  private readonly APP_VERSION = '1.9.0';
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
 
@@ -168,8 +171,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.maxHarvestDays.set(config.maxHarvestDays);
         this.preferredBitrate.set(config.preferredBitrate);
         this.preferredMono.set(config.preferredMono);
-        this.onePerHours.set(config.onePerHours ?? 12);           // NEW
-        this.limitOnePerDay.set(true);                            // enabled by default
+        this.limitEnabled.set(config.limitEnabled ?? false);
+        this.limitVideos.set(config.limitVideos ?? 2);
+        this.limitHours.set(config.limitHours ?? 6);
         this.autoPurgeDays.set(config.autoPurgeDays);
         this.userAgent.set(config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
         this.hasCookies.set(!!config.hasCookies);
@@ -627,7 +631,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       maxHarvestDays: this.maxHarvestDays(),
       preferredBitrate: this.preferredBitrate(),
       preferredMono: this.preferredMono(),
-      onePerHours: this.onePerHours(),           // NEW
+      limitEnabled: this.limitEnabled(),
+      limitVideos: this.limitVideos(),
+      limitHours: this.limitHours(),
       autoPurgeDays: this.autoPurgeDays(),
       userAgent: this.userAgent()
     }).subscribe();
