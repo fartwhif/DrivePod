@@ -475,9 +475,6 @@ async function scrapeTab(channelId: string, tab: string, maxDays: number, scrape
 
     const cmd = `yt-dlp ` + ((scrapeIgnore) ? '' : `--playlist-items 1-10 `) + `--break-on-reject --extractor-args "youtubetab:approximate_date" --no-progress --dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
 
-    // if (FORCE_ALTERNATIVE_DISCOVERY) {
-    //   console.log(`[TEST] req: ${cmd}`);
-    // }
     const { stdout } = await safeExec(cmd, `scrapeTab ${tab} for ${channelId}`);
     return stdout.trim().split('\n')
       .filter(l => l.trim())
@@ -487,8 +484,7 @@ async function scrapeTab(channelId: string, tab: string, maxDays: number, scrape
           let res = {
             videoId: json.id,
             title: json.title || 'Untitled',
-            //pubDate: parseYtDlpPubDate(json),
-            duration: parseYtDlpDuration(json),   // ← NEW: duration in seconds (number)
+            duration: parseYtDlpDuration(json),
             link: `https://www.youtube.com/watch?v=${json.id}`
           };
 
@@ -547,7 +543,6 @@ async function performIgnoreSweep(channelId: string) {
 
 // === ALTERNATIVE METHOD (updated to respect global + per-tab toggles) ===
 async function getLatestVideosAlternative(channelId: string, maxDays: number, includeIgnored: boolean = false): Promise<any[]> {
-  // Respect global toggle
   const altEnabled = (await getConfig('alternativeMetadataEnabled', 'true')) === 'true';
   if (!altEnabled) {
     console.log(`🔧 [Alternative] Disabled globally for ${channelId}`);
@@ -592,7 +587,6 @@ async function getLatestVideosAlternative(channelId: string, maxDays: number, in
 
 export async function fillMissingMetadata(item: any): Promise<any> {
   try {
-    // Fetch metadata if any of the key fields are missing (including live status)
     if (!item.pubDate || !item.duration || !item.liveStatus) {
       console.log(`fetching metadata for ${item.videoId}`);
       const cmd = `yt-dlp --no-warnings --print '%(timestamp)s|%(duration_string)s|%(live_status)s' "${item.link}"`;
@@ -601,7 +595,7 @@ export async function fillMissingMetadata(item: any): Promise<any> {
       const result = {
         timestamp: parseInt(rawTs, 10) || undefined,
         duration_string: dur || undefined,
-        live_status: liveStatusRaw?.trim() || 'not_live',  // safe default
+        live_status: liveStatusRaw?.trim() || 'not_live',
       };
 
       item.duration = parseYtDlpDuration(result);
@@ -799,9 +793,9 @@ async function ignoreVideo(videoInfo: {
   videoId: string;
   channelId: string;
   title?: string;
-  pubDate?: Date | string | null;   // renamed from publishedAt for exact match to your example
+  pubDate?: Date | string | null;
   duration?: number;
-  [key: string]: any;               // allows extra fields like thumbnailPath, etc.
+  [key: string]: any;
 }): Promise<void> {
   const { videoId, channelId, title, pubDate, duration } = videoInfo;
 
@@ -813,7 +807,6 @@ async function ignoreVideo(videoInfo: {
   console.log(`🛡️ [ignoreVideo] Processing ignore request for ${videoId}`);
 
   try {
-    // 1. Check if record already exists
     const existing = await prisma.video.findUnique({ where: { videoId } });
 
     if (existing) {
@@ -827,7 +820,6 @@ async function ignoreVideo(videoInfo: {
         console.log(`✅ [ignoreVideo] Updated existing video → ignored: true (${videoId})`);
       }
     } else {
-      // 2. Create new ignored record (same pattern used in performIgnoreSweep)
       let publishedAt: Date;
       if (pubDate) {
         publishedAt = new Date(pubDate);
@@ -851,7 +843,6 @@ async function ignoreVideo(videoInfo: {
       console.log(`✅ [ignoreVideo] Created new ignored record for ${videoId}`);
     }
 
-    // 3. Clean up filesystem (remove any downloaded or partial files)
     const videoDir = path.join(CACHE_DIR, videoId);
     if (fs.existsSync(videoDir)) {
       try {
@@ -862,7 +853,6 @@ async function ignoreVideo(videoInfo: {
       }
     }
 
-    // 4. Clear currentVideoId if this was the currently playing video
     const currentVideoId = await getConfig('currentVideoId', '');
     if (currentVideoId === videoId) {
       await setConfig('currentVideoId', '');
@@ -912,6 +902,11 @@ async function harvestAndPurge() {
     const limitEnabled = (await getConfig('limitEnabled', 'false')) === 'true';
     const limitVideos = parseInt(await getConfig('limitVideos', '2'));
     const limitHours = parseInt(await getConfig('limitHours', '6'));
+
+    // NEW: DB-backed global duration filter (optional, default disabled, max default = 12 hours = 720 minutes)
+    const durationFilterEnabled = (await getConfig('durationFilterEnabled', 'false')) === 'true';
+    const minDurationMinutes = parseInt(await getConfig('minDurationMinutes', '0'));
+    const maxDurationMinutes = parseInt(await getConfig('maxDurationMinutes', '720'));
 
     const channels = await prisma.channel.findMany({ orderBy: { order: 'asc' } });
     harvestStatus.totalChannels = channels.length;
@@ -1006,7 +1001,6 @@ async function harvestAndPurge() {
                 }
               }
 
-              //state of metadata is unknown, need to filter early if possible
               const item2 = {
                 videoId: item.videoId,
                 channelId: currentChannel.channelId,
@@ -1019,10 +1013,10 @@ async function harvestAndPurge() {
                 continue;
               }
 
-              let meta = await fillMissingMetadata(item);//slow
+              let meta = await fillMissingMetadata(item);
               
               if (!meta.res) {
-                const errorMsg = (meta.err || '').toLowerCase();
+                const errorMsg = String(meta.err?.message ?? meta.err ?? '').toLowerCase();
                 if (errorMsg.includes('members-only content')) {
                   await ignoreVideo(item2);
                 }
@@ -1033,6 +1027,16 @@ async function harvestAndPurge() {
               if (await isFilteredOutByPubDate(item)) {
                 await ignoreVideo(item2);
                 continue;
+              }
+
+              // === NEW GLOBAL DURATION FILTER (DB-backed, optional, default disabled) ===
+              if (durationFilterEnabled) {
+                const durMinutes = (item.duration || 0) / 60;
+                if (durMinutes < minDurationMinutes || durMinutes > maxDurationMinutes) {
+                  console.log(`⏭️ [Duration Filter ${minDurationMinutes}-${maxDurationMinutes}min] Skipping ${videoId} (${durMinutes.toFixed(1)} min) outside range`);
+                  await ignoreVideo(item2);
+                  continue;
+                }
               }
 
               let publishedAt = new Date(item.pubDate);
@@ -1067,7 +1071,7 @@ async function harvestAndPurge() {
               );
 
               if (success) {
-                downloadedThisRun++;   // increment successful download counter for this run
+                downloadedThisRun++;
                 const videoDir = path.join(CACHE_DIR, videoId);
                 const audioPath = path.join(videoDir, `${videoId}.mp3`);
 
@@ -1155,27 +1159,30 @@ async function harvestAndPurge() {
 app.get('/api/harvest-status', (_, res) => res.json(harvestStatus));
 
 app.get('/api/config', async (_, res) => {
-  const maxDays = await getConfig('maxHarvestDays', '7');
+  const maxHarvestDays = await getConfig('maxHarvestDays', '7');
   const preferredBitrate = await getConfig('preferredBitrate', '128');
   const preferredMono = await getConfig('preferredMono', 'false');
   const autoPurgeDays = await getConfig('autoPurgeDays', '30');
   const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   const cookieContent = await getCookies();
 
-  // NEW rate limit fields
   const limitEnabled = await getConfig('limitEnabled', 'false');
   const limitVideos = await getConfig('limitVideos', '2');
   const limitHours = await getConfig('limitHours', '6');
   const currentVideoId = await getConfig('currentVideoId', '');
 
-  // NEW: Alternative metadata fetch method settings
   const alternativeMetadataEnabled = await getConfig('alternativeMetadataEnabled', 'true');
   const scrapeVideosTab = await getConfig('scrapeVideosTab', 'true');
   const scrapeStreamsTab = await getConfig('scrapeStreamsTab', 'true');
   const scrapeShortsTab = await getConfig('scrapeShortsTab', 'true');
 
+  // NEW: DB-backed global duration filter
+  const durationFilterEnabled = await getConfig('durationFilterEnabled', 'false');
+  const minDurationMinutes = await getConfig('minDurationMinutes', '0');
+  const maxDurationMinutes = await getConfig('maxDurationMinutes', '720');
+
   res.json({
-    maxHarvestDays: parseInt(maxDays),
+    maxHarvestDays: parseInt(maxHarvestDays),
     preferredBitrate: parseInt(preferredBitrate),
     preferredMono: preferredMono === 'true',
     autoPurgeDays: parseInt(autoPurgeDays),
@@ -1185,18 +1192,23 @@ app.get('/api/config', async (_, res) => {
     limitEnabled: limitEnabled === 'true',
     limitVideos: parseInt(limitVideos),
     limitHours: parseInt(limitHours),
-    // NEW
     alternativeMetadataEnabled: alternativeMetadataEnabled === 'true',
     scrapeVideosTab: scrapeVideosTab === 'true',
     scrapeStreamsTab: scrapeStreamsTab === 'true',
-    scrapeShortsTab: scrapeShortsTab === 'true'
+    scrapeShortsTab: scrapeShortsTab === 'true',
+    // NEW duration filter fields
+    durationFilterEnabled: durationFilterEnabled === 'true',
+    minDurationMinutes: parseInt(minDurationMinutes),
+    maxDurationMinutes: parseInt(maxDurationMinutes)
   });
 });
 
 app.post('/api/config', async (req, res) => {
   const { maxHarvestDays, preferredBitrate, preferredMono, autoPurgeDays, userAgent, cookies,
     limitEnabled, limitVideos, limitHours,
-    alternativeMetadataEnabled, scrapeVideosTab, scrapeStreamsTab, scrapeShortsTab } = req.body;
+    alternativeMetadataEnabled, scrapeVideosTab, scrapeStreamsTab, scrapeShortsTab,
+    // NEW duration filter
+    durationFilterEnabled, minDurationMinutes, maxDurationMinutes } = req.body;
 
   if (maxHarvestDays !== undefined) await setConfig('maxHarvestDays', String(maxHarvestDays));
   if (preferredBitrate !== undefined) await setConfig('preferredBitrate', String(preferredBitrate));
@@ -1205,16 +1217,19 @@ app.post('/api/config', async (req, res) => {
   if (userAgent !== undefined) await setConfig('userAgent', userAgent);
   if (cookies !== undefined) await setConfig('cookies', cookies);
 
-  // NEW rate limit config
   if (limitEnabled !== undefined) await setConfig('limitEnabled', String(limitEnabled));
   if (limitVideos !== undefined) await setConfig('limitVideos', String(limitVideos));
   if (limitHours !== undefined) await setConfig('limitHours', String(limitHours));
 
-  // NEW: Alternative metadata fetch method config
   if (alternativeMetadataEnabled !== undefined) await setConfig('alternativeMetadataEnabled', String(alternativeMetadataEnabled));
   if (scrapeVideosTab !== undefined) await setConfig('scrapeVideosTab', String(scrapeVideosTab));
   if (scrapeStreamsTab !== undefined) await setConfig('scrapeStreamsTab', String(scrapeStreamsTab));
   if (scrapeShortsTab !== undefined) await setConfig('scrapeShortsTab', String(scrapeShortsTab));
+
+  // NEW duration filter config
+  if (durationFilterEnabled !== undefined) await setConfig('durationFilterEnabled', String(durationFilterEnabled));
+  if (minDurationMinutes !== undefined) await setConfig('minDurationMinutes', String(minDurationMinutes));
+  if (maxDurationMinutes !== undefined) await setConfig('maxDurationMinutes', String(maxDurationMinutes));
 
   res.json({ success: true });
 });
@@ -1447,7 +1462,6 @@ app.patch('/api/video/:videoId/progress', async (req, res) => {
     }
 
     await setConfig('currentVideoId', videoId);
-    // console.log(`📌 Progress saved for ${videoId} → set as current video`);
     res.json({ success: true });
   } catch (e: any) {
     console.error(`❌ Failed to save progress for ${videoId}:`, e.message);

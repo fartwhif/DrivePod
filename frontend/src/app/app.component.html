@@ -313,6 +313,33 @@
         </div>
       </div>
 
+      <!-- NEW: Global Duration Filter (DB-backed, optional, default disabled, max default = 12 hours) -->
+      <div class="flex flex-col sm:flex-row items-start sm:items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
+        <label class="flex items-center gap-2 cursor-pointer flex-shrink-0">
+          <input type="checkbox" 
+                 [ngModel]="durationFilterEnabled()" 
+                 (ngModelChange)="durationFilterEnabled.set($event); saveConfig()">
+          <span class="font-medium">Enable duration filter</span>
+        </label>
+        
+        <div class="flex items-center gap-2 flex-1 flex-wrap">
+          <span class="font-medium whitespace-nowrap">Between</span>
+          <input type="number" 
+                 [(ngModel)]="minDurationMinutes" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-16 text-center outline-none" 
+                 min="0" max="1440">
+          <span class="font-medium whitespace-nowrap">and</span>
+          <input type="number" 
+                 [(ngModel)]="maxDurationMinutes" 
+                 (ngModelChange)="saveConfig()" 
+                 class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-20 text-center outline-none" 
+                 min="0" max="1440">
+          <span class="font-medium whitespace-nowrap">minutes</span>
+          <span class="text-xs text-amber-400 ml-auto">(harvest only • default max 12h)</span>
+        </div>
+      </div>
+
       <!-- NEW: Alternative Metadata Fetch Method Section -->
       <div class="mt-6 bg-zinc-800 p-5 rounded-2xl">
         <h3 class="font-medium mb-4 flex items-center gap-2 text-zinc-300">
