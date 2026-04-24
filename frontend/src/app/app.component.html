@@ -292,7 +292,7 @@
           <input type="checkbox" 
                  [ngModel]="limitEnabled()" 
                  (ngModelChange)="limitEnabled.set($event); saveConfig()">
-          <span class="font-medium">Enable rate limit</span>
+          <span class="font-medium">Per-channel rate limit</span>
         </label>
         
         <div class="flex items-center gap-2 flex-1 flex-wrap">
@@ -302,24 +302,21 @@
                  (ngModelChange)="saveConfig()" 
                  class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-16 text-center outline-none" 
                  min="1" max="20">
-          <span class="font-medium whitespace-nowrap">items per</span>
+          <span class="font-medium whitespace-nowrap">content items per</span>
           <input type="number" 
                  [(ngModel)]="limitHours" 
                  (ngModelChange)="saveConfig()" 
                  class="bg-zinc-700 text-white px-3 py-1 rounded-xl w-20 text-center outline-none" 
                  min="1" max="720">
           <span class="font-medium">hours</span>
-          <span class="text-xs text-amber-400 ml-auto">(per channel • prevents over-harvesting)</span>
         </div>
       </div>
-
-      <!-- NEW: Global Duration Filter (DB-backed, optional, default disabled, max default = 12 hours) -->
       <div class="flex flex-col sm:flex-row items-start sm:items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
         <label class="flex items-center gap-2 cursor-pointer flex-shrink-0">
           <input type="checkbox" 
                  [ngModel]="durationFilterEnabled()" 
                  (ngModelChange)="durationFilterEnabled.set($event); saveConfig()">
-          <span class="font-medium">Enable duration filter</span>
+          <span class="font-medium">Content duration filter</span>
         </label>
         
         <div class="flex items-center gap-2 flex-1 flex-wrap">
@@ -340,11 +337,10 @@
         </div>
       </div>
 
-      <!-- NEW: Alternative Metadata Fetch Method Section -->
       <div class="mt-6 bg-zinc-800 p-5 rounded-2xl">
         <h3 class="font-medium mb-4 flex items-center gap-2 text-zinc-300">
-          🔍 Alternative Metadata Fetch Method
-          <span class="text-xs bg-amber-900 text-amber-300 px-2 py-0.5 rounded-full">yt-dlp fallback</span>
+          🔍 Additional content discovery method
+          <span class="text-xs bg-amber-900 text-amber-300 px-2 py-0.5 rounded-full">yt-dlp</span>
         </h3>
 
         <div class="flex items-center gap-3 bg-zinc-700/50 p-3 rounded-xl mb-4">
@@ -352,13 +348,13 @@
             <input type="checkbox" 
                    [ngModel]="alternativeMetadataEnabled()" 
                    (ngModelChange)="alternativeMetadataEnabled.set($event); saveConfig()">
-            <span class="font-medium">Enable alternative method (fallback when RSS fails)</span>
+            <span class="font-medium">Enable additional method</span>
           </label>
           <span class="text-xs text-emerald-400 whitespace-nowrap">Default: ON</span>
         </div>
 
         <div class="ml-8">
-          <div class="text-sm font-medium text-zinc-400 mb-3">Tabs to scrape with alternative method:</div>
+          <div class="text-sm font-medium text-zinc-400 mb-3">Tabs to scrape with additional method:</div>
           <div class="flex flex-wrap gap-x-8 gap-y-3">
             <label class="flex items-center gap-2 cursor-pointer">
               <input type="checkbox" 
@@ -379,7 +375,7 @@
               <span class="text-sm">Shorts</span>
             </label>
           </div>
-          <p class="text-xs text-zinc-500 mt-3">Only used if RSS feed fails. All tabs enabled by default.</p>
+          <p class="text-xs text-zinc-500 mt-3">Augments content discovery when enabled.</p>
         </div>
       </div>
 

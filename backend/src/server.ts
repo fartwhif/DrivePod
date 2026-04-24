@@ -85,7 +85,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 // === SETTINGS ===
 const MAX_CONCURRENT_CHANNELS = 2;
 let isHarvesting = false;
-let UseAlternateListGetterMethod = false;
+let UseAlternateListGetterMethod = true;
 
 // === LIVE HARVEST STATUS ===
 let harvestStatus = {
@@ -391,12 +391,6 @@ function cleanRssItems(items: any[]): any[] {
   }).filter(item => item.videoId);
 }
 
-/**
- * Parses yt-dlp JSON duration info.
- * Priority: numeric `duration` (already in seconds) → parse `duration_string`
- * Supports: "2:00:08", "8:43", "45", etc.
- * Returns duration in seconds (number) or undefined.
- */
 function parseYtDlpDuration(json: any): number | undefined {
   // 1. Prefer direct numeric duration (seconds, may be float like 7208.0)
   if (typeof json.duration === 'number' && !isNaN(json.duration) && json.duration > 0) {
@@ -421,10 +415,6 @@ function parseYtDlpDuration(json: any): number | undefined {
   return undefined;
 }
 
-/**
- * Helper: If a date resolves to *today at midnight* (00:00:00), return current time instead.
- * This fixes yt-dlp's common behavior on brand-new videos that only report the day.
- */
 function applyTodayMidnightRule(date: Date): Date {
   const now = new Date();
   const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -435,9 +425,6 @@ function applyTodayMidnightRule(date: Date): Date {
   return date;
 }
 
-/**
- * Updated parseYtDlpPubDate — applies the midnight rule to BOTH timestamp AND upload_date
- */
 function parseYtDlpPubDate(json: any): Date | undefined {
   // 1. Prefer timestamp (Unix timestamp in seconds) — now with midnight rule
   if (typeof json?.timestamp === 'number' && json.timestamp > 0) {
@@ -446,8 +433,7 @@ function parseYtDlpPubDate(json: any): Date | undefined {
       return applyTodayMidnightRule(date);
     }
   }
-
-  // 2. Fallback to upload_date (YYYYMMDD format)
+  
   if (typeof json?.upload_date === 'string' && json.upload_date.length === 8) {
     const year = parseInt(json.upload_date.slice(0, 4), 10);
     const month = parseInt(json.upload_date.slice(4, 6), 10) - 1; // JS months are 0-based
@@ -460,12 +446,10 @@ function parseYtDlpPubDate(json: any): Date | undefined {
       }
     }
   }
-
-  // bad fallback
+  
   return undefined;
 }
 
-// === UPDATED scrapeTab function (replace the entire existing function) ===
 async function scrapeTab(channelId: string, tab: string, maxDays: number, scrapeIgnore: boolean): Promise<any[]> {
   const url = `https://www.youtube.com/channel/${channelId}/${tab}`;
   try {
@@ -473,7 +457,10 @@ async function scrapeTab(channelId: string, tab: string, maxDays: number, scrape
     date.setDate(date.getDate() - maxDays);
     const dateStr = date.toISOString().split('T')[0].replace(/-/g, '');
 
-    const cmd = `yt-dlp ` + ((scrapeIgnore) ? '' : `--playlist-items 1-10 `) + `--break-on-reject --extractor-args "youtubetab:approximate_date" --no-progress --dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
+    const cmd = (await getBaseYtDlpCommand()) +
+      ((scrapeIgnore) ? '' : `--playlist-items 1-10 `) +
+      `--break-on-reject --extractor-args "youtubetab:approximate_date" ` +
+      `--dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
 
     const { stdout } = await safeExec(cmd, `scrapeTab ${tab} for ${channelId}`);
     return stdout.trim().split('\n')
@@ -589,7 +576,8 @@ export async function fillMissingMetadata(item: any): Promise<any> {
   try {
     if (!item.pubDate || !item.duration || !item.liveStatus) {
       console.log(`fetching metadata for ${item.videoId}`);
-      const cmd = `yt-dlp --no-warnings --print '%(timestamp)s|%(duration_string)s|%(live_status)s' "${item.link}"`;
+      const cmd = (await getBaseYtDlpCommand()) +
+        `--no-warnings --print '%(timestamp)s|%(duration_string)s|%(live_status)s' "${item.link}"`;
       const { stdout } = await safeExec(cmd, `fetch metadata for ${item.videoId}`);
       const [rawTs, dur, liveStatusRaw] = stdout.trim().split('|');
       const result = {
@@ -614,6 +602,24 @@ export async function fillMissingMetadata(item: any): Promise<any> {
   }
 }
 
+async function getBaseYtDlpCommand(): Promise<string> {
+  const cookies = await getCookies();
+  const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
+
+  let cookieFlag = '';
+  if (cookies.trim()) {
+    cookieFlag = `--cookies "${TEMP_COOKIES_FILE}" `;
+    console.log(`🍪 Using cookies`);
+  }
+
+  const cmd = `yt-dlp --no-progress ` +
+    `--js-runtimes node --remote-components ejs:github ` +
+    `--user-agent "${userAgent}" ` +
+    cookieFlag;
+
+  return cmd;
+}
+
 // === DOWNLOAD + TRANSCODE ===
 async function downloadAndProcessVideo(
   videoInfo: any,
@@ -635,20 +641,10 @@ async function downloadAndProcessVideo(
   try {
     console.log(`📥 Starting download: ${videoId} (${author})`);
 
-    const cookies = await getCookies();
-    const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
-
-    let cookieFlag = '';
-    if (cookies.trim()) {
-      cookieFlag = `--cookies "${TEMP_COOKIES_FILE}" `;
-      console.log(`🍪 Using cookies for ${videoId}`);
-    }
-
-    const downloadCmd = `yt-dlp --no-progress -f bestaudio/best --write-thumbnail --no-overwrites --continue ` +
+    const downloadCmd = (await getBaseYtDlpCommand()) +
+      `-f bestaudio/best --write-thumbnail --no-overwrites --continue ` +
       `--match-filter "live_status != is_live & live_status != is_upcoming" ` +
       `--js-runtimes node --remote-components ejs:github ` +
-      `--user-agent "${userAgent}" ` +
-      cookieFlag +
       `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`;
 
     await safeExec(downloadCmd, `yt-dlp download ${videoId}`);
@@ -788,6 +784,21 @@ async function isFilteredOutByPubDate(item: any): Promise<boolean> {
   }
   return false;
 }
+async function isFilteredOutByDuration(item: any): Promise<boolean> {
+  if (item.duration) {
+    const durationFilterEnabled = (await getConfig('durationFilterEnabled', 'false')) === 'true';
+    const minDurationMinutes = parseInt(await getConfig('minDurationMinutes', '0'));
+    const maxDurationMinutes = parseInt(await getConfig('maxDurationMinutes', '720'));
+    if (durationFilterEnabled) {
+      const durMinutes = (item.duration || 0) / 60;
+      if (durMinutes < minDurationMinutes || durMinutes > maxDurationMinutes) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 
 async function ignoreVideo(videoInfo: {
   videoId: string;
@@ -893,6 +904,13 @@ async function harvestAndPurge() {
     await deleteTempCookiesFile();
     await writeTempCookiesFile();
 
+    if (UseAlternateListGetterMethod) {
+      UseAlternateListGetterMethod = false;
+    }
+    else if (!UseAlternateListGetterMethod) {
+      UseAlternateListGetterMethod = true;
+    }
+
     const maxDays = parseInt(await getConfig('maxHarvestDays', '7'));
     const preferredBitrate = parseInt(await getConfig('preferredBitrate', '128'));
     const preferredMono = (await getConfig('preferredMono', 'false')) === 'true';
@@ -959,12 +977,7 @@ async function harvestAndPurge() {
 
             const { items } = await getRssFeedWithCache(currentChannel.channelId);
 
-            if (UseAlternateListGetterMethod) {
-              UseAlternateListGetterMethod = false;
-            }
-            else if (!UseAlternateListGetterMethod) {
-              UseAlternateListGetterMethod = true;
-            }
+
             
             harvestStatus.totalVideosThisRun += items.length;
 
@@ -1008,7 +1021,7 @@ async function harvestAndPurge() {
                 pubDate: item.pubDate || new Date(),
                 duration: item.duration || 0
               };
-              if (await isFilteredOutByPubDate(item)) {
+              if (await isFilteredOutByPubDate(item) || await isFilteredOutByDuration(item)) {
                 await ignoreVideo(item2);
                 continue;
               }
@@ -1024,19 +1037,9 @@ async function harvestAndPurge() {
               }
               if (item.VODFuture) continue;
 
-              if (await isFilteredOutByPubDate(item)) {
+              if (await isFilteredOutByPubDate(item) || await isFilteredOutByDuration(item)) {
                 await ignoreVideo(item2);
                 continue;
-              }
-
-              // === NEW GLOBAL DURATION FILTER (DB-backed, optional, default disabled) ===
-              if (durationFilterEnabled) {
-                const durMinutes = (item.duration || 0) / 60;
-                if (durMinutes < minDurationMinutes || durMinutes > maxDurationMinutes) {
-                  console.log(`⏭️ [Duration Filter ${minDurationMinutes}-${maxDurationMinutes}min] Skipping ${videoId} (${durMinutes.toFixed(1)} min) outside range`);
-                  await ignoreVideo(item2);
-                  continue;
-                }
               }
 
               let publishedAt = new Date(item.pubDate);
