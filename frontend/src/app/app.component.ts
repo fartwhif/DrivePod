@@ -27,11 +27,14 @@ interface Config {
   limitEnabled: boolean;
   limitVideos: number;
   limitHours: number;
-  // NEW: Alternative metadata fetch method configuration
   alternativeMetadataEnabled: boolean;
   scrapeVideosTab: boolean;
   scrapeStreamsTab: boolean;
   scrapeShortsTab: boolean;
+  // NEW: DB-backed global duration filter
+  durationFilterEnabled: boolean;
+  minDurationMinutes: number;
+  maxDurationMinutes: number;
 }
 
 interface ImportResult {
@@ -92,6 +95,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   scrapeVideosTab = signal(true);
   scrapeStreamsTab = signal(true);
   scrapeShortsTab = signal(true);
+
+  // NEW: DB-backed global duration filter (optional, default disabled, max default = 12 hours = 720 minutes)
+  durationFilterEnabled = signal(false);
+  minDurationMinutes = signal(0);
+  maxDurationMinutes = signal(720);
 
   // 56K MODEM OPTIMIZATIONS
   lowBandwidthMode = signal(false);
@@ -194,6 +202,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.scrapeVideosTab.set(config.scrapeVideosTab ?? true);
         this.scrapeStreamsTab.set(config.scrapeStreamsTab ?? true);
         this.scrapeShortsTab.set(config.scrapeShortsTab ?? true);
+
+        // NEW: Load duration filter settings
+        this.durationFilterEnabled.set(config.durationFilterEnabled ?? false);
+        this.minDurationMinutes.set(config.minDurationMinutes ?? 0);
+        this.maxDurationMinutes.set(config.maxDurationMinutes ?? 720);
 
         const savedId = this.currentVideoId();
         let autoPlay: boolean = !!savedId || targetMode !== 'off';
@@ -652,11 +665,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       limitHours: this.limitHours(),
       autoPurgeDays: this.autoPurgeDays(),
       userAgent: this.userAgent(),
-      // NEW: Alternative metadata fetch settings
       alternativeMetadataEnabled: this.alternativeMetadataEnabled(),
       scrapeVideosTab: this.scrapeVideosTab(),
       scrapeStreamsTab: this.scrapeStreamsTab(),
-      scrapeShortsTab: this.scrapeShortsTab()
+      scrapeShortsTab: this.scrapeShortsTab(),
+      // NEW duration filter
+      durationFilterEnabled: this.durationFilterEnabled(),
+      minDurationMinutes: this.minDurationMinutes(),
+      maxDurationMinutes: this.maxDurationMinutes()
     }).subscribe();
   }
 
