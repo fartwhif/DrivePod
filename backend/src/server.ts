@@ -1,8 +1,7 @@
-// FULL UPDATED server.ts
 import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
-import type { Video } from '@prisma/client';
+import { Video } from '@prisma/client';
 import Parser from 'rss-parser';
 import cron from 'node-cron';
 import bodyParser from 'body-parser';
@@ -86,9 +85,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 // === SETTINGS ===
 const MAX_CONCURRENT_CHANNELS = 2;
 let isHarvesting = false;
-
-// === FOR TESTING: Force alternative discovery method (yt-dlp scraping) instead of RSS ===
-const FORCE_ALTERNATIVE_DISCOVERY = false;   // ← Set to `true` to force yt-dlp method for testing
+let UseAlternateListGetterMethod = false;
 
 // === LIVE HARVEST STATUS ===
 let harvestStatus = {
@@ -181,7 +178,7 @@ async function cleanupCorruptedFolders() {
 
     if (!videoRecord) {
       console.log(`   🗑️ ORPHAN FOLDER (no DB Video entity): ${videoId}`);
-      try { fs.rmSync(folderPath, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(folderPath, { recursive: true, force: true }); } catch { }
       continue;
     }
 
@@ -225,7 +222,7 @@ async function cleanupCorruptedFolders() {
     if (!fs.existsSync(folderPath) || !fs.existsSync(mp3Path)) {
       const reason = !fs.existsSync(folderPath) ? 'Folder missing on disk' : '.mp3 file missing';
       console.log(`   🗑️ ORPHAN DB ENTITY: ${video.videoId} → ${reason}`);
-      try { await prisma.video.delete({ where: { id: video.id } }); } catch {}
+      try { await prisma.video.delete({ where: { id: video.id } }); } catch { }
     }
   }
 
@@ -285,7 +282,7 @@ async function getChannelTitle(channelId: string, preferCache: boolean = false):
       const title = extractChannelTitle(parsed);
       console.log(`✅ [getChannelTitle] Used cached title → "${title}" for ${channelId} (age: ${getFileAge(cacheFile)})`);
       return title;
-    } catch {}
+    } catch { }
   }
 
   console.warn(`❌ [getChannelTitle] Could not fetch title for ${channelId}`);
@@ -312,57 +309,50 @@ async function fetchRssRaw(url: string, channelId: string): Promise<string> {
   });
 }
 
-async function getRssFeedWithCache(channelId: string): Promise<{items: any[], channelTitle: string}> {
+async function getRssFeedWithCache(channelId: string): Promise<{ items: any[], channelTitle: string }> {
   const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
   const cacheFile = path.join(RSS_CACHE_DIR, `${channelId}.xml`);
   const timestamp = logTimestamp();
   const maxDays = parseInt(await getConfig('maxHarvestDays', '7'));
 
-  // === FORCE ALTERNATIVE DISCOVERY FOR TESTING ===
-  if (FORCE_ALTERNATIVE_DISCOVERY) {
-    console.log(`[${timestamp}] FORCE_ALTERNATIVE_DISCOVERY=true — skipping RSS and using ALTERNATIVE METHOD for ${channelId}`);
+  const altEnabled = (await getConfig('alternativeMetadataEnabled', 'true')) === 'true';
+  if (!UseAlternateListGetterMethod || !altEnabled) {
+    // Normal flow (RSS first, then alternative, then cache)
     try {
-      const items = await getLatestVideosAlternative(channelId, maxDays, false);
-      const channelTitle = await getChannelTitle(channelId, true);
-      console.log(`[${timestamp}] Forced alternative method succeeded for ${channelId} (${items.length} items)`);
-      return { items, channelTitle };
-    } catch (e) {
-      console.error(`[${timestamp}] Forced alternative method failed for ${channelId}:`, e);
-      // fall through to normal RSS path if forced method fails
+      const xml = await fetchRssRaw(rssUrl, channelId);
+      fs.writeFileSync(cacheFile, xml);
+      console.log(`Fresh RSS cached for ${channelId}`);
+      const parsed = await parser.parseString(xml);
+      const channelTitle =
+        parsed.title?.trim() ||
+        parsed.author?.name?.trim() ||
+        parsed.feed?.title?.trim() ||
+        parsed.feed?.['title']?.trim() ||
+        'Unknown Channel';
+      return { items: cleanRssItems(parsed.items || []), channelTitle };
+    } catch {
+      console.warn(`Live RSS failed for ${channelId} → trying ALTERNATIVE METHOD (if enabled)`);
     }
   }
 
-  // Normal flow (RSS first, then alternative, then cache)
-  try {
-    const xml = await fetchRssRaw(rssUrl, channelId);
-    fs.writeFileSync(cacheFile, xml);
-    console.log(`Fresh RSS cached for ${channelId}`);
-    const parsed = await parser.parseString(xml);
-    const channelTitle = 
-      parsed.title?.trim() ||
-      parsed.author?.name?.trim() ||
-      parsed.feed?.title?.trim() ||
-      parsed.feed?.['title']?.trim() ||
-      'Unknown Channel';
-    return { items: cleanRssItems(parsed.items || []), channelTitle };
-  } catch {
-    console.warn(`Live RSS failed for ${channelId} → trying ALTERNATIVE METHOD`);
-  }
-
-  try {
-    console.log(`[${timestamp}] Alternative method started for ${channelId}`);
-    const items = await getLatestVideosAlternative(channelId, maxDays, false);
-    const channelTitle = await getChannelTitle(channelId, true);
-    return { items, channelTitle };
-  } catch {
-    console.warn(`Alternative method failed → falling back to cached RSS`);
+  if (altEnabled) {
+    try {
+      console.log(`[${timestamp}] Alternative method started for ${channelId}`);
+      const items = await getLatestVideosAlternative(channelId, maxDays, false);
+      const channelTitle = await getChannelTitle(channelId, true);
+      return { items, channelTitle };
+    } catch {
+      console.warn(`Alternative method failed → falling back to cached RSS`);
+    }
+  } else {
+    console.log(`[${timestamp}] Alternative metadata fetch disabled — skipping fallback for ${channelId}`);
   }
 
   if (fs.existsSync(cacheFile)) {
     try {
       const xml = fs.readFileSync(cacheFile, 'utf-8');
       const parsed = await parser.parseString(xml);
-      const channelTitle = 
+      const channelTitle =
         parsed.title?.trim() ||
         parsed.author?.name?.trim() ||
         parsed.feed?.title?.trim() ||
@@ -386,11 +376,11 @@ function cleanRssItems(items: any[]): any[] {
       const match = item.id.match(/yt:video:(.+)/);
       if (match) videoId = match[1];
     }
- 
+
     let pubDateRaw = item.pubDate || item.published || item.updated || null;
-    let pubDate = pubDateRaw ? new Date(pubDateRaw) : new Date();
-    if (isNaN(pubDate.getTime())) pubDate = new Date();
- 
+    let pubDate = pubDateRaw ? new Date(pubDateRaw) : undefined;
+    if (pubDate && isNaN(pubDate.getTime())) pubDate = undefined;
+
     return {
       ...item,
       videoId,
@@ -438,7 +428,7 @@ function parseYtDlpDuration(json: any): number | undefined {
 function applyTodayMidnightRule(date: Date): Date {
   const now = new Date();
   const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  
+
   if (date.getTime() === todayMidnight.getTime()) {
     return now;
   }
@@ -448,7 +438,7 @@ function applyTodayMidnightRule(date: Date): Date {
 /**
  * Updated parseYtDlpPubDate — applies the midnight rule to BOTH timestamp AND upload_date
  */
-function parseYtDlpPubDate(json: any): Date {
+function parseYtDlpPubDate(json: any): Date | undefined {
   // 1. Prefer timestamp (Unix timestamp in seconds) — now with midnight rule
   if (typeof json?.timestamp === 'number' && json.timestamp > 0) {
     const date = new Date(json.timestamp * 1000);
@@ -471,42 +461,37 @@ function parseYtDlpPubDate(json: any): Date {
     }
   }
 
-  // Ultimate fallback
-  return new Date();
+  // bad fallback
+  return undefined;
 }
 
 // === UPDATED scrapeTab function (replace the entire existing function) ===
-async function scrapeTab(channelId: string, tab: string, maxDays: number): Promise<any[]> {
+async function scrapeTab(channelId: string, tab: string, maxDays: number, scrapeIgnore: boolean): Promise<any[]> {
   const url = `https://www.youtube.com/channel/${channelId}/${tab}`;
   try {
     const date = new Date();
     date.setDate(date.getDate() - maxDays);
     const dateStr = date.toISOString().split('T')[0].replace(/-/g, '');
 
-    const cmd = `yt-dlp --break-on-reject --extractor-args "youtubetab:approximate_date" --no-progress --dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
-    
-    if (FORCE_ALTERNATIVE_DISCOVERY) {
-      console.log(`[TEST] req: ${cmd}`);
-    }
+    const cmd = `yt-dlp ` + ((scrapeIgnore) ? '' : `--playlist-items 1-10 `) + `--break-on-reject --extractor-args "youtubetab:approximate_date" --no-progress --dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
+
+    // if (FORCE_ALTERNATIVE_DISCOVERY) {
+    //   console.log(`[TEST] req: ${cmd}`);
+    // }
     const { stdout } = await safeExec(cmd, `scrapeTab ${tab} for ${channelId}`);
     return stdout.trim().split('\n')
       .filter(l => l.trim())
       .map(line => {
         try {
           const json = JSON.parse(line);
-          if (FORCE_ALTERNATIVE_DISCOVERY) {
-            console.log(`[TEST] res: ${JSON.stringify(json)}`);
-          }
           let res = {
             videoId: json.id,
             title: json.title || 'Untitled',
-            pubDate: parseYtDlpPubDate(json),
+            //pubDate: parseYtDlpPubDate(json),
             duration: parseYtDlpDuration(json),   // ← NEW: duration in seconds (number)
             link: `https://www.youtube.com/watch?v=${json.id}`
           };
-          if (FORCE_ALTERNATIVE_DISCOVERY) {
-            console.log(`[TEST] res: ${JSON.stringify(res)}`);
-          }
+
           return res;
 
         } catch {
@@ -534,8 +519,8 @@ async function performIgnoreSweep(channelId: string) {
     const existingVideo = await prisma.video.findUnique({ where: { videoId: videoItem.videoId } });
     if (existingVideo) continue;
 
-    let publishedAt = videoItem.pubDate && !isNaN(videoItem.pubDate.getTime()) && videoItem.pubDate.getTime() < Date.now() 
-      ? videoItem.pubDate 
+    let publishedAt = videoItem.pubDate && !isNaN(videoItem.pubDate.getTime()) && videoItem.pubDate.getTime() < Date.now()
+      ? videoItem.pubDate
       : new Date();
 
     await prisma.video.create({
@@ -560,31 +545,79 @@ async function performIgnoreSweep(channelId: string) {
   console.log(`✅ [IGNORE SWEEP] Flagged ${count} existing videos for ${channelRecord.title}`);
 }
 
-// === ALTERNATIVE METHOD ===
+// === ALTERNATIVE METHOD (updated to respect global + per-tab toggles) ===
 async function getLatestVideosAlternative(channelId: string, maxDays: number, includeIgnored: boolean = false): Promise<any[]> {
+  // Respect global toggle
+  const altEnabled = (await getConfig('alternativeMetadataEnabled', 'true')) === 'true';
+  if (!altEnabled) {
+    console.log(`🔧 [Alternative] Disabled globally for ${channelId}`);
+    return [];
+  }
+
+  const useVideos = (await getConfig('scrapeVideosTab', 'true')) === 'true';
+  const useStreams = (await getConfig('scrapeStreamsTab', 'true')) === 'true';
+  const useShorts = (await getConfig('scrapeShortsTab', 'true')) === 'true';
+
+  console.log(`🔧 Alternative tabs for ${channelId}: videos=${useVideos}, streams=${useStreams}, shorts=${useShorts}`);
+
+  const scrapePromises: Promise<any[]>[] = [];
+  if (useVideos) scrapePromises.push(scrapeTab(channelId, 'videos', maxDays, includeIgnored));
+  if (useStreams) scrapePromises.push(scrapeTab(channelId, 'streams', maxDays, includeIgnored));
+  if (useShorts) scrapePromises.push(scrapeTab(channelId, 'shorts', maxDays, includeIgnored));
+
+  const results = scrapePromises.length > 0
+    ? await Promise.all(scrapePromises)
+    : [];
+
+  const allItems = results.flat();
+
   let ignoredVideoIds = new Set<string>();
   if (!includeIgnored) {
     const ignoredVideos = await prisma.video.findMany({
-      where: { channelId, ignored: true },
+      where: { channelId },
       select: { videoId: true }
     });
     ignoredVideoIds = new Set(ignoredVideos.map((v: { videoId: string }) => v.videoId));
   }
 
-  const [videos, streams, shorts] = await Promise.all([
-    scrapeTab(channelId, 'videos', maxDays),
-    scrapeTab(channelId, 'streams', maxDays),
-    scrapeTab(channelId, 'shorts', maxDays)
-  ]);
-
-  const allItems = [...videos, ...streams, ...shorts];
   const seenVideoIds = new Set<string>();
-  const uniqueItems = allItems.filter(item => 
+  const uniqueItems = allItems.filter(item =>
     !ignoredVideoIds.has(item.videoId) && !seenVideoIds.has(item.videoId) && seenVideoIds.add(item.videoId)
   );
 
+
   console.log(`✅ Alternative method completed for ${channelId} (includeIgnored=${includeIgnored}, returned ${uniqueItems.length})`);
   return uniqueItems;
+}
+
+export async function fillMissingMetadata(item: any): Promise<any> {
+  try {
+    // Fetch metadata if any of the key fields are missing (including live status)
+    if (!item.pubDate || !item.duration || !item.liveStatus) {
+      console.log(`fetching metadata for ${item.videoId}`);
+      const cmd = `yt-dlp --no-warnings --print '%(timestamp)s|%(duration_string)s|%(live_status)s' "${item.link}"`;
+      const { stdout } = await safeExec(cmd, `fetch metadata for ${item.videoId}`);
+      const [rawTs, dur, liveStatusRaw] = stdout.trim().split('|');
+      const result = {
+        timestamp: parseInt(rawTs, 10) || undefined,
+        duration_string: dur || undefined,
+        live_status: liveStatusRaw?.trim() || 'not_live',  // safe default
+      };
+
+      item.duration = parseYtDlpDuration(result);
+      item.pubDate = parseYtDlpPubDate(result);
+      item.liveStatus = result.live_status;
+      item.liveStatuses = 'not_live|is_live|is_upcoming|was_live|post_live';
+      item.VODNow = (item.liveStatus == 'not_live' || item.liveStatus == 'was_live');
+      item.VODFuture = (item.liveStatus == 'is_live' || item.liveStatus == 'is_upcoming' || item.liveStatus == 'post_live');
+
+      return { res: !!(item.duration && item.pubDate && item.liveStatus), err: '' }
+    }
+    return { res: true, err: '' };
+  } catch (err) {
+    console.error('fillMissingMetadata failed:', err);
+    return { res: false, err };
+  }
 }
 
 // === DOWNLOAD + TRANSCODE ===
@@ -623,7 +656,7 @@ async function downloadAndProcessVideo(
       `--user-agent "${userAgent}" ` +
       cookieFlag +
       `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`;
-    
+
     await safeExec(downloadCmd, `yt-dlp download ${videoId}`);
 
     let raw = path.join(videoDir, `${videoId}.webm`);
@@ -671,20 +704,20 @@ comment=${JSON.stringify(commentData)}
     if (thumbnailPath && thumbnailPath.includes('-small.webp')) {
       const smallThumbPath = path.join(videoDir, `${videoId}-small.webp`);
       args = ['-i', raw, '-i', smallThumbPath, '-f', 'ffmetadata', '-i', metadataPath,
-              '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
-              '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
-              '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+        '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
+        '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
+        '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     } else if (originalThumbFile) {
       const originalThumb = path.join(videoDir, originalThumbFile);
       args = ['-i', raw, '-i', originalThumb, '-f', 'ffmetadata', '-i', metadataPath,
-              '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
-              '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
-              '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+        '-map', '0:a', '-map', '1:0', '-map_metadata', '2',
+        '-c:a', 'libmp3lame', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic',
+        '-id3v2_version', '3', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     } else {
       args = ['-i', raw, '-f', 'ffmetadata', '-i', metadataPath,
-              '-map', '0:a', '-map_metadata', '1',
-              '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact',
-              '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
+        '-map', '0:a', '-map_metadata', '1',
+        '-id3v2_version', '3', '-write_id3v1', '0', '-write_xing', '0', '-fflags', '+bitexact',
+        '-vn', '-c:a', 'libmp3lame', '-ar', '24000', '-b:a', `${preferredBitrate}k`, '-f', 'mp3', mp3];
     }
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
 
@@ -700,8 +733,8 @@ comment=${JSON.stringify(commentData)}
     const errorMsg = (err.stderr || err.message || '').toLowerCase();
 
     if (errorMsg.includes('cookies are no longer valid') ||
-        errorMsg.includes('invalid cookies') ||
-        (errorMsg.includes('cookie') && errorMsg.includes('expired'))) {
+      errorMsg.includes('invalid cookies') ||
+      (errorMsg.includes('cookie') && errorMsg.includes('expired'))) {
       console.log(`🔑 [AUTO-CLEAR] Cookies are no longer valid → cleared from database`);
       await setConfig('cookies', '');
     }
@@ -722,7 +755,7 @@ comment=${JSON.stringify(commentData)}
     return false;
   } finally {
     if (fs.existsSync(metadataPath)) {
-      try { fs.unlinkSync(metadataPath); } catch {}
+      try { fs.unlinkSync(metadataPath); } catch { }
     }
 
     if (!success && fs.existsSync(videoDir) && !fs.existsSync(mp3)) {
@@ -748,6 +781,96 @@ async function getAudioDuration(filePath: string): Promise<number | null> {
     return isNaN(d) ? null : Math.round(d * 10) / 10;
   } catch {
     return null;
+  }
+}
+
+async function isFilteredOutByPubDate(item: any): Promise<boolean> {
+  if (item.pubDate) {
+    const maxDays = parseInt(await getConfig('maxHarvestDays', '7'));
+    let publishedAt = new Date(item.pubDate);
+    const ageMs = Date.now() - publishedAt.getTime();
+    if (ageMs < 0) publishedAt = new Date();
+    if (ageMs / (1000 * 60 * 60) > maxDays * 24) return true;
+  }
+  return false;
+}
+
+async function ignoreVideo(videoInfo: {
+  videoId: string;
+  channelId: string;
+  title?: string;
+  pubDate?: Date | string | null;   // renamed from publishedAt for exact match to your example
+  duration?: number;
+  [key: string]: any;               // allows extra fields like thumbnailPath, etc.
+}): Promise<void> {
+  const { videoId, channelId, title, pubDate, duration } = videoInfo;
+
+  if (!videoId?.trim() || !channelId?.trim()) {
+    console.warn(`⚠️ [ignoreVideo] Missing videoId or channelId`);
+    return;
+  }
+
+  console.log(`🛡️ [ignoreVideo] Processing ignore request for ${videoId}`);
+
+  try {
+    // 1. Check if record already exists
+    const existing = await prisma.video.findUnique({ where: { videoId } });
+
+    if (existing) {
+      if (existing.ignored) {
+        console.log(`ℹ️ [ignoreVideo] ${videoId} is already marked ignored`);
+      } else {
+        await prisma.video.update({
+          where: { videoId },
+          data: { ignored: true }
+        });
+        console.log(`✅ [ignoreVideo] Updated existing video → ignored: true (${videoId})`);
+      }
+    } else {
+      // 2. Create new ignored record (same pattern used in performIgnoreSweep)
+      let publishedAt: Date;
+      if (pubDate) {
+        publishedAt = new Date(pubDate);
+        if (isNaN(publishedAt.getTime())) publishedAt = new Date();
+      } else {
+        publishedAt = new Date();
+      }
+
+      await prisma.video.create({
+        data: {
+          videoId,
+          channelId,
+          title: (title || 'Untitled (Ignored)').trim(),
+          publishedAt,
+          duration: duration || null,
+          thumbnailPath: null,
+          audioPath: '',
+          ignored: true,
+        }
+      });
+      console.log(`✅ [ignoreVideo] Created new ignored record for ${videoId}`);
+    }
+
+    // 3. Clean up filesystem (remove any downloaded or partial files)
+    const videoDir = path.join(CACHE_DIR, videoId);
+    if (fs.existsSync(videoDir)) {
+      try {
+        fs.rmSync(videoDir, { recursive: true, force: true });
+        console.log(`🗑️ [ignoreVideo] Deleted cache folder for ignored video: ${videoId}`);
+      } catch (err: any) {
+        console.warn(`⚠️ [ignoreVideo] Could not delete cache folder ${videoId}:`, err.message);
+      }
+    }
+
+    // 4. Clear currentVideoId if this was the currently playing video
+    const currentVideoId = await getConfig('currentVideoId', '');
+    if (currentVideoId === videoId) {
+      await setConfig('currentVideoId', '');
+      console.log(`🧹 [ignoreVideo] Cleared currentVideoId (was ignored)`);
+    }
+
+  } catch (err: any) {
+    console.error(`❌ [ignoreVideo] Failed to ignore ${videoId}:`, err.message);
   }
 }
 
@@ -840,6 +963,14 @@ async function harvestAndPurge() {
             }
 
             const { items } = await getRssFeedWithCache(currentChannel.channelId);
+
+            if (UseAlternateListGetterMethod) {
+              UseAlternateListGetterMethod = false;
+            }
+            else if (!UseAlternateListGetterMethod) {
+              UseAlternateListGetterMethod = true;
+            }
+            
             harvestStatus.totalVideosThisRun += items.length;
 
             const candidateIds = items.map(item => item.videoId).filter(Boolean);
@@ -851,9 +982,9 @@ async function harvestAndPurge() {
             );
 
             const newVideosToInsert: any[] = [];
-            let downloadedThisRun = 0;   // NEW: track successful downloads this run for this channel
+            let downloadedThisRun = 0;
 
-            let recentCount : number = 0
+            let recentCount: number = 0
             if (limitEnabled) {
               const cutoff = new Date(Date.now() - limitHours * 60 * 60 * 1000);
               recentCount = await prisma.video.count({
@@ -868,18 +999,43 @@ async function harvestAndPurge() {
               const videoId = item.videoId || '';
               if (!videoId || existingIds.has(videoId)) continue;
 
-              // === PER-ITEM RATE LIMIT CHECK (DB count + this-run count) ===
               if (limitEnabled) {
                 if (recentCount + downloadedThisRun >= limitVideos) {
                   console.log(`⏹️ [Rate Limit ${limitVideos}/${limitHours}h] Reached limit for channel "${currentChannel.title}" (${recentCount + downloadedThisRun}/${limitVideos} total) — stopping further downloads for this channel`);
-                  break;   // exit the item loop for this channel
+                  break;
                 }
               }
 
-              let publishedAt = new Date(item.pubDate || Date.now());
-              const ageMs = Date.now() - publishedAt.getTime();
-              if (ageMs < 0) publishedAt = new Date();
-              if (ageMs / (1000 * 60 * 60) > maxDays * 24) continue;
+              //state of metadata is unknown, need to filter early if possible
+              const item2 = {
+                videoId: item.videoId,
+                channelId: currentChannel.channelId,
+                title: item.title || '',
+                pubDate: item.pubDate || new Date(),
+                duration: item.duration || 0
+              };
+              if (await isFilteredOutByPubDate(item)) {
+                await ignoreVideo(item2);
+                continue;
+              }
+
+              let meta = await fillMissingMetadata(item);//slow
+              
+              if (!meta.res) {
+                const errorMsg = (meta.err || '').toLowerCase();
+                if (errorMsg.includes('members-only content')) {
+                  await ignoreVideo(item2);
+                }
+                continue;
+              }
+              if (item.VODFuture) continue;
+
+              if (await isFilteredOutByPubDate(item)) {
+                await ignoreVideo(item2);
+                continue;
+              }
+
+              let publishedAt = new Date(item.pubDate);
 
               let videoInfo: any = {
                 videoId,
@@ -920,7 +1076,7 @@ async function harvestAndPurge() {
                   const files = fs.readdirSync(videoDir);
                   const thumbFile = files.find(f => f.endsWith('-small.webp')) || files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
                   if (thumbFile) thumbnailPath = `/cache/${videoId}/${thumbFile}`;
-                } catch (e) {}
+                } catch (e) { }
 
                 const duration = await getAudioDuration(audioPath) || undefined;
 
@@ -930,7 +1086,7 @@ async function harvestAndPurge() {
 
                 const jsonPath = path.join(videoDir, `${videoId}.json`);
                 try {
-                  fs.writeFileSync(jsonPath, JSON.stringify(videoInfo, null, 2));
+                  fs.writeFileSync(jsonPath, JSON.stringify(videoInfo, null, 2), 'utf-8');
                   console.log(`📄 Wrote ${videoId}.json with metadata`);
                 } catch (e) {
                   console.error(`Failed to write ${videoId}.json`);
@@ -969,8 +1125,8 @@ async function harvestAndPurge() {
 
     harvestStatus.activeItems = [];
     const cutoff = new Date(Date.now() - autoPurgeDays * 24 * 60 * 60 * 1000);
-    const oldVideos: Video[] = await prisma.video.findMany({ 
-      where: { publishedAt: { lt: cutoff }, ignored: false } 
+    const oldVideos: Video[] = await prisma.video.findMany({
+      where: { publishedAt: { lt: cutoff }, ignored: false }
     });
     for (const video of oldVideos) {
       const dir = path.join(CACHE_DIR, video.videoId);
@@ -1005,12 +1161,18 @@ app.get('/api/config', async (_, res) => {
   const autoPurgeDays = await getConfig('autoPurgeDays', '30');
   const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   const cookieContent = await getCookies();
-  
+
   // NEW rate limit fields
   const limitEnabled = await getConfig('limitEnabled', 'false');
   const limitVideos = await getConfig('limitVideos', '2');
   const limitHours = await getConfig('limitHours', '6');
   const currentVideoId = await getConfig('currentVideoId', '');
+
+  // NEW: Alternative metadata fetch method settings
+  const alternativeMetadataEnabled = await getConfig('alternativeMetadataEnabled', 'true');
+  const scrapeVideosTab = await getConfig('scrapeVideosTab', 'true');
+  const scrapeStreamsTab = await getConfig('scrapeStreamsTab', 'true');
+  const scrapeShortsTab = await getConfig('scrapeShortsTab', 'true');
 
   res.json({
     maxHarvestDays: parseInt(maxDays),
@@ -1022,13 +1184,19 @@ app.get('/api/config', async (_, res) => {
     lastPlayedVideoId: currentVideoId || null,
     limitEnabled: limitEnabled === 'true',
     limitVideos: parseInt(limitVideos),
-    limitHours: parseInt(limitHours)
+    limitHours: parseInt(limitHours),
+    // NEW
+    alternativeMetadataEnabled: alternativeMetadataEnabled === 'true',
+    scrapeVideosTab: scrapeVideosTab === 'true',
+    scrapeStreamsTab: scrapeStreamsTab === 'true',
+    scrapeShortsTab: scrapeShortsTab === 'true'
   });
 });
 
 app.post('/api/config', async (req, res) => {
   const { maxHarvestDays, preferredBitrate, preferredMono, autoPurgeDays, userAgent, cookies,
-          limitEnabled, limitVideos, limitHours } = req.body;
+    limitEnabled, limitVideos, limitHours,
+    alternativeMetadataEnabled, scrapeVideosTab, scrapeStreamsTab, scrapeShortsTab } = req.body;
 
   if (maxHarvestDays !== undefined) await setConfig('maxHarvestDays', String(maxHarvestDays));
   if (preferredBitrate !== undefined) await setConfig('preferredBitrate', String(preferredBitrate));
@@ -1041,6 +1209,12 @@ app.post('/api/config', async (req, res) => {
   if (limitEnabled !== undefined) await setConfig('limitEnabled', String(limitEnabled));
   if (limitVideos !== undefined) await setConfig('limitVideos', String(limitVideos));
   if (limitHours !== undefined) await setConfig('limitHours', String(limitHours));
+
+  // NEW: Alternative metadata fetch method config
+  if (alternativeMetadataEnabled !== undefined) await setConfig('alternativeMetadataEnabled', String(alternativeMetadataEnabled));
+  if (scrapeVideosTab !== undefined) await setConfig('scrapeVideosTab', String(scrapeVideosTab));
+  if (scrapeStreamsTab !== undefined) await setConfig('scrapeStreamsTab', String(scrapeStreamsTab));
+  if (scrapeShortsTab !== undefined) await setConfig('scrapeShortsTab', String(scrapeShortsTab));
 
   res.json({ success: true });
 });
@@ -1063,23 +1237,23 @@ app.get('/api/channels', async (_, res) => {
 app.post('/api/channels', async (req, res) => {
   let { channelId, title } = req.body;
   const trimmedTitle = (title || '').toString().trim();
- 
+
   if (!trimmedTitle || trimmedTitle === 'Unknown Channel') {
     console.log(`🔍 Auto-fetching channel title for ${channelId}`);
     title = await getChannelTitle(channelId);
   } else {
     title = trimmedTitle;
   }
- 
+
   const maxOrder = await prisma.channel.aggregate({ _max: { order: true } });
   const nextOrder = (maxOrder._max.order ?? 0) + 1;
- 
+
   const channel = await prisma.channel.upsert({
     where: { channelId },
     update: { title },
     create: { channelId, title, order: nextOrder, ignoreScrapeDone: false }
   });
- 
+
   res.json(channel);
 });
 
@@ -1139,17 +1313,17 @@ app.delete('/api/channels/:channelId', async (req, res) => {
       console.log(`✅ Channel ${channelId} fully deleted`);
     }
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       deletedVideos: deletedVideos.count,
-      deletedChannel: deletedChannel.count 
+      deletedChannel: deletedChannel.count
     });
 
   } catch (e: any) {
     console.error(`❌ Failed to delete channel ${channelId}:`, e.message);
-    res.status(500).json({ 
-      success: false, 
-      error: e.message 
+    res.status(500).json({
+      success: false,
+      error: e.message
     });
   }
 });

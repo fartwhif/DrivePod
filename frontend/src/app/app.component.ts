@@ -1,4 +1,3 @@
-// FULL UPDATED app.component.ts
 import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
@@ -28,6 +27,11 @@ interface Config {
   limitEnabled: boolean;
   limitVideos: number;
   limitHours: number;
+  // NEW: Alternative metadata fetch method configuration
+  alternativeMetadataEnabled: boolean;
+  scrapeVideosTab: boolean;
+  scrapeStreamsTab: boolean;
+  scrapeShortsTab: boolean;
 }
 
 interface ImportResult {
@@ -75,13 +79,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   maxHarvestDays = signal(7);
   preferredBitrate = signal(128);
   preferredMono = signal(false);
-  limitEnabled = signal(false);      // NEW: rate limit toggle (default OFF)
-  limitVideos = signal(2);           // NEW: default 2 videos
-  limitHours = signal(6);            // NEW: default 6 hours
+  limitEnabled = signal(false);
+  limitVideos = signal(2);
+  limitHours = signal(6);
   autoPurgeDays = signal(30);
   userAgent = signal('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
   hasCookies = signal(false);
   currentVideoId = signal<string | null>(null);
+
+  // NEW: Alternative metadata fetch method configuration (global + per-tab)
+  alternativeMetadataEnabled = signal(true);
+  scrapeVideosTab = signal(true);
+  scrapeStreamsTab = signal(true);
+  scrapeShortsTab = signal(true);
 
   // 56K MODEM OPTIMIZATIONS
   lowBandwidthMode = signal(false);
@@ -178,6 +188,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.userAgent.set(config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
         this.hasCookies.set(!!config.hasCookies);
         this.currentVideoId.set(config.lastPlayedVideoId || null);
+
+        // NEW: Load alternative metadata settings
+        this.alternativeMetadataEnabled.set(config.alternativeMetadataEnabled ?? true);
+        this.scrapeVideosTab.set(config.scrapeVideosTab ?? true);
+        this.scrapeStreamsTab.set(config.scrapeStreamsTab ?? true);
+        this.scrapeShortsTab.set(config.scrapeShortsTab ?? true);
 
         const savedId = this.currentVideoId();
         let autoPlay: boolean = !!savedId || targetMode !== 'off';
@@ -635,7 +651,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       limitVideos: this.limitVideos(),
       limitHours: this.limitHours(),
       autoPurgeDays: this.autoPurgeDays(),
-      userAgent: this.userAgent()
+      userAgent: this.userAgent(),
+      // NEW: Alternative metadata fetch settings
+      alternativeMetadataEnabled: this.alternativeMetadataEnabled(),
+      scrapeVideosTab: this.scrapeVideosTab(),
+      scrapeStreamsTab: this.scrapeStreamsTab(),
+      scrapeShortsTab: this.scrapeShortsTab()
     }).subscribe();
   }
 

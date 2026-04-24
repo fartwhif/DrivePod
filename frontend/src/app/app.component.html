@@ -1,4 +1,3 @@
-<!-- FULL UPDATED app.component.html -->
 <div class="max-w-4xl mx-auto p-3 sm:p-6 bg-zinc-950 text-white min-h-screen font-sans">
   <!-- Now Playing Player - FIRST ELEMENT ON PAGE -->
   @if (currentVideo(); as video) {
@@ -311,6 +310,49 @@
                  min="1" max="720">
           <span class="font-medium">hours</span>
           <span class="text-xs text-amber-400 ml-auto">(per channel • prevents over-harvesting)</span>
+        </div>
+      </div>
+
+      <!-- NEW: Alternative Metadata Fetch Method Section -->
+      <div class="mt-6 bg-zinc-800 p-5 rounded-2xl">
+        <h3 class="font-medium mb-4 flex items-center gap-2 text-zinc-300">
+          🔍 Alternative Metadata Fetch Method
+          <span class="text-xs bg-amber-900 text-amber-300 px-2 py-0.5 rounded-full">yt-dlp fallback</span>
+        </h3>
+
+        <div class="flex items-center gap-3 bg-zinc-700/50 p-3 rounded-xl mb-4">
+          <label class="flex items-center gap-2 cursor-pointer flex-1">
+            <input type="checkbox" 
+                   [ngModel]="alternativeMetadataEnabled()" 
+                   (ngModelChange)="alternativeMetadataEnabled.set($event); saveConfig()">
+            <span class="font-medium">Enable alternative method (fallback when RSS fails)</span>
+          </label>
+          <span class="text-xs text-emerald-400 whitespace-nowrap">Default: ON</span>
+        </div>
+
+        <div class="ml-8">
+          <div class="text-sm font-medium text-zinc-400 mb-3">Tabs to scrape with alternative method:</div>
+          <div class="flex flex-wrap gap-x-8 gap-y-3">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" 
+                     [ngModel]="scrapeVideosTab()" 
+                     (ngModelChange)="scrapeVideosTab.set($event); saveConfig()">
+              <span class="text-sm">Videos</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" 
+                     [ngModel]="scrapeStreamsTab()" 
+                     (ngModelChange)="scrapeStreamsTab.set($event); saveConfig()">
+              <span class="text-sm">Streams</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" 
+                     [ngModel]="scrapeShortsTab()" 
+                     (ngModelChange)="scrapeShortsTab.set($event); saveConfig()">
+              <span class="text-sm">Shorts</span>
+            </label>
+          </div>
+          <p class="text-xs text-zinc-500 mt-3">Only used if RSS feed fails. All tabs enabled by default.</p>
         </div>
       </div>
 
