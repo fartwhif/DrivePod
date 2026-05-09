@@ -22,6 +22,8 @@ const CACHE_DIR = process.env.CACHE_DIR || '/var/www/cache';
 const RSS_CACHE_DIR = path.join(CACHE_DIR, 'rss');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '../../data');
 const TEMP_COOKIES_FILE = path.join(DATA_DIR, 'cookies.txt');
+const PLAYLIST_JSON_PATH = path.join(CACHE_DIR, 'playlist.json');
+const PLAYLIST_TEMP_PATH = path.join(CACHE_DIR, 'playlist.tmp.json');
 
 const prisma = new PrismaClient();
 const parser = new Parser({
@@ -31,6 +33,10 @@ const parser = new Parser({
     }
   }
 });
+
+if (!fs.existsSync(PLAYLIST_JSON_PATH)) {
+  updatePlaylistJson();
+}
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -178,7 +184,7 @@ async function cleanupCorruptedFolders() {
 
     if (!videoRecord) {
       console.log(`   🗑️ ORPHAN FOLDER (no DB Video entity): ${videoId}`);
-      try { fs.rmSync(folderPath, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(folderPath, { recursive: true, force: true }); await updatePlaylistJson(); } catch { }
       continue;
     }
 
@@ -203,6 +209,7 @@ async function cleanupCorruptedFolders() {
       try {
         fs.rmSync(folderPath, { recursive: true, force: true });
         await prisma.video.deleteMany({ where: { videoId: videoId } });
+        await updatePlaylistJson();
         console.log(`   ✅ Deleted corrupted folder + DB entry: ${videoId}`);
       } catch (e) {
         console.error(`   ❌ Failed to delete ${videoId}`);
@@ -222,7 +229,7 @@ async function cleanupCorruptedFolders() {
     if (!fs.existsSync(folderPath) || !fs.existsSync(mp3Path)) {
       const reason = !fs.existsSync(folderPath) ? 'Folder missing on disk' : '.mp3 file missing';
       console.log(`   🗑️ ORPHAN DB ENTITY: ${video.videoId} → ${reason}`);
-      try { await prisma.video.delete({ where: { id: video.id } }); } catch { }
+      try { await prisma.video.delete({ where: { id: video.id } }); await updatePlaylistJson();} catch { }
     }
   }
 
@@ -750,6 +757,7 @@ comment=${JSON.stringify(commentData)}
 
     if (!success && fs.existsSync(videoDir) && !fs.existsSync(mp3)) {
       fs.rmSync(videoDir, { recursive: true, force: true });
+      await updatePlaylistJson();
       console.log(`🧹 Cleaned up incomplete folder for ${videoId}`);
     }
   }
@@ -771,6 +779,53 @@ async function getAudioDuration(filePath: string): Promise<number | null> {
     return isNaN(d) ? null : Math.round(d * 10) / 10;
   } catch {
     return null;
+  }
+}
+
+async function updatePlaylistJson() {
+  try {
+    console.log(`📋 Updating ${PLAYLIST_JSON_PATH} (atomic write)`);
+
+    const videos = await prisma.video.findMany({
+      where: { ignored: false },
+      orderBy: { publishedAt: 'desc' },
+      include: { channel: true }
+    });
+
+    const playlist: any[] = [];
+
+    for (const v of videos) {
+      const folder = path.join(CACHE_DIR, v.videoId);
+      const jsonPath = path.join(folder, `${v.videoId}.json`);
+
+      let meta: any = { ...v }; // fallback from DB
+
+      if (fs.existsSync(jsonPath)) {
+        try {
+          const fileMeta = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+          meta = { ...meta, ...fileMeta }; // prefer rich per-item JSON
+        } catch (e) {
+          console.warn(`⚠️ Could not read ${v.videoId}.json, using DB fallback`);
+        }
+      }
+
+      // Ensure paths are absolute URLs where expected
+      if (meta.thumbnailPath && !meta.thumbnailPath.startsWith('http')) {
+        meta.thumbnailPath = `/cache/${v.videoId}/${path.basename(meta.thumbnailPath)}`;
+      }
+      if (meta.audioPath) {
+        meta.audioPath = `/cache/${v.videoId}/${v.videoId}.mp3`;
+      }
+
+      playlist.push(meta);
+    }
+
+    // Atomic write
+    fs.writeFileSync(PLAYLIST_TEMP_PATH, JSON.stringify(playlist, null, 2), 'utf-8');
+    fs.renameSync(PLAYLIST_TEMP_PATH, PLAYLIST_JSON_PATH);
+    console.log(`✅ playlist.json updated (${playlist.length} items)`);
+  } catch (err: any) {
+    console.error(`❌ Failed to update playlist.json:`, err.message);
   }
 }
 
@@ -858,6 +913,7 @@ async function ignoreVideo(videoInfo: {
     if (fs.existsSync(videoDir)) {
       try {
         fs.rmSync(videoDir, { recursive: true, force: true });
+        await updatePlaylistJson();
         console.log(`🗑️ [ignoreVideo] Deleted cache folder for ignored video: ${videoId}`);
       } catch (err: any) {
         console.warn(`⚠️ [ignoreVideo] Could not delete cache folder ${videoId}:`, err.message);
@@ -870,6 +926,8 @@ async function ignoreVideo(videoInfo: {
       console.log(`🧹 [ignoreVideo] Cleared currentVideoId (was ignored)`);
     }
 
+    await updatePlaylistJson();
+    
   } catch (err: any) {
     console.error(`❌ [ignoreVideo] Failed to ignore ${videoId}:`, err.message);
   }
@@ -1107,6 +1165,7 @@ async function harvestAndPurge() {
             if (newVideosToInsert.length > 0) {
               await prisma.video.createMany({ data: newVideosToInsert });
               harvestStatus.processedVideos += newVideosToInsert.length;
+              await updatePlaylistJson();
               console.log(`   ✅ Batch inserted ${newVideosToInsert.length} videos for ${currentChannel.title}`);
             }
 
@@ -1135,11 +1194,16 @@ async function harvestAndPurge() {
     const oldVideos: Video[] = await prisma.video.findMany({
       where: { publishedAt: { lt: cutoff }, ignored: false }
     });
+    
     for (const video of oldVideos) {
       const dir = path.join(CACHE_DIR, video.videoId);
       if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
       await prisma.video.delete({ where: { videoId: video.videoId } });
     }
+    if (oldVideos.length > 0) {
+      await updatePlaylistJson();
+    }
+    
     const currentVideoId = await getConfig('currentVideoId', '');
     if (currentVideoId && oldVideos.some(v => v.videoId === currentVideoId)) {
       await setConfig('currentVideoId', '');
@@ -1328,9 +1392,10 @@ app.delete('/api/channels/:channelId', async (req, res) => {
     if (deletedChannel.count === 0) {
       console.warn(`   ⚠️ Channel ${channelId} was already deleted or did not exist`);
     } else {
+      await updatePlaylistJson();
       console.log(`✅ Channel ${channelId} fully deleted`);
     }
-
+    
     res.json({
       success: true,
       deletedVideos: deletedVideos.count,
@@ -1524,7 +1589,7 @@ app.post('/api/purge-all', async (req, res) => {
   const deletedCount = await prisma.video.deleteMany({
     where: { ignored: false }
   });
-
+  await updatePlaylistJson();
   console.log(`✅ Purge complete — ${deletedCount.count} non-ignored videos removed`);
   res.json({ success: true, deletedCount: deletedCount.count });
 });
