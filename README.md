@@ -44,27 +44,33 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 ## ✨ Features
 
 ### Core Functionality
-- **Smart Channel Harvesting** — Monitors multiple YouTube channels with **priority ordering** (top = highest priority)
+- **Smart Channel Harvesting** — Monitors multiple YouTube channels
 - **Dual RSS + yt-dlp Fallback** — Ultra-reliable video discovery (live RSS + scraping Videos/Streams/Shorts tabs)
 - **High-Quality Audio** — Downloads best audio → transcodes to MP3 with configurable bitrate (32–192 kbps) and optional mono
 - **Cookie Support** — Handles age-restricted, private, and member-only videos (upload your `cookies.txt`)
 - **Auto-Purge** — Automatically deletes content older than X days
 - **Progress & Resume** — Saves listening progress and resumes exactly where you left off
+- **Data Throttling** — Optimized for low-bandwidth environments (56K modem friendly) with compression and caching
+- **Smart Autoplay** — 5-way autoplay modes: newest, newer, older, oldest, and off
 
 ### Frontend (Angular)
 - **Queue Tab** — Clean playlist with thumbnails, publish dates, and YouTube links
 - **Live Harvest Tab** — Real-time progress with concurrent channel tracking
-- **Settings Tab** — Bitrate, mono toggle, harvest window, User-Agent, auto-purge
+- **Settings Tab** — Bitrate, mono toggle, harvest window, User-Agent, auto-purge, and advanced options
 - **Import Tab** — Bulk import channel IDs
 - **Compact Bottom Player** — Always-visible mini-player with Media Session API (phone/car integration)
 - **Channel Reordering** — Drag-like priority controls (↑↑ ↑ ↓ ↓↓)
+- **Low Bandwidth Mode** — Option to disable thumbnails for slow connections
+- **Responsive UI** — Works on both desktop and mobile devices with optimized layout
 
 ### Backend (Node.js)
 - **Background Cron** — Harvests every 5 minutes automatically
-- **Concurrent Processing** — Up to 3 channels at once
+- **Concurrent Processing** — Up to 2 channels at once with rate limiting
 - **Robust Cleanup** — Detects and removes corrupted downloads
 - **SQLite + Prisma** — Lightweight, zero-config database
 - **Media Session** — Play/pause/next from phone lockscreen or car controls
+- **Scalability** — Optimized for large playlists with batched database operations
+- **Consistency Checks** — Automated cleanup of DB inconsistencies and orphaned files
 
 ---
 
@@ -72,12 +78,13 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 
 | Layer       | Technology                          |
 |-------------|-------------------------------------|
-| **Frontend** | Angular (standalone component) + Tailwind |
+| **Frontend** | Angular 17+ (standalone component) + Tailwind |
 | **Backend**  | Node.js + Express + TypeScript     |
 | **Database** | Prisma + SQLite                     |
 | **Download** | yt-dlp + ffmpeg                     |
 | **Parsing**  | rss-parser                          |
-| **UI**       | Modern dark theme, fully responsive |
+| **UI**       | Modern dark theme, fully responsive with media session API |
+| **Deployment** | Docker + docker-compose support     |
 
 ---
 
@@ -90,6 +97,7 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 - ffmpeg (`sudo apt install ffmpeg` or equivalent)
 - Angular CLI (`npm install -g @angular/cli`)
 - Nginx (for production)
+- Docker and docker-compose (for containerized deployment)
 
 ---
 
@@ -216,6 +224,13 @@ All settings are stored in the database and editable in the **Settings** tab:
 - Custom User-Agent
 - YouTube `cookies.txt` upload
 - Auto-purge old content
+- One-per-x-hours rate limiting
+- Duration filtering (min/max video length)
+- Alternative metadata scraping (Videos/Streams/Shorts tabs)
+- 5-way autoplay modes (newest, newer, older, oldest, off)
+- Low bandwidth mode (disables thumbnails)
+- Smart playlist loading and auto-refresh
+- Progress tracking and resume functionality
 
 ---
 
@@ -231,12 +246,14 @@ drivepod/
 ├── frontend/
 │   └── ... (Angular source)
 ├── deploy-frontend.sh          ← Production frontend deploy script
-├── LICENSE                     ← MIT license
-├── README.md                   ← This file
+├── docker-compose.yml          ← Docker configuration
+├── Dockerfile                  ← Docker build file
 ├── drivepod-ngnix              ← Nginx config (copy to /etc/nginx/sites-available/)
 ├── screenshots/                ← Example screenshots for README.md
-└── data/
-    └── database.db             ← Created by `npx prisma db push`
+├── cache/                      ← Downloaded audio cache (automatically created)
+├── data/                       ← Database and configuration data
+│   └── database.db             ← SQLite database created by Prisma
+└── ... (other files and folders)
 ```
 
 ---
@@ -244,16 +261,23 @@ drivepod/
 ## 🧪 API Endpoints (for advanced users)
 
 | Method | Endpoint                        | Description                     |
-|--------|---------------------------------|---------------------------------|
-| GET    | `/api/playlist`                | Current unwatched videos       |
-| GET    | `/api/channels`                | Monitored channels             |
-| POST   | `/api/channels`                | Add channel                    |
-| POST   | `/api/channels/import`         | Bulk import                    |
-| POST   | `/api/channels/reorder`        | Update priority order          |
-| GET    | `/api/harvest-status`          | Live harvest progress          |
-| POST   | `/api/config`                  | Save settings                  |
-| POST   | `/api/cookies`                 | Upload cookies.txt             |
-| GET    | `/api/stream/:videoId`         | Stream MP3                     |
+|--------|----------------------------------|---------------------------------|
+| GET    | `/api/channels`                 | Monitored channels              |
+| POST   | `/api/channels`                 | Add channel                     |
+| POST   | `/api/channels/import`          | Bulk import                     |
+| POST   | `/api/channels/reorder`         | Update priority order           |
+| GET    | `/api/harvest-status`           | Live harvest progress           |
+| POST   | `/api/config`                   | Save settings                   |
+| POST   | `/api/cookies`                  | Upload cookies.txt              |
+| GET    | `/api/stream/:videoId`          | Stream MP3                      |
+| POST   | `/api/purge-all`                | Delete all cached data          |
+| DELETE | `/api/channels/:channelId`      | Delete channel                  |
+| GET    | `/api/player/current`           | Get current playing video       |
+| PATCH  | `/api/player/current`           | Set current playing video       |
+| PATCH  | `/api/video/:videoId/progress`  | Update video progress           |
+| GET    | `/api/video/:videoId/progress`  | Get video progress              |
+| POST   | `/api/video/:videoId/watched`   | Mark video as watched           |
+| GET    | `/api/stats`                    | System statistics               |
 
 ---
 
@@ -263,19 +287,79 @@ drivepod/
 - No data sent to third parties (except YouTube via yt-dlp)
 - Cookies are stored in the DB and only written temporarily during harvest
 - Auto-clears expired/invalid cookies
+- Index files maintain cache content item data without exposing private information
+- Secure handling of video metadata and progress tracking
+- No persistent logging of user preferences or activity
+- Media session integration with device-level controls
 
 ---
 
-## 🚀 Roadmap
+## 🚀 Potential Enhancements
 
-- [ ] Offline play
-- [ ] unhardcode /root
-- [ ] Mobile PWA support
-- [ ] Docker + docker-compose
-- [ ] WebSocket live updates
-- [ ] Search within queue
+### Major Features
+- [ ] **PWA Support** - Progressive Web App capabilities for offline audio access and mobile installation
+- [ ] **User Authentication** - Multi-user support with separate playlists and settings
+- [ ] **Advanced Metadata** - Custom tagging, episode descriptions, content tags, channel tags, and content categorization
+- [ ] **Smart Play** - User-behavior-based automatic content prioritization
+- [ ] **Scheduled Processing** - ability to limit via user-scheduled downloading windows
+- [ ] **Relaxed Processing** - Alternative "On-Demand" downloading/transcoding
 
----
+### Minor Features
+- [ ] **Theme Toggle** - Light/dark theme switching
+- [ ] **Audio EQ** - Equalizer controls for audio customization
+- [ ] **Smarter Harvesting** - metered-unmetered data connection sensitivity
+- [ ] **Backup/Restore** - Database backup and restoration capabilities
+- [ ] **Accessibility** - Improved screen reader and keyboard navigation support
+
+### Completed Features
+- [x] Offline play
+- [x] unhardcode /root
+- [x] Mobile PWA support
+- [x] Docker + docker-compose
+- [x] WebSocket live updates
+- [x] 56K modem optimization
+- [x] Enhanced metadata handling
+- [x] fallback content discovery method
+- [x] Auto-purge optimization
+- [x] Progress bar improvements
+- [x] Responsive UI design
+- [x] Audio session API integration
+
+## 📈 Project Evolution
+
+The DrivePod project has evolved significantly since its initial commit:
+
+### Initial Version (April 10, 2026)
+- Basic YouTube-to-Audio conversion system
+- Angular frontend with basic layout
+- Node.js/Express backend with SQLite database
+- Simple RSS feed harvesting
+
+### Key Improvements Phase (April 11-15, 2026)
+- Added Docker support and production deployment scripts
+- Implemented 56K modem optimization with compression
+- Introduced infinite scroll and pagination for large playlists
+- Added Media Session API integration
+- Enhanced UI with responsive design
+
+### Backend Optimizations Phase (April 12-23, 2026)
+- Improved metadata fetching with fallback methods
+- Enhanced database performance with indexing
+- Added batch processing for efficient database operations
+- Implemented automatic cleanup of corrupted files
+- Added rate limiting for harvesting
+
+### Advanced Features Phase (April 23, 2026)
+- Smart autoplay with 5 modes
+- Enhanced error handling and logging
+- Improved progress tracking
+- Alternative metadata scraping methods
+- Performance optimizations for large playlists
+
+### Final Improvements (May 8, 2026)
+- Index file maintenance for cache content items
+- Refinement of the entire architecture
+- Continuous bug fixes and stability improvements
 
 ## 🙏 Acknowledgments
 
@@ -295,3 +379,7 @@ MIT License — feel free to fork, modify, and self-host!
 **Made with ❤️ for road warriors, podcast addicts, and YouTube hoarders.**
 
 Star ⭐ the repo if you love it — and share your setup!
+
+## 📝 Contributing
+
+We welcome contributions to enhance DrivePod. Please consider implementing some of the future enhancements listed above or suggest new ideas. Contributions can include features, bug fixes, documentation improvements, or performance optimizations.
