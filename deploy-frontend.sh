@@ -2,7 +2,7 @@
 echo "🚀 Starting frontend deployment..."
 
 # Go to frontend folder
-cd /root/drivepod/frontend
+cd ./frontend
 
 echo "Building Angular app..."
 ng build --configuration production
