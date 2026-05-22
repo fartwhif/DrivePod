@@ -101,6 +101,18 @@
       <span>📥</span>
       <span>Import</span>
     </button>
+    <button
+      (click)="router.navigate(['/login'])"
+      class="py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap text-zinc-400 hover:text-sky-400 hover:bg-sky-900/20">
+      <span>👤</span>
+      <span>Switch Account</span>
+    </button>
+    <button
+      (click)="logout()"
+      class="py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap text-zinc-400 hover:text-red-400 hover:bg-red-900/20">
+      <span>🚪</span>
+      <span>Logout</span>
+    </button>
   </div>
 
   <!-- Queue Tab -->

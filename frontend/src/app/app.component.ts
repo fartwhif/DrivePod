@@ -1,9 +1,11 @@
-import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef } from '@angular/core';
+import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Title } from '@angular/platform-browser';
+import { Router } from '@angular/router';
 import { forkJoin } from 'rxjs';
+import { AuthService } from './services/auth.service';
 
 interface Video {
   id: string;
@@ -64,7 +66,7 @@ interface HarvestStatus {
 }
 
 @Component({
-  selector: 'app-root',
+  selector: 'app-main',
   standalone: true,
   imports: [CommonModule, FormsModule],
   templateUrl: './app.component.html',
@@ -72,6 +74,7 @@ interface HarvestStatus {
 })
 export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   apiUrl = '/api';
+  router = inject(Router);
   channels = signal<any[]>([]);
   playlist = signal<Video[]>([]);
   currentVideo = signal<Video | null>(null);
@@ -430,7 +433,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.updatePageTitle(video);
 
     const monoStr = this.preferredMono() ? '-mono' : '';
-    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
+    const token = localStorage.getItem('drivepod_token');
+    const tokenParam = token ? `&token=${token}` : '';
+    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}${tokenParam}`;
 
     const targetProgress = video.progress || 0;
 
@@ -796,6 +801,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         }
       }
     });
+  }
+
+  logout() {
+    inject(AuthService).logout();
+    inject(Router).navigate(['/login']);
   }
 
   addChannel(channelId: string, title: string) {
