@@ -33,6 +33,13 @@
             <button (click)="skipNext()" 
                     class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏭️</button>
             <div class="ml-auto flex flex-col items-end gap-1">
+              <button (click)="toggleProtect(video.videoId, !video.protected)"
+                [class.text-amber-400]="video.protected"
+                [class.text-zinc-500]="!video.protected"
+                [class.hover:text-amber-300]="video.protected"
+                [class.hover:text-amber-200]="!video.protected"
+                title="{{ video.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}"
+                class="text-3xl leading-none">{{ video.protected ? '🔒' : '🔓' }}</button>
               <a [href]="'https://www.youtube.com/watch?v=' + video.videoId"
                 target="_blank"
                 rel="noopener noreferrer"
