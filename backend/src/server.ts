@@ -12,7 +12,10 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import https from 'https';
 import compression from 'compression';
-import type { Request, Response } from 'express';
+import { expressjwt as jwt } from 'express-jwt';
+import jwksRsa from 'jwks-rsa';
+import jwtLib from 'jsonwebtoken';
+import type { Request, Response, NextFunction } from 'express';
 
 const execPromise = promisify(exec);
 
@@ -145,6 +148,73 @@ async function deleteTempCookiesFile() {
   if (fs.existsSync(TEMP_COOKIES_FILE)) {
     fs.unlinkSync(TEMP_COOKIES_FILE);
     console.log(`🗑️ Temporary cookies.txt deleted`);
+  }
+}
+
+// === AUTH ===
+const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN;
+const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE;
+const DEMO_SECRET = process.env.DEMO_SECRET || 'drivepod-demo-secret-key-2026';
+const DEMO_USER = { sub: 'demo-user', email: 'demo@drivepod.local', name: 'Demo User' };
+
+interface TokenPayload extends jwtLib.JwtPayload {
+  sub: string;
+  email?: string;
+  name?: string;
+}
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: TokenPayload;
+    }
+  }
+}
+
+function isAuthEnabled(): boolean {
+  return !!AUTH0_DOMAIN;
+}
+
+function getAuth0JwksHost(): string {
+  return `https://${AUTH0_DOMAIN}/.well-known/jwks.json`;
+}
+
+const authMiddleware = jwt({
+  secret: jwksRsa.expressJwtSecret({
+    cache: true,
+    rateLimit: true,
+    jwksRequestsPerMinute: 5,
+    jwksUri: getAuth0JwksHost(),
+  }) as unknown as string,
+  audience: AUTH0_AUDIENCE || `https://${AUTH0_DOMAIN}/api/v2/`,
+  issuer: `https://${AUTH0_DOMAIN}/`,
+  algorithms: ['RS256'],
+});
+
+function demoAuthMiddleware(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const token = authHeader.substring(7);
+  try {
+    const decoded = jwtLib.verify(token, DEMO_SECRET) as TokenPayload;
+    req.user = decoded;
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+function getAuthStrategy(): 'auth0' | 'demo' {
+  return isAuthEnabled() ? 'auth0' : 'demo';
+}
+
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  if (getAuthStrategy() === 'auth0') {
+    return authMiddleware(req, res, next);
+  } else {
+    return demoAuthMiddleware(req, res, next);
   }
 }
 
@@ -1223,9 +1293,28 @@ async function harvestAndPurge() {
 }
 
 // ====================== API ROUTES ======================
-app.get('/api/harvest-status', (_, res) => res.json(harvestStatus));
 
-app.get('/api/config', async (_, res) => {
+// === AUTH ROUTES (no auth required) ===
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  if (username === 'admin' && password === 'demo123') {
+    const token = jwtLib.sign(DEMO_USER, DEMO_SECRET, { expiresIn: '7d' });
+    console.log(`🔓 [DEMO] User logged in as ${DEMO_USER.name}`);
+    res.json({ token, user: DEMO_USER });
+  } else {
+    res.status(401).json({ error: 'Invalid credentials' });
+  }
+});
+
+app.get('/api/auth/me', requireAuth, (req: Request, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+  res.json({ user: req.user });
+});
+
+// === HARVEST STATUS ===
+app.get('/api/harvest-status', requireAuth, (_, res) => res.json(harvestStatus));
+
+app.get('/api/config', requireAuth, async (_, res) => {
   const maxHarvestDays = await getConfig('maxHarvestDays', '7');
   const preferredBitrate = await getConfig('preferredBitrate', '128');
   const preferredMono = await getConfig('preferredMono', 'false');
@@ -1270,7 +1359,7 @@ app.get('/api/config', async (_, res) => {
   });
 });
 
-app.post('/api/config', async (req, res) => {
+app.post('/api/config', requireAuth, async (req, res) => {
   const { maxHarvestDays, preferredBitrate, preferredMono, autoPurgeDays, userAgent, cookies,
     limitEnabled, limitVideos, limitHours,
     alternativeMetadataEnabled, scrapeVideosTab, scrapeStreamsTab, scrapeShortsTab,
@@ -1301,7 +1390,7 @@ app.post('/api/config', async (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/cookies', (req, res) => {
+app.post('/api/cookies', requireAuth, (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, error: 'No cookies.txt file uploaded' });
 
   const content = req.file.buffer.toString('utf-8');
@@ -1311,12 +1400,12 @@ app.post('/api/cookies', (req, res) => {
   });
 });
 
-app.get('/api/channels', async (_, res) => {
+app.get('/api/channels', requireAuth, async (_, res) => {
   const channels = await prisma.channel.findMany({ orderBy: { order: 'asc' } });
   res.json(channels);
 });
 
-app.post('/api/channels', async (req, res) => {
+app.post('/api/channels', requireAuth, async (req, res) => {
   let { channelId, title } = req.body;
   const trimmedTitle = (title || '').toString().trim();
 
@@ -1340,7 +1429,7 @@ app.post('/api/channels', async (req, res) => {
 });
 
 // === ROBUST CHANNEL DELETE ENDPOINT ===
-app.delete('/api/channels/:channelId', async (req, res) => {
+app.delete('/api/channels/:channelId', requireAuth, async (req, res) => {
   const channelId = req.params.channelId;
   console.log(`🗑️ Deleting channel: ${channelId}`);
 
@@ -1411,7 +1500,7 @@ app.delete('/api/channels/:channelId', async (req, res) => {
   }
 });
 
-app.post('/api/channels/import', async (req, res) => {
+app.post('/api/channels/import', requireAuth, async (req, res) => {
   const { channelIds } = req.body as { channelIds: string[] };
   const results: any[] = [];
   let currentOrder = (await prisma.channel.aggregate({ _max: { order: true } }))._max.order ?? 0;
@@ -1451,7 +1540,7 @@ app.post('/api/channels/import', async (req, res) => {
   res.json({ success: true, results });
 });
 
-app.get('/api/playlist', async (req, res) => {
+app.get('/api/playlist', requireAuth, async (req, res) => {
   const take = Math.min(Math.max(parseInt(req.query.take as string) || 20, 10), 100);
   const skip = parseInt(req.query.skip as string) || 0;
 
@@ -1492,7 +1581,7 @@ app.get('/api/playlist', async (req, res) => {
   res.json(videos);
 });
 
-app.post('/api/channels/reorder', async (req, res) => {
+app.post('/api/channels/reorder', requireAuth, async (req, res) => {
   const { channelIds } = req.body as { channelIds: string[] };
   if (!Array.isArray(channelIds)) return res.status(400).json({ success: false, error: 'Invalid payload' });
 
@@ -1509,7 +1598,7 @@ app.post('/api/channels/reorder', async (req, res) => {
   }
 });
 
-app.patch('/api/video/:videoId/progress', async (req, res) => {
+app.patch('/api/video/:videoId/progress', requireAuth, async (req, res) => {
   const videoId = req.params.videoId;
   const progress = req.body.progress;
 
@@ -1537,7 +1626,7 @@ app.patch('/api/video/:videoId/progress', async (req, res) => {
   }
 });
 
-app.post('/api/video/:videoId/watched', async (req, res) => {
+app.post('/api/video/:videoId/watched', requireAuth, async (req, res) => {
   try {
     const result = await prisma.video.updateMany({
       where: { videoId: req.params.videoId },
@@ -1553,18 +1642,18 @@ app.post('/api/video/:videoId/watched', async (req, res) => {
   }
 });
 
-app.get('/api/player/current', async (_, res) => {
+app.get('/api/player/current', requireAuth, async (_, res) => {
   const videoId = await getConfig('currentVideoId', '');
   res.json({ videoId: videoId || null });
 });
 
-app.patch('/api/player/current', async (req, res) => {
+app.patch('/api/player/current', requireAuth, async (req, res) => {
   const { videoId } = req.body;
   await setConfig('currentVideoId', videoId || '');
   res.json({ success: true });
 });
 
-app.post('/api/purge-all', async (req, res) => {
+app.post('/api/purge-all', requireAuth, async (req, res) => {
   console.log(`🗑️ [PURGE-ALL] Starting purge of non-ignored videos only`);
 
   if (fs.existsSync(CACHE_DIR)) {
@@ -1594,7 +1683,7 @@ app.post('/api/purge-all', async (req, res) => {
   res.json({ success: true, deletedCount: deletedCount.count });
 });
 
-app.patch('/api/video/:videoId/protect', async (req, res) => {
+app.patch('/api/video/:videoId/protect', requireAuth, async (req, res) => {
   const { videoId } = req.params;
   const { protected: isProtected } = req.body;
 
@@ -1614,6 +1703,27 @@ app.patch('/api/video/:videoId/protect', async (req, res) => {
 app.get('/api/stream/:videoId', async (req, res) => {
   const video = await prisma.video.findUnique({ where: { videoId: req.params.videoId } });
   if (!video || !fs.existsSync(video.audioPath)) return res.status(404).send('Video not found');
+
+  // Allow query param token for <audio> src URLs (no custom headers)
+  if (req.query.token) {
+    try {
+      jwtLib.verify(req.query.token as string, DEMO_SECRET);
+    } catch {
+      return res.status(401).send('Unauthorized');
+    }
+  } else {
+    // Fall back to Bearer header for regular API calls
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).send('Unauthorized');
+    }
+    try {
+      jwtLib.verify(authHeader.substring(7), DEMO_SECRET);
+    } catch {
+      return res.status(401).send('Unauthorized');
+    }
+  }
+
   res.sendFile(video.audioPath);
 });
 
