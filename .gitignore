@@ -29,3 +29,38 @@ yarn-error.log*
 /cache
 /data/
 *.db-journal
+
+
+
+# Dependencies
+node_modules/
+**/node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+**/dist/
+**/build/
+
+# Env
+.env
+.env.local
+**/.env
+!.env.example
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+*.log
+npm-debug.log*
+
+# Docker volumes
+postgres-data/
+uploads/
+
+# Misc
+coverage/
+*.tsbuildinfo
