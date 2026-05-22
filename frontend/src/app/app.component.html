@@ -68,50 +68,48 @@
   }
 
   <!-- Tabs -->
-  <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner overflow-x-auto">
+  <div class="flex mb-8 bg-zinc-900 rounded-3xl p-1 border border-zinc-700 shadow-inner flex-wrap gap-1">
     <button
       (click)="setTab('queue')"
       [class.bg-zinc-800]="activeTab() === 'queue'"
       [class.text-white]="activeTab() === 'queue'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
       <span>📜</span>
-      <span>Queue</span>
+      <span class="hidden sm:inline">Queue</span>
     </button>
     <button
       (click)="setTab('harvest')"
       [class.bg-zinc-800]="activeTab() === 'harvest'"
       [class.text-white]="activeTab() === 'harvest'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
       <span>🔄</span>
-      <span>Harvest</span>
+      <span class="hidden sm:inline">Harvest</span>
     </button>
     <button
       (click)="setTab('settings')"
       [class.bg-zinc-800]="activeTab() === 'settings'"
       [class.text-white]="activeTab() === 'settings'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
       <span>⚙️</span>
-      <span>Settings</span>
+      <span class="hidden sm:inline">Settings</span>
     </button>
     <button
       (click)="setTab('import')"
       [class.bg-zinc-800]="activeTab() === 'import'"
       [class.text-white]="activeTab() === 'import'"
-      class="flex-1 py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap">
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
       <span>📥</span>
-      <span>Import</span>
+      <span class="hidden sm:inline">Import</span>
     </button>
     <button
       (click)="router.navigate(['/login'])"
-      class="py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap text-zinc-400 hover:text-sky-400 hover:bg-sky-900/20">
-      <span>👤</span>
-      <span>Switch Account</span>
+      class="py-3 px-3 text-sm font-semibold rounded-2xl transition-all text-zinc-400 hover:text-sky-400 hover:bg-sky-900/20">
+      👤
     </button>
     <button
       (click)="logout()"
-      class="py-3 px-3 sm:px-6 text-base sm:text-lg font-semibold rounded-3xl transition-all flex items-center justify-center gap-2 whitespace-nowrap text-zinc-400 hover:text-red-400 hover:bg-red-900/20">
-      <span>🚪</span>
-      <span>Logout</span>
+      class="py-3 px-3 text-sm font-semibold rounded-2xl transition-all text-zinc-400 hover:text-red-400 hover:bg-red-900/20">
+      🚪
     </button>
   </div>
 
