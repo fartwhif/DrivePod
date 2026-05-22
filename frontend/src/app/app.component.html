@@ -20,7 +20,7 @@
         }
 
         <!-- Everything to the right of thumbnail (rigid) -->
-        <div class="flex-1 flex items-center">
+        <div class="flex-1 min-w-0 flex items-center">
           
           <!-- Playback buttons (compact gap so link always fits on iPhone XR) -->
           <div class="flex items-center gap-0 text-4xl">
@@ -141,7 +141,7 @@
             </div>
           </div>
 
-          <div class="flex flex-col items-end gap-0">
+          <div class="flex flex-col items-end gap-0 flex-shrink-0 w-[50px]">
             <div class="text-right text-zinc-400 text-sm self-center w-[50px]">
               {{ formatDuration(v.duration) }}
             </div>
@@ -213,7 +213,7 @@
         @for (item of harvestStatus().activeItems; track item.channelId) {
           <div class="bg-zinc-800 p-5 rounded-2xl mb-4 flex items-start gap-4">
             <div class="flex-1 min-w-0">
-              <div class="font-medium">{{ item.channelTitle }}</div>
+              <div class="font-medium line-clamp-1">{{ item.channelTitle }}</div>
               @if (item.videoTitle) {
                 <div class="text-sm text-zinc-400 line-clamp-1 mt-1">{{ item.videoTitle }}</div>
               }
@@ -507,7 +507,7 @@
                 <a [href]="'https://www.youtube.com/channel/' + c.channelId" 
                    target="_blank" 
                    rel="noopener noreferrer" 
-                   class="hover:text-sky-400 flex items-center gap-2 flex-1">
+                   class="hover:text-sky-400 flex items-center gap-2 flex-1 min-w-0 truncate">
                   {{ c.title }}
                   <span class="text-xs text-sky-400">↗</span>
                 </a>
