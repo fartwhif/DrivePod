@@ -234,6 +234,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   ngAfterViewInit() {
     this.setupInfiniteScroll();
+    this.setupKeyboardShortcuts();
   }
 
   ngOnDestroy() {
@@ -241,6 +242,25 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.stopHarvestPolling();
     if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
+    window.removeEventListener('keydown', this.handleKeyboardShortcut.bind(this));
+  }
+
+  private setupKeyboardShortcuts(): void {
+    window.addEventListener('keydown', this.handleKeyboardShortcut.bind(this));
+  }
+
+  private handleKeyboardShortcut(event: KeyboardEvent): void {
+    if (event.key === 'ArrowLeft') {
+      if (this.audio && this.audio.duration && !isNaN(this.audio.duration)) {
+        this.audio.currentTime = Math.max(0, this.audio.currentTime - 10);
+        event.preventDefault();
+      }
+    } else if (event.key === 'ArrowRight') {
+      if (this.audio && this.audio.duration && !isNaN(this.audio.duration)) {
+        this.audio.currentTime = Math.min(this.audio.duration, this.audio.currentTime + 10);
+        event.preventDefault();
+      }
+    }
   }
 
   private loadInitialPlaylist(targetVideoId: string | null = null, autoplayAfterLoad: boolean = false) {
