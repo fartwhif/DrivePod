@@ -14,6 +14,7 @@ interface Video {
   thumbnailPath: string | null;
   progress: number;
   duration?: number;
+  protected: boolean;
 }
 
 interface Config {
@@ -779,6 +780,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   purgeAll() {
     if (!confirm('Delete ALL cached videos and clear the playlist?')) return;
     this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadInitialPlaylist(null, false));
+  }
+
+  toggleProtect(videoId: string, isProtected: boolean) {
+    this.http.patch(`${this.apiUrl}/video/${videoId}/protect`, { protected: isProtected }).subscribe({
+      next: () => {
+        const playlist = [...this.playlist()];
+        const idx = playlist.findIndex(v => v.videoId === videoId);
+        if (idx !== -1) {
+          playlist[idx] = { ...playlist[idx], protected: isProtected };
+          this.playlist.set(playlist);
+        }
+        if (this.currentVideo()?.videoId === videoId) {
+          this.currentVideo.set({ ...this.currentVideo()!, protected: isProtected });
+        }
+      }
+    });
   }
 
   addChannel(channelId: string, title: string) {

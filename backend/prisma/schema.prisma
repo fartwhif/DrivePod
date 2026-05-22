@@ -33,6 +33,7 @@ model Video {
   progress      Float    @default(0)
   duration      Float?
   ignored       Boolean  @default(false)
+  protected     Boolean  @default(false)
   createdAt     DateTime @default(now())
 
   channel       Channel  @relation(fields: [channelId], references: [channelId])

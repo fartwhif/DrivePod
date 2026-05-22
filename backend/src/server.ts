@@ -1192,7 +1192,7 @@ async function harvestAndPurge() {
     harvestStatus.activeItems = [];
     const cutoff = new Date(Date.now() - autoPurgeDays * 24 * 60 * 60 * 1000);
     const oldVideos: Video[] = await prisma.video.findMany({
-      where: { publishedAt: { lt: cutoff }, ignored: false }
+      where: { publishedAt: { lt: cutoff }, ignored: false, protected: false }
     });
     
     for (const video of oldVideos) {
@@ -1569,7 +1569,7 @@ app.post('/api/purge-all', async (req, res) => {
 
   if (fs.existsSync(CACHE_DIR)) {
     const nonIgnoredVideos = await prisma.video.findMany({
-      where: { ignored: false },
+      where: { ignored: false, protected: false },
       select: { videoId: true }
     });
 
@@ -1587,11 +1587,28 @@ app.post('/api/purge-all', async (req, res) => {
   }
 
   const deletedCount = await prisma.video.deleteMany({
-    where: { ignored: false }
+    where: { ignored: false, protected: false }
   });
   await updateIndexFile();
   console.log(`✅ Purge complete — ${deletedCount.count} non-ignored videos removed`);
   res.json({ success: true, deletedCount: deletedCount.count });
+});
+
+app.patch('/api/video/:videoId/protect', async (req, res) => {
+  const { videoId } = req.params;
+  const { protected: isProtected } = req.body;
+
+  const video = await prisma.video.findUnique({ where: { videoId } });
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+
+  await prisma.video.update({
+    where: { videoId },
+    data: { protected: isProtected }
+  });
+
+  console.log(`${isProtected ? '🔒' : '🔓'} [PROTECT] ${videoId} → ${isProtected}`);
+  await updateIndexFile();
+  res.json({ success: true, protected: isProtected });
 });
 
 app.get('/api/stream/:videoId', async (req, res) => {
