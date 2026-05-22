@@ -135,7 +135,14 @@
             <div class="text-right text-zinc-400 text-sm self-center w-[50px]">
               {{ formatDuration(v.duration) }}
             </div>
-            <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
+            <button (click)="$event.stopImmediatePropagation(); toggleProtect(v.videoId, !v.protected)"
+               class="text-xl leading-none text-right"
+               [class.text-amber-400]="v.protected"
+               [class.text-zinc-500]="!v.protected"
+               [class.hover:text-amber-300]="v.protected"
+               [class.hover:text-amber-200]="!v.protected"
+               title="{{ v.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}">{{ v.protected ? '🔒' : '🔓' }}</button>
+             <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
                target="_blank"
                rel="noopener noreferrer"
                (click)="$event.stopImmediatePropagation()"
