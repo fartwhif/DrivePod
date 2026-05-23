@@ -113,7 +113,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   private readonly APP_VERSION = '1.9.0';
 
-  activeTab = signal<'queue' | 'harvest' | 'settings' | 'import'>('queue');
+  activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected'>('queue');
+  protectedPlaylist = signal<Video[]>([]);
 
   importResults = signal<ImportResult[]>([]);
 
@@ -167,6 +168,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     this.titleService.setTitle(this.defaultPageTitle);
     this.activeTab.set('queue');
+    this.protectedPlaylist.set([]);
 
     this.loadChannels();
 
@@ -660,7 +662,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     } catch (e) {}
   }
 
-  setTab(tab: 'queue' | 'harvest' | 'settings' | 'import') {
+  setTab(tab: 'queue' | 'harvest' | 'settings' | 'import' | 'protected') {
     this.activeTab.set(tab);
     if (tab !== 'import') this.importResults.set([]);
 
@@ -674,6 +676,20 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.loadInitialPlaylist(null, false);
       setTimeout(() => this.setupInfiniteScroll(), 300);
     }
+
+    if (tab === 'protected') {
+      this.loadProtectedPlaylist();
+    }
+  }
+
+  loadProtectedPlaylist() {
+    this.http.get<Video[]>(`${this.apiUrl}/playlist/protected`).subscribe({
+      next: (data) => this.protectedPlaylist.set(data),
+      error: (err) => {
+        console.error('Failed to load protected videos', err);
+        this.protectedPlaylist.set([]);
+      }
+    });
   }
 
   private updatePageTitle(video: Video | null) {

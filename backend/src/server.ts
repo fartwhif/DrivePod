@@ -1581,6 +1581,21 @@ app.get('/api/playlist', requireAuth, async (req, res) => {
   res.json(videos);
 });
 
+app.get('/api/playlist/protected', requireAuth, async (req, res) => {
+  const take = Math.min(Math.max(parseInt(req.query.take as string) || 20, 10), 100);
+  const skip = parseInt(req.query.skip as string) || 0;
+
+  const videos = await prisma.video.findMany({
+    where: { protected: true, ignored: false },
+    orderBy: { publishedAt: 'desc' },
+    include: { channel: true },
+    take,
+    skip,
+  });
+
+  res.json(videos);
+});
+
 app.post('/api/channels/reorder', requireAuth, async (req, res) => {
   const { channelIds } = req.body as { channelIds: string[] };
   if (!Array.isArray(channelIds)) return res.status(400).json({ success: false, error: 'Invalid payload' });

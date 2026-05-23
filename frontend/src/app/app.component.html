@@ -109,6 +109,14 @@
       <span class="hidden sm:inline">Import</span>
     </button>
     <button
+      (click)="setTab('protected')"
+      [class.bg-zinc-800]="activeTab() === 'protected'"
+      [class.text-white]="activeTab() === 'protected'"
+      class="flex-1 py-3 px-3 sm:px-4 text-sm font-semibold rounded-2xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap">
+      <span>🔒</span>
+      <span class="hidden sm:inline">Protected</span>
+    </button>
+    <button
       (click)="router.navigate(['/login'])"
       class="py-3 px-3 text-sm font-semibold rounded-2xl transition-all text-zinc-400 hover:text-sky-400 hover:bg-sky-900/20">
       👤
@@ -190,6 +198,63 @@
           <div class="text-sm opacity-70">🎉 End of queue</div>
         }
       </div>
+    </div>
+  }
+
+  <!-- Protected Tab -->
+  @if (activeTab() === 'protected') {
+    <div class="grid gap-3">
+      @for (v of protectedPlaylist(); track v.videoId) {
+        <div (click)="playVideo(v)" class="flex gap-3 bg-zinc-900 hover:bg-zinc-800 p-3 rounded-2xl cursor-pointer transition items-start">
+          @if (!lowBandwidthMode()) {
+            <img [src]="v.thumbnailPath || ''"
+                  loading="lazy"
+                  decoding="async"
+                  fetchpriority="low"
+                  width="80"
+                  height="80"
+                  class="w-20 h-20 object-cover rounded-xl flex-shrink-0"
+                  (error)="onImageError($event)">
+          } @else {
+            <div class="w-20 h-20 bg-zinc-800 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">📻</div>
+          }
+
+          <div class="flex-1 min-w-0">
+            <div class="font-medium line-clamp-2 leading-tight">{{ v.title }}</div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.channel.title }}
+            </div>
+            <div class="text-zinc-400 line-clamp-1 text-sm">
+              {{ v.publishedAt | date:'mediumDate' }} • {{ getTimeAgo(v.publishedAt) }}
+            </div>
+          </div>
+
+          <div class="flex flex-col items-end gap-0 flex-shrink-0 w-[50px]">
+            <div class="text-right text-zinc-400 text-sm self-center w-[50px]">
+              {{ formatDuration(v.duration) }}
+            </div>
+            <button (click)="$event.stopImmediatePropagation(); toggleProtect(v.videoId, !v.protected)"
+               class="text-xl leading-none text-right"
+               [class.text-amber-400]="v.protected"
+               [class.text-zinc-500]="!v.protected"
+               [class.hover:text-amber-300]="v.protected"
+               [class.hover:text-amber-200]="!v.protected"
+               title="{{ v.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}">{{ v.protected ? '🔒' : '🔓' }}</button>
+            <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
+              target="_blank"
+              rel="noopener noreferrer"
+              (click)="$event.stopImmediatePropagation()"
+              class="text-sky-400 hover:text-sky-300 text-xl leading-none text-right">🔗</a>
+          </div>
+        </div>
+      }
+
+      @if (protectedPlaylist().length === 0) {
+        <div class="bg-zinc-900 p-12 rounded-3xl text-center text-zinc-400 text-lg">
+          No protected items yet.<br>
+          <span class="text-sm">Lock videos from the Queue tab to preserve them.</span>
+        </div>
+      }
     </div>
   }
 
