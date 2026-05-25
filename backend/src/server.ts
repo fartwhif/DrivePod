@@ -791,6 +791,8 @@ comment=${JSON.stringify(commentData)}
     const ffmpegCmd = `ffmpeg ${args.join(' ')}`;
     await safeExec(ffmpegCmd, `ffmpeg transcoding ${videoId}`);
 
+    await safeExec(`vbrfix -always "${mp3}" "${mp3}.vbrfix.tmp" && mv -f "${mp3}.vbrfix.tmp" "${mp3}"`, `vbrfix ${videoId}`);
+
     if (fs.existsSync(raw)) fs.unlinkSync(raw);
 
     success = true;
@@ -879,12 +881,12 @@ async function updateIndexFile() {
         }
       }
 
-      // Ensure paths are absolute URLs where expected
+      // Paths are relative to CACHE_DIR
       if (meta.thumbnailPath && !meta.thumbnailPath.startsWith('http')) {
-        meta.thumbnailPath = `/cache/${v.videoId}/${path.basename(meta.thumbnailPath)}`;
+        meta.thumbnailPath = `${v.videoId}/${path.basename(meta.thumbnailPath)}`;
       }
       if (meta.audioPath) {
-        meta.audioPath = `/cache/${v.videoId}/${v.videoId}.mp3`;
+        meta.audioPath = `${v.videoId}/${v.videoId}.mp3`;
       }
 
       playlist.push(meta);
