@@ -12,6 +12,7 @@ FROM node:20-bookworm-slim AS runtime
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    vbrfix \
     curl \
     nginx \
     && rm -rf /var/lib/apt/lists/*
