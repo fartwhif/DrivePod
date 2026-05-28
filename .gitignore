@@ -31,7 +31,6 @@ yarn-error.log*
 *.db-journal
 
 
-
 # Dependencies
 node_modules/
 **/node_modules/
