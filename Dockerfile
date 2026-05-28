@@ -50,6 +50,9 @@ RUN mkdir -p /app/data /var/www/cache \
 RUN ln -s /etc/nginx/sites-available/drivepod /etc/nginx/sites-enabled/ \
     && rm -f /etc/nginx/sites-enabled/default
 
+# Copy .env file
+COPY .env /app/.env
+
 # Copy entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

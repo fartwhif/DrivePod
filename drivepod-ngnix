@@ -15,7 +15,7 @@ server {
     }
 
     location /cache/ {
-        alias /var/www/cache/;
+        alias /mnt/e/projects/drivepod/cache/;
         add_header Cross-Origin-Resource-Policy "cross-origin" always;
         add_header Access-Control-Allow-Origin "*" always;
         add_header X-Content-Type-Options "nosniff" always;
@@ -24,7 +24,8 @@ server {
             image/png   png;
             image/webp  webp;
             image/gif   gif;
+            audio/mpeg  mp3;
         }
-        default_type image/jpeg;
+        default_type application/octet-stream;
     }
 }

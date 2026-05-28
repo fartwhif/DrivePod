@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config({ path: '/app/.env' });
+
 import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
@@ -19,11 +22,20 @@ import type { Request, Response, NextFunction } from 'express';
 
 const execPromise = promisify(exec);
 
+if (!process.env.CACHE_DIR) {
+  console.error('❌ CACHE_DIR not set. Create .env file from .env.example');
+  process.exit(1);
+}
+if (!process.env.DATA_DIR) {
+  console.error('❌ DATA_DIR not set. Create .env file from .env.example');
+  process.exit(1);
+}
+
 const app = express();
 const port = 3000;
-const CACHE_DIR = process.env.CACHE_DIR || '/var/www/cache';
+const CACHE_DIR = process.env.CACHE_DIR;
 const RSS_CACHE_DIR = path.join(CACHE_DIR, 'rss');
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '../../data');
+const DATA_DIR = process.env.DATA_DIR;
 const TEMP_COOKIES_FILE = path.join(DATA_DIR, 'cookies.txt');
 const INDEX_JSON_PATH = path.join(CACHE_DIR, 'index.json');
 const INDEX_TEMP_PATH = path.join(CACHE_DIR, 'index.tmp.json');

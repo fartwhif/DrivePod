@@ -9,7 +9,9 @@ services:
     ports:
       - "24320:80"
     volumes:
-      - ./data:/app/data
-      - ./cache:/var/www/cache
+      - /mnt/e/projects/drivepod/data:/mnt/e/projects/drivepod/data
+      - /mnt/e/projects/drivepod/cache:/mnt/e/projects/drivepod/cache
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
