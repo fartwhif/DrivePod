@@ -841,6 +841,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         if (this.currentVideo()?.videoId === videoId) {
           this.currentVideo.set({ ...this.currentVideo()!, protected: isProtected });
         }
+        if (isProtected) {
+          const protectedList = [...this.protectedPlaylist()];
+          const pIdx = protectedList.findIndex(v => v.videoId === videoId);
+          if (pIdx !== -1) {
+            protectedList[pIdx] = { ...protectedList[pIdx], protected: true };
+            this.protectedPlaylist.set(protectedList);
+          }
+        } else {
+          this.protectedPlaylist.set(this.protectedPlaylist().filter(v => v.videoId !== videoId));
+        }
+        const watchedList = [...this.watchedPlaylist()];
+        const wIdx = watchedList.findIndex(v => v.videoId === videoId);
+        if (wIdx !== -1) {
+          watchedList[wIdx] = { ...watchedList[wIdx], protected: isProtected };
+          this.watchedPlaylist.set(watchedList);
+        }
       }
     });
   }
