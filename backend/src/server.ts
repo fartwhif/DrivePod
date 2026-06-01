@@ -1671,6 +1671,38 @@ app.post('/api/video/:videoId/watched', requireAuth, async (req, res) => {
   }
 });
 
+app.patch('/api/video/:videoId/watched', requireAuth, async (req, res) => {
+  const { watched } = req.body as { watched: boolean };
+  try {
+    const result = await prisma.video.updateMany({
+      where: { videoId: req.params.videoId },
+      data: { watched }
+    });
+    if (result.count === 0) {
+      console.warn(`⚠️ Toggle watched skipped — video ${req.params.videoId} not found`);
+    }
+    res.json({ success: true });
+  } catch (e: any) {
+    console.error(`❌ Failed to toggle watched:`, e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/playlist/watched', requireAuth, async (req, res) => {
+  const take = Math.min(Math.max(parseInt(req.query.take as string) || 50, 10), 100);
+  const skip = parseInt(req.query.skip as string) || 0;
+
+  const videos = await prisma.video.findMany({
+    where: { watched: true, ignored: false },
+    orderBy: { publishedAt: 'desc' },
+    include: { channel: true },
+    take,
+    skip,
+  });
+
+  res.json(videos);
+});
+
 app.get('/api/player/current', requireAuth, async (_, res) => {
   const videoId = await getConfig('currentVideoId', '');
   res.json({ videoId: videoId || null });

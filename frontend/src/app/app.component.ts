@@ -113,8 +113,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   private readonly APP_VERSION = '1.9.0';
 
-  activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected'>('queue');
+  activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched'>('queue');
   protectedPlaylist = signal<Video[]>([]);
+  watchedPlaylist = signal<Video[]>([]);
 
   importResults = signal<ImportResult[]>([]);
 
@@ -662,7 +663,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     } catch (e) {}
   }
 
-  setTab(tab: 'queue' | 'harvest' | 'settings' | 'import' | 'protected') {
+  setTab(tab: 'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched') {
     this.activeTab.set(tab);
     if (tab !== 'import') this.importResults.set([]);
 
@@ -680,6 +681,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (tab === 'protected') {
       this.loadProtectedPlaylist();
     }
+
+    if (tab === 'watched') {
+      this.loadWatchedPlaylist();
+    }
   }
 
   loadProtectedPlaylist() {
@@ -689,6 +694,27 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         console.error('Failed to load protected videos', err);
         this.protectedPlaylist.set([]);
       }
+    });
+  }
+
+  loadWatchedPlaylist() {
+    this.http.get<Video[]>(`${this.apiUrl}/playlist/watched`).subscribe({
+      next: (data) => this.watchedPlaylist.set(data),
+      error: (err) => {
+        console.error('Failed to load watched videos', err);
+        this.watchedPlaylist.set([]);
+      }
+    });
+  }
+
+  toggleWatched(videoId: string, watched: boolean) {
+    this.http.patch(`${this.apiUrl}/video/${videoId}/watched`, { watched }).subscribe({
+      next: () => {
+        if (!watched) {
+          this.watchedPlaylist.update(current => current.filter(v => v.videoId !== videoId));
+        }
+      },
+      error: (err) => console.error('Failed to toggle watched', err)
     });
   }
 
