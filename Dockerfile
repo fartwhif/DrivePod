@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
     vbrfix \
     curl \
     nginx \
+    wireguard \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install latest yt-dlp
@@ -52,6 +54,9 @@ RUN ln -s /etc/nginx/sites-available/drivepod /etc/nginx/sites-enabled/ \
 
 # Copy .env file
 COPY .env /app/.env
+
+# Copy WireGuard config template
+COPY wireguard/wg0.conf.template /etc/wireguard/wg0.conf.template
 
 # Copy entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh

@@ -6,6 +6,8 @@ services:
     image: drivepod
     container_name: drivepod
     restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
     ports:
       - "24320:80"
     volumes:
