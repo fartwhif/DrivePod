@@ -9,7 +9,7 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "24320:80"
+       - "${VPS_IP:-0.0.0.0}:${NGINX_PORT:-24320}:${NGINX_PORT:-24320}"
     volumes:
       - /mnt/e/projects/drivepod/data:/mnt/e/projects/drivepod/data
       - /mnt/e/projects/drivepod/cache:/mnt/e/projects/drivepod/cache
