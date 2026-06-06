@@ -154,6 +154,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   private saveDebounceTimer: any = null;
   private harvestPollInterval: any = null;
+  private playlistRefreshInterval: any = null;
 
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
   private lastPositionUpdate = 0;
@@ -242,7 +243,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupMediaSessionHandlers();
 
     // Playlist auto-refresh every 2 minutes
-    setInterval(() => this.loadInitialPlaylist(null, false), 120000);
+    this.playlistRefreshInterval = setInterval(() => this.loadInitialPlaylist(null, false), 120000);
   }
 
   ngAfterViewInit() {
@@ -251,9 +252,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    this.cleanup();
+  }
+
+  private cleanup() {
+    // Stop audio player
+    this.audio.pause();
+    this.audio.src = '';
+    this.audio.load();
+
+    // Clear all intervals and timers
     if (this.observer) this.observer.disconnect();
     this.stopHarvestPolling();
     if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
+    if (this.playlistRefreshInterval) clearInterval(this.playlistRefreshInterval);
+
+    // Remove event listeners
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
     window.removeEventListener('keydown', this.handleKeyboardShortcut.bind(this));
   }
@@ -868,6 +882,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   logout() {
+    // Save progress before stopping
+    if (this.currentVideo()) {
+      this.saveProgress(this.audio.currentTime);
+    }
+    // Stop audio and cleanup before navigating
+    this.cleanup();
     this.zone.runOutsideAngular(() => {
       this.authService.logout();
       this.router.navigate(['/login']);
