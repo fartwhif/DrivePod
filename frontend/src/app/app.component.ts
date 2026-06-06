@@ -41,9 +41,12 @@ interface Config {
 }
 
 interface ImportResult {
-  channelId: string;
+  input: string;
+  type: 'channel' | 'video';
   status: 'added' | 'skipped' | 'failed';
   title?: string;
+  channelTitle?: string;
+  channelId?: string;
   reason?: string;
 }
 
@@ -882,14 +885,25 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const lines = rawText.trim().split('\n').map(l => l.trim()).filter(l => l.length > 0);
     if (lines.length === 0) return;
 
-    this.http.post<{ success: boolean; results: ImportResult[] }>(`${this.apiUrl}/channels/import`, {
-      channelIds: lines
+    this.http.post<{ success: boolean; results: ImportResult[] }>(`${this.apiUrl}/import`, {
+      items: lines
     }).subscribe({
       next: (res) => {
         this.importResults.set(res.results);
         this.loadChannels();
+        // Reload playlists if videos were added
+        const hasVideoAdds = res.results.some(r => r.status === 'added' && r.type === 'video');
+        if (hasVideoAdds) {
+          this.loadInitialPlaylist(null, false);
+          this.loadProtectedPlaylist();
+        }
       },
-      error: () => this.importResults.set([{ channelId: 'Error', status: 'failed', reason: 'Server error' }])
+      error: () => this.importResults.set([{
+        input: 'Error',
+        type: 'channel',
+        status: 'failed',
+        reason: 'Server error'
+      }])
     });
   }
 

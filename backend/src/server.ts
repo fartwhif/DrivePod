@@ -1524,6 +1524,308 @@ app.delete('/api/channels/:channelId', requireAuth, async (req, res) => {
   }
 });
 
+
+// === URL CLASSIFICATION ===
+
+type ImportItemType = 'channel' | 'video';
+
+interface ParsedImportItem {
+  type: ImportItemType;
+  videoId?: string;
+  channelId?: string;
+  originalInput: string;
+  isHandle?: boolean;
+}
+
+function classifyYouTubeUrl(input: string): ParsedImportItem | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  // Direct channel ID (UC...)
+  if (/^UC[A-Za-z0-9_-]{22}$/.test(trimmed)) {
+    return { type: 'channel', channelId: trimmed, originalInput: trimmed };
+  }
+
+  // Video URL: youtube.com/watch?v=VIDEO_ID
+  const watchMatch = trimmed.match(/youtube\.com\/watch\?.*v=([A-Za-z0-9_-]{11})/);
+  if (watchMatch) {
+    return { type: 'video', videoId: watchMatch[1], originalInput: trimmed };
+  }
+
+  // Video URL: youtu.be/VIDEO_ID
+  const shortMatch = trimmed.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+  if (shortMatch) {
+    return { type: 'video', videoId: shortMatch[1], originalInput: trimmed };
+  }
+
+  // Video URL: youtube.com/shorts/VIDEO_ID
+  const shortsMatch = trimmed.match(/youtube\.com\/shorts\/([A-Za-z0-9_-]{11})/);
+  if (shortsMatch) {
+    return { type: 'video', videoId: shortsMatch[1], originalInput: trimmed };
+  }
+
+  // Channel URL: youtube.com/channel/CHANNEL_ID
+  const channelMatch = trimmed.match(/youtube\.com\/channel\/([A-Za-z0-9_-]+)/);
+  if (channelMatch) {
+    return { type: 'channel', channelId: channelMatch[1], originalInput: trimmed };
+  }
+
+  // Channel handle: youtube.com/@HANDLE or youtube.com/c/HANDLE or youtube.com/user/HANDLE
+  const handleMatch = trimmed.match(/youtube\.com\/(?:@|c\/|user\/)([A-Za-z0-9_-]+)/);
+  if (handleMatch) {
+    return { type: 'channel', channelId: handleMatch[1], originalInput: trimmed, isHandle: true };
+  }
+
+  // Fallback: treat as channel ID (existing behavior)
+  return { type: 'channel', channelId: trimmed, originalInput: trimmed };
+}
+
+// Resolve @handle, /c/name, /user/name to actual UC... channel ID using yt-dlp
+async function resolveChannelHandle(handle: string): Promise<string | null> {
+  const url = `https://www.youtube.com/${handle.startsWith('@') ? handle : '@' + handle}`;
+  try {
+    const cmd = `yt-dlp --skip-download --dump-json --no-progress "${url}" 2>/dev/null | head -1`;
+    const { stdout } = await safeExec(cmd, `resolve handle ${handle}`);
+    const info = JSON.parse(stdout);
+    return info.channel_id || null;
+  } catch {
+    console.warn(`Failed to resolve handle: ${handle}`);
+    return null;
+  }
+}
+
+// Get channel ID from a video using yt-dlp
+async function getChannelFromVideo(videoId: string): Promise<{ channelId: string; channelTitle: string; videoTitle: string } | null> {
+  try {
+    const cmd = `yt-dlp --skip-download --dump-json --no-progress "https://www.youtube.com/watch?v=${videoId}" 2>/dev/null | head -1`;
+    const { stdout } = await safeExec(cmd, `get channel for video ${videoId}`);
+    const info = JSON.parse(stdout);
+    return {
+      channelId: info.channel_id,
+      channelTitle: info.channel || 'Unknown Channel',
+      videoTitle: info.title || 'Untitled'
+    };
+  } catch (err: any) {
+    console.error(`Failed to get channel info for video ${videoId}:`, err.message);
+    return null;
+  }
+}
+
+
+// === SINGLE VIDEO IMPORT ===
+async function importSingleVideo(
+  videoId: string,
+  channelId: string,
+  channelTitle: string,
+  videoTitle: string
+): Promise<{ success: boolean; reason?: string }> {
+  // Already exists?
+  const existing = await prisma.video.findUnique({ where: { videoId } });
+  if (existing) {
+    if (!existing.protected) {
+      await prisma.video.update({
+        where: { videoId },
+        data: { protected: true }
+      });
+    }
+    return { success: true, reason: 'already-exists' };
+  }
+
+  const preferredBitrate = parseInt(await getConfig('preferredBitrate', '128'));
+  const preferredMono = (await getConfig('preferredMono', 'false')) === 'true';
+
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const videoInfo = {
+    videoId,
+    channelId,
+    title: videoTitle,
+    author: channelTitle,
+    publishedAt: new Date()
+  };
+
+  const success = await downloadAndProcessVideo(
+    videoInfo,
+    videoUrl,
+    preferredBitrate,
+    preferredMono
+  );
+
+  if (!success) {
+    return { success: false, reason: 'download-failed' };
+  }
+
+  // Build DB record
+  const videoDir = path.join(CACHE_DIR, videoId);
+  const audioPath = path.join(videoDir, `${videoId}.mp3`);
+
+  let thumbnailPath: string | null = null;
+  try {
+    const files = fs.readdirSync(videoDir);
+    const thumbFile = files.find(f => f.endsWith('-small.webp')) ||
+                      files.find(f => /\.(jpe?g|webp|png)$/i.test(f));
+    if (thumbFile) thumbnailPath = `/cache/${videoId}/${thumbFile}`;
+  } catch { }
+
+  const duration = await getAudioDuration(audioPath) || undefined;
+
+  const dbVideo = {
+    videoId,
+    channelId,
+    title: videoTitle,
+    publishedAt: new Date(),
+    thumbnailPath,
+    audioPath,
+    duration,
+    protected: true
+  };
+
+  await prisma.video.create({ data: dbVideo });
+
+  // Write metadata JSON
+  const jsonPath = path.join(videoDir, `${videoId}.json`);
+  try {
+    fs.writeFileSync(jsonPath, JSON.stringify(dbVideo, null, 2), 'utf-8');
+  } catch { }
+
+  await updateIndexFile();
+  console.log(`[IMPORT] Added video ${videoId} (${videoTitle}) from ${channelTitle}`);
+  return { success: true };
+}
+
+
+app.post('/api/import', requireAuth, async (req, res) => {
+  const { items } = req.body as { items: string[] };
+  const results: any[] = [];
+
+  // Phase 1: Parse and classify all inputs
+  const parsed: ParsedImportItem[] = [];
+  for (const raw of items) {
+    const item = classifyYouTubeUrl(raw);
+    if (item) parsed.push(item);
+  }
+
+  const channelImports = parsed.filter(i => i.type === 'channel');
+  const videoImports = parsed.filter(i => i.type === 'video');
+
+  // Track newly added channels
+  const newlyAddedChannels = new Map<string, string>();
+
+  // === Phase 2: Process channel imports ===
+  let currentOrder = (await prisma.channel.aggregate({ _max: { order: true } }))._max.order ?? 0;
+
+  for (const ch of channelImports) {
+    let channelId = ch.channelId!;
+
+    // Resolve @handle / c/name to UC... ID if needed
+    if (ch.isHandle) {
+      const resolved = await resolveChannelHandle(channelId);
+      if (!resolved) {
+        results.push({ input: ch.originalInput, type: 'channel', status: 'failed', reason: 'Could not resolve handle' });
+        continue;
+      }
+      channelId = resolved;
+    }
+
+    // Already exists?
+    if (await prisma.channel.findUnique({ where: { channelId } })) {
+      results.push({ input: ch.originalInput, type: 'channel', status: 'skipped', reason: 'already exists' });
+      continue;
+    }
+
+    try {
+      const { channelTitle } = await getRssFeedWithCache(channelId);
+      currentOrder += 1;
+      await prisma.channel.create({
+        data: { channelId, title: channelTitle, order: currentOrder, ignoreScrapeDone: false, active: true }
+      });
+      newlyAddedChannels.set(ch.originalInput, channelId);
+      results.push({ input: ch.originalInput, type: 'channel', status: 'added', title: channelTitle, channelId });
+      console.log(`[IMPORT] Added channel ${channelId} (${channelTitle})`);
+    } catch (e: any) {
+      results.push({ input: ch.originalInput, type: 'channel', status: 'failed', reason: e.message?.substring(0, 100) });
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // === Phase 3: Process video imports ===
+  const videoChannelCache = new Map<string, { channelId: string; channelTitle: string; videoTitle: string }>();
+
+  for (const vid of videoImports) {
+    const videoId = vid.videoId!;
+
+    try {
+      // Get channel info for this video (cache to avoid repeated yt-dlp calls)
+      let channelInfo: { channelId: string; channelTitle: string; videoTitle: string } | undefined =
+        videoChannelCache.get(videoId);
+      if (!channelInfo) {
+        const fetched = await getChannelFromVideo(videoId);
+        if (fetched) {
+          channelInfo = fetched;
+          videoChannelCache.set(videoId, fetched);
+        }
+      }
+
+      if (!channelInfo) {
+        results.push({ input: vid.originalInput, type: 'video', status: 'failed', reason: 'Could not fetch video info' });
+        continue;
+      }
+
+      // Check if channel exists, if not create as inactive
+      const existingChannel = await prisma.channel.findUnique({
+        where: { channelId: channelInfo.channelId }
+      });
+
+      if (!existingChannel) {
+        currentOrder += 1;
+        await prisma.channel.create({
+          data: {
+            channelId: channelInfo.channelId,
+            title: channelInfo.channelTitle,
+            order: currentOrder,
+            active: false,
+            ignoreScrapeDone: false
+          }
+        });
+        console.log(`[IMPORT] Created inactive channel ${channelInfo.channelId} (${channelInfo.channelTitle}) for video import`);
+      }
+
+      // Download and protect the video
+      const result = await importSingleVideo(
+        videoId,
+        channelInfo.channelId,
+        channelInfo.channelTitle,
+        channelInfo.videoTitle
+      );
+
+      if (result.success) {
+        results.push({
+          input: vid.originalInput,
+          type: 'video',
+          status: result.reason === 'already-exists' ? 'skipped' : 'added',
+          title: channelInfo.videoTitle,
+          channelTitle: channelInfo.channelTitle,
+          reason: result.reason
+        });
+      } else {
+        results.push({
+          input: vid.originalInput,
+          type: 'video',
+          status: 'failed',
+          reason: result.reason || 'Download failed'
+        });
+      }
+    } catch (e: any) {
+      results.push({ input: vid.originalInput, type: 'video', status: 'failed', reason: e.message?.substring(0, 100) });
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  res.json({ success: true, results });
+});
+
+// Legacy alias for backward compatibility
 app.post('/api/channels/import', requireAuth, async (req, res) => {
   const { channelIds } = req.body as { channelIds: string[] };
   const results: any[] = [];
@@ -1540,24 +1842,14 @@ app.post('/api/channels/import', requireAuth, async (req, res) => {
 
     try {
       const { channelTitle } = await getRssFeedWithCache(channelId);
-
       currentOrder += 1;
-      const newChannel = await prisma.channel.create({
-        data: {
-          channelId,
-          title: channelTitle,
-          order: currentOrder,
-          ignoreScrapeDone: false
-        }
+      await prisma.channel.create({
+        data: { channelId, title: channelTitle, order: currentOrder, ignoreScrapeDone: false }
       });
-
       results.push({ channelId, status: 'added', title: channelTitle });
-      console.log(`✅ Imported ${channelId} → ${channelTitle}`);
-    } catch (e) {
-      console.error(`❌ Import failed for ${channelId}`, e);
+    } catch (e: any) {
       results.push({ channelId, status: 'failed' });
     }
-
     await new Promise(r => setTimeout(r, 800));
   }
 
