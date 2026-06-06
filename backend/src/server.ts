@@ -1069,9 +1069,15 @@ async function harvestAndPurge() {
     const maxDurationMinutes = parseInt(await getConfig('maxDurationMinutes', '720'));
 
     const channels = await prisma.channel.findMany({ where: { active: true }, orderBy: { order: 'asc' } });
-    harvestStatus.totalChannels = channels.length;
+    // Skip channels with invalid channel IDs (URLs, handles, etc.)
+    const validChannels = channels.filter(ch => ch.channelId.startsWith('UC'));
+    if (channels.length !== validChannels.length) {
+      const invalid = channels.filter(ch => !ch.channelId.startsWith('UC'));
+      console.warn(`⚠️ Skipping ${invalid.length} channel(s) with invalid channelId: ${invalid.map(c => c.channelId.substring(0, 40)).join(', ')}`);
+    }
+    harvestStatus.totalChannels = validChannels.length;
 
-    const queue = [...channels];
+    const queue = [...validChannels];
     const running: Promise<void>[] = [];
 
     while (queue.length > 0 || running.length > 0) {
@@ -1653,9 +1659,22 @@ function extractChannelId(info: any): string | null {
 // Returns { channelId (UC...), channelTitle, videoTitle } or null.
 async function getChannelFromVideo(videoId: string): Promise<{ channelId: string; channelTitle: string; videoTitle: string } | null> {
   try {
-    const cmd = `yt-dlp --skip-download --dump-json --no-progress "https://www.youtube.com/watch?v=${videoId}" 2>/dev/null | head -1`;
+    const cmd = `yt-dlp --skip-download --dump-json --no-progress "https://www.youtube.com/watch?v=${videoId}" 2>/dev/null`;
     const { stdout } = await safeExec(cmd, `get channel for video ${videoId}`);
-    const info = JSON.parse(stdout);
+    const trimmed = stdout.trim();
+
+    if (!trimmed) {
+      console.warn(`[IMPORT] yt-dlp returned empty output for video ${videoId} (age-gated? blocked?)`);
+      return null;
+    }
+
+    // yt-dlp --dump-json outputs a single JSON object; find the line that starts with {
+    const jsonLine = trimmed.split('\n').find(l => l.trim().startsWith('{'));
+    if (!jsonLine) {
+      console.warn(`[IMPORT] No JSON found in yt-dlp output for video ${videoId}`);
+      return null;
+    }
+    const info = JSON.parse(jsonLine);
 
     // Extract UC... channel ID
     let channelId = extractChannelId(info);
