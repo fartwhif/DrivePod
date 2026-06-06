@@ -692,10 +692,15 @@
       <p class="text-zinc-400 mb-6">Paste YouTube channel IDs, channel URLs, or video URLs (one per line). Channels are added as active subscriptions. Videos are downloaded individually, protected from purge, and their channels are added as inactive.</p>
       <textarea #importList rows="14" class="w-full bg-zinc-800 px-4 py-3 rounded-2xl outline-none font-mono text-sm resize-none" placeholder="UCxxxxxxxxxxxxxxxxxxxx&#10;https://www.youtube.com/watch?v=xxxxxxxxxxx&#10;https://www.youtube.com/@channelname&#10;https://youtu.be/xxxxxxxxxxx"></textarea>
       <div class="flex items-center gap-4 mt-6">
-        <button (click)="importChannels(importList.value)" class="flex-1 bg-emerald-600 hover:bg-emerald-700 py-4 rounded-2xl font-semibold text-lg flex items-center justify-center gap-2">🚀 Import</button>
+        <button (click)="importChannels(importList.value)" [disabled]="isImporting()" class="flex-1 bg-emerald-600 hover:bg-emerald-700 py-4 rounded-2xl font-semibold text-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">🚀 <span *ngIf="!isImporting()">Import</span><span *ngIf="isImporting()">Importing... please wait</span></button>
         <button (click)="importList.value = ''; importResults.set([])" class="px-8 py-4 bg-zinc-700 hover:bg-zinc-600 rounded-2xl font-medium">Clear</button>
       </div>
-      @if (importResults().length > 0) {
+      @if (isImporting()) {
+          <div class="mt-8 bg-zinc-950 rounded-2xl p-4 text-center text-yellow-400">
+            ⏳ Importing... this may take a while for download &amp; transcoding
+          </div>
+        }
+        @if (importResults().length > 0) {
         <div class="mt-8">
           <h3 class="text-lg font-medium mb-3">Import Results</h3>
           <div class="bg-zinc-950 rounded-2xl overflow-hidden">

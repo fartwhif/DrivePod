@@ -106,6 +106,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 // === SETTINGS ===
 const MAX_CONCURRENT_CHANNELS = 2;
 let isHarvesting = false;
+let isImporting = false;
 let UseAlternateListGetterMethod = true;
 
 // === LIVE HARVEST STATUS ===
@@ -1023,6 +1024,10 @@ async function harvestAndPurge() {
     console.log(`⏳ [${logTimestamp()}] Harvest already running — skipping`);
     return;
   }
+  if (isImporting) {
+    console.log(`⏳ [${logTimestamp()}] Import in progress — skipping harvest`);
+    return;
+  }
 
   isHarvesting = true;
 
@@ -1729,16 +1734,27 @@ async function importSingleVideo(
   channelTitle: string,
   videoTitle: string
 ): Promise<{ success: boolean; reason?: string }> {
-  // Already exists?
+  // Already exists? Unignore, then check if we need to re-download.
   const existing = await prisma.video.findUnique({ where: { videoId } });
+  const videoExisted = !!existing;
+  const originalPublishedAt = existing?.publishedAt;
   if (existing) {
-    if (!existing.protected) {
-      await prisma.video.update({
-        where: { videoId },
-        data: { protected: true }
-      });
+    console.log(`[IMPORT] Video ${videoId} already exists — unignoring, checking cache`);
+    await prisma.video.update({
+      where: { videoId },
+      data: { ignored: false, protected: true }
+    });
+    // Check if cached files exist and DB has valid paths — skip download if so
+    const videoDir = path.join(CACHE_DIR, videoId);
+    const dbAudioPath = existing.audioPath || null;
+    const filesExist = dbAudioPath && fs.existsSync(dbAudioPath) && fs.existsSync(videoDir);
+    if (filesExist) {
+      console.log(`[IMPORT] Cache files exist for ${videoId} — skipping download`);
+      await updateIndexFile();
+      return { success: true, reason: 'already-exists' };
     }
-    return { success: true, reason: 'already-exists' };
+    // Files missing — fall through to download
+    console.log(`[IMPORT] Cache files missing for ${videoId} — downloading`);
   }
 
   const preferredBitrate = parseInt(await getConfig('preferredBitrate', '128'));
@@ -1789,7 +1805,14 @@ async function importSingleVideo(
     protected: true
   };
 
-  await prisma.video.create({ data: dbVideo });
+  // Use upsert — handles both new videos and existing videos that needed re-download
+  // For existing videos, preserve the original publishedAt
+  const updateData = videoExisted && originalPublishedAt ? { ...dbVideo, publishedAt: originalPublishedAt } : dbVideo;
+  await prisma.video.upsert({
+    where: { videoId },
+    create: dbVideo,
+    update: updateData
+  });
 
   // Write metadata JSON
   const jsonPath = path.join(videoDir, `${videoId}.json`);
@@ -1807,131 +1830,141 @@ app.post('/api/import', requireAuth, async (req, res) => {
   const { items } = req.body as { items: string[] };
   const results: any[] = [];
 
-  // Phase 1: Parse and classify all inputs
-  const parsed: ParsedImportItem[] = [];
-  for (const raw of items) {
-    const item = classifyYouTubeUrl(raw);
-    if (item) parsed.push(item);
+  if (isImporting) {
+    return res.status(409).json({ error: 'Import already in progress' });
   }
-
-  const channelImports = parsed.filter(i => i.type === 'channel');
-  const videoImports = parsed.filter(i => i.type === 'video');
-
-  // Track newly added channels
-  const newlyAddedChannels = new Map<string, string>();
-
-  // === Phase 2: Process channel imports ===
-  let currentOrder = (await prisma.channel.aggregate({ _max: { order: true } }))._max.order ?? 0;
-
-  for (const ch of channelImports) {
-    let channelId = ch.channelId!;
-
-    // Resolve @handle / c/name to UC... ID if needed
-    if (ch.isHandle) {
-      const resolved = await resolveChannelHandle(channelId);
-      if (!resolved) {
-        results.push({ input: ch.originalInput, type: 'channel', status: 'failed', reason: 'Could not resolve handle' });
-        continue;
-      }
-      channelId = resolved;
-    }
-
-    // Already exists?
-    if (await prisma.channel.findUnique({ where: { channelId } })) {
-      results.push({ input: ch.originalInput, type: 'channel', status: 'skipped', reason: 'already exists' });
-      continue;
-    }
-
-    try {
-      const { channelTitle } = await getRssFeedWithCache(channelId);
-      currentOrder += 1;
-      await prisma.channel.create({
-        data: { channelId, title: channelTitle, order: currentOrder, ignoreScrapeDone: false, active: true }
-      });
-      newlyAddedChannels.set(ch.originalInput, channelId);
-      results.push({ input: ch.originalInput, type: 'channel', status: 'added', title: channelTitle, channelId });
-      console.log(`[IMPORT] Added channel ${channelId} (${channelTitle})`);
-    } catch (e: any) {
-      results.push({ input: ch.originalInput, type: 'channel', status: 'failed', reason: e.message?.substring(0, 100) });
-    }
-
-    await new Promise(r => setTimeout(r, 500));
+  if (isHarvesting) {
+    return res.status(409).json({ error: 'Harvest in progress — try again later' });
   }
+  isImporting = true;
+  try {
+    // Phase 1: Parse and classify all inputs
+    const parsed: ParsedImportItem[] = [];
+    for (const raw of items) {
+      const item = classifyYouTubeUrl(raw);
+      if (item) parsed.push(item);
+    }
 
-  // === Phase 3: Process video imports ===
-  const videoChannelCache = new Map<string, { channelId: string; channelTitle: string; videoTitle: string }>();
+    const channelImports = parsed.filter(i => i.type === 'channel');
+    const videoImports = parsed.filter(i => i.type === 'video');
 
-  for (const vid of videoImports) {
-    const videoId = vid.videoId!;
+    // Track newly added channels
+    const newlyAddedChannels = new Map<string, string>();
 
-    try {
-      // Get channel info for this video (cache to avoid repeated yt-dlp calls)
-      let channelInfo: { channelId: string; channelTitle: string; videoTitle: string } | undefined =
-        videoChannelCache.get(videoId);
-      if (!channelInfo) {
-        const fetched = await getChannelFromVideo(videoId);
-        if (fetched) {
-          channelInfo = fetched;
-          videoChannelCache.set(videoId, fetched);
+    // === Phase 2: Process channel imports ===
+    let currentOrder = (await prisma.channel.aggregate({ _max: { order: true } }))._max.order ?? 0;
+
+    for (const ch of channelImports) {
+      let channelId = ch.channelId!;
+
+      // Resolve @handle / c/name to UC... ID if needed
+      if (ch.isHandle) {
+        const resolved = await resolveChannelHandle(channelId);
+        if (!resolved) {
+          results.push({ input: ch.originalInput, type: 'channel', status: 'failed', reason: 'Could not resolve handle' });
+          continue;
         }
+        channelId = resolved;
       }
 
-      if (!channelInfo) {
-        results.push({ input: vid.originalInput, type: 'video', status: 'failed', reason: 'Could not fetch video info' });
+      // Already exists?
+      if (await prisma.channel.findUnique({ where: { channelId } })) {
+        results.push({ input: ch.originalInput, type: 'channel', status: 'skipped', reason: 'already exists' });
         continue;
       }
 
-      // Check if channel exists, if not create as inactive
-      const existingChannel = await prisma.channel.findUnique({
-        where: { channelId: channelInfo.channelId }
-      });
-
-      if (!existingChannel) {
+      try {
+        const { channelTitle } = await getRssFeedWithCache(channelId);
         currentOrder += 1;
         await prisma.channel.create({
-          data: {
-            channelId: channelInfo.channelId,
-            title: channelInfo.channelTitle,
-            order: currentOrder,
-            active: false,
-            ignoreScrapeDone: false
-          }
+          data: { channelId, title: channelTitle, order: currentOrder, ignoreScrapeDone: false, active: true }
         });
-        console.log(`[IMPORT] Created inactive channel ${channelInfo.channelId} (${channelInfo.channelTitle}) for video import`);
+        newlyAddedChannels.set(ch.originalInput, channelId);
+        results.push({ input: ch.originalInput, type: 'channel', status: 'added', title: channelTitle, channelId });
+        console.log(`[IMPORT] Added channel ${channelId} (${channelTitle})`);
+      } catch (e: any) {
+        results.push({ input: ch.originalInput, type: 'channel', status: 'failed', reason: e.message?.substring(0, 100) });
       }
 
-      // Download and protect the video
-      const result = await importSingleVideo(
-        videoId,
-        channelInfo.channelId,
-        channelInfo.channelTitle,
-        channelInfo.videoTitle
-      );
-
-      if (result.success) {
-        results.push({
-          input: vid.originalInput,
-          type: 'video',
-          status: result.reason === 'already-exists' ? 'skipped' : 'added',
-          title: channelInfo.videoTitle,
-          channelTitle: channelInfo.channelTitle,
-          reason: result.reason
-        });
-      } else {
-        results.push({
-          input: vid.originalInput,
-          type: 'video',
-          status: 'failed',
-          reason: result.reason || 'Download failed'
-        });
-      }
-    } catch (e: any) {
-      results.push({ input: vid.originalInput, type: 'video', status: 'failed', reason: e.message?.substring(0, 100) });
+      await new Promise(r => setTimeout(r, 500));
     }
 
-    await new Promise(r => setTimeout(r, 500));
-  }
+    // === Phase 3: Process video imports ===
+    const videoChannelCache = new Map<string, { channelId: string; channelTitle: string; videoTitle: string }>();
 
+    for (const vid of videoImports) {
+      const videoId = vid.videoId!;
+
+      try {
+        // Get channel info for this video (cache to avoid repeated yt-dlp calls)
+        let channelInfo: { channelId: string; channelTitle: string; videoTitle: string } | undefined =
+          videoChannelCache.get(videoId);
+        if (!channelInfo) {
+          const fetched = await getChannelFromVideo(videoId);
+          if (fetched) {
+            channelInfo = fetched;
+            videoChannelCache.set(videoId, fetched);
+          }
+        }
+
+        if (!channelInfo) {
+          results.push({ input: vid.originalInput, type: 'video', status: 'failed', reason: 'Could not fetch video info' });
+          continue;
+        }
+
+        // Check if channel exists, if not create as inactive
+        const existingChannel = await prisma.channel.findUnique({
+          where: { channelId: channelInfo.channelId }
+        });
+
+        if (!existingChannel) {
+          currentOrder += 1;
+          await prisma.channel.create({
+            data: {
+              channelId: channelInfo.channelId,
+              title: channelInfo.channelTitle,
+              order: currentOrder,
+              active: false,
+              ignoreScrapeDone: false
+            }
+          });
+          console.log(`[IMPORT] Created inactive channel ${channelInfo.channelId} (${channelInfo.channelTitle}) for video import`);
+        }
+
+        // Download and protect the video
+        const result = await importSingleVideo(
+          videoId,
+          channelInfo.channelId,
+          channelInfo.channelTitle,
+          channelInfo.videoTitle
+        );
+
+        if (result.success) {
+          results.push({
+            input: vid.originalInput,
+            type: 'video',
+            status: result.reason === 'already-exists' ? 'skipped' : 'added',
+            title: channelInfo.videoTitle,
+            channelTitle: channelInfo.channelTitle,
+            reason: result.reason
+          });
+        } else {
+          results.push({
+            input: vid.originalInput,
+            type: 'video',
+            status: 'failed',
+            reason: result.reason || 'Download failed'
+          });
+        }
+      } catch (e: any) {
+        results.push({ input: vid.originalInput, type: 'video', status: 'failed', reason: e.message?.substring(0, 100) });
+      }
+
+      await new Promise(r => setTimeout(r, 500));
+    }
+  } finally {
+    isImporting = false;
+  }
   res.json({ success: true, results });
 });
 

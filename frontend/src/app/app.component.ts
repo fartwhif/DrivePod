@@ -122,6 +122,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   watchedPlaylist = signal<Video[]>([]);
 
   importResults = signal<ImportResult[]>([]);
+  isImporting = signal(false);
 
   harvestStatus = signal<HarvestStatus>({
     isRunning: false,
@@ -923,28 +924,41 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   importChannels(rawText: string) {
-    const lines = rawText.trim().split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const lines = rawText.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
     if (lines.length === 0) return;
+
+    this.isImporting.set(true);
+    this.importResults.set([]);
 
     this.http.post<{ success: boolean; results: ImportResult[] }>(`${this.apiUrl}/import`, {
       items: lines
+    }, {
+      timeout: 600000
     }).subscribe({
       next: (res) => {
         this.importResults.set(res.results);
+        this.isImporting.set(false);
         this.loadChannels();
-        // Reload playlists if videos were added
         const hasVideoAdds = res.results.some(r => r.status === 'added' && r.type === 'video');
         if (hasVideoAdds) {
           this.loadInitialPlaylist(null, false);
           this.loadProtectedPlaylist();
         }
       },
-      error: () => this.importResults.set([{
-        input: 'Error',
-        type: 'channel',
-        status: 'failed',
-        reason: 'Server error'
-      }])
+      error: (err) => {
+        this.isImporting.set(false);
+        const reason = err.status === 409
+          ? 'Harvest or import already running \u2014 try again later'
+          : err.status === 0
+            ? 'Request timed out \u2014 import may still be processing'
+            : `Server error (${err.status || 'unknown'})`;
+        this.importResults.set([{
+          input: 'Error',
+          type: 'channel',
+          status: 'failed',
+          reason
+        }]);
+      }
     });
   }
 
