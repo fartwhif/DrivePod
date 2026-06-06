@@ -1,4 +1,4 @@
-import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef, inject } from '@angular/core';
+import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef, inject, NgZone } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -78,6 +78,7 @@ interface HarvestStatus {
 export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   apiUrl = '/api';
   router = inject(Router);
+  authService!: AuthService;
   channels = signal<any[]>([]);
   playlist = signal<Video[]>([]);
   currentVideo = signal<Video | null>(null);
@@ -160,8 +161,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   constructor(
     private http: HttpClient,
-    private titleService: Title
+    private titleService: Title,
+    private zone: NgZone
   ) {
+    this.authService = inject(AuthService);
     effect(() => {
       this.updateMediaSession(this.currentVideo());
     });
@@ -865,8 +868,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   logout() {
-    inject(AuthService).logout();
-    inject(Router).navigate(['/login']);
+    this.zone.runOutsideAngular(() => {
+      this.authService.logout();
+      this.router.navigate(['/login']);
+    });
   }
 
   addChannel(channelId: string, title: string) {
