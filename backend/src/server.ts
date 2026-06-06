@@ -1068,7 +1068,7 @@ async function harvestAndPurge() {
     const minDurationMinutes = parseInt(await getConfig('minDurationMinutes', '0'));
     const maxDurationMinutes = parseInt(await getConfig('maxDurationMinutes', '720'));
 
-    const channels = await prisma.channel.findMany({ orderBy: { order: 'asc' } });
+    const channels = await prisma.channel.findMany({ where: { active: true }, orderBy: { order: 'asc' } });
     harvestStatus.totalChannels = channels.length;
 
     const queue = [...channels];
@@ -1417,6 +1417,16 @@ app.post('/api/cookies', requireAuth, (req, res) => {
 app.get('/api/channels', requireAuth, async (_, res) => {
   const channels = await prisma.channel.findMany({ orderBy: { order: 'asc' } });
   res.json(channels);
+});
+
+app.patch('/api/channels/:channelId/active', requireAuth, async (req, res) => {
+  const { active } = req.body as { active: boolean };
+  await prisma.channel.update({
+    where: { channelId: req.params.channelId },
+    data: { active }
+  });
+  console.log(`${active ? '✅' : '⏸️'} [CHANNEL] ${req.params.channelId} → active=${active}`);
+  res.json({ success: true });
 });
 
 app.post('/api/channels', requireAuth, async (req, res) => {

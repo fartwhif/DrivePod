@@ -647,10 +647,18 @@
                 <a [href]="'https://www.youtube.com/channel/' + c.channelId" 
                    target="_blank" 
                    rel="noopener noreferrer" 
-                   class="hover:text-sky-400 flex items-center gap-2 flex-1 min-w-0 truncate">
+                   class="hover:text-sky-400 flex items-center gap-2 flex-1 min-w-0 truncate"
+                   [class.opacity-40]="!c.active">
                   {{ c.title }}
                   <span class="text-xs text-sky-400">↗</span>
                 </a>
+                <button (click)="toggleChannelActive(c.channelId, !c.active); $event.stopImmediatePropagation()" 
+                        [class.text-emerald-400]="c.active"
+                        [class.text-zinc-500]="!c.active"
+                        [class.hover:text-emerald-300]="c.active"
+                        [class.hover:text-emerald-200]="!c.active"
+                        title="{{ c.active ? 'Harvesting active' : 'Harvesting paused' }}"
+                        class="px-2 text-xl">{{ c.active ? '🟢' : '⏸️' }}</button>
                 <button (click)="startEditing(c.channelId, c.title); $event.stopImmediatePropagation()" 
                         class="text-zinc-400 hover:text-white px-2 text-xl">✏️</button>
               }

@@ -13,6 +13,7 @@ model Channel {
   title            String
   order            Int      @default(0)
   ignoreScrapeDone Boolean  @default(false)
+  active           Boolean  @default(true)
   createdAt        DateTime @default(now())
   videos           Video[]
 
