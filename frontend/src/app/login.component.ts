@@ -1,5 +1,5 @@
-import { Component, inject, signal } from '@angular/core';
-import { Router } from '@angular/router';
+import { Component, inject, signal, OnInit } from '@angular/core';
+import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { CommonModule } from '@angular/common';
 import { AuthService, LoginCredentials, LoginResponse } from './services/auth.service';
@@ -11,14 +11,22 @@ import { AuthService, LoginCredentials, LoginResponse } from './services/auth.se
   templateUrl: './login.component.html',
   styleUrls: []
 })
-export class LoginComponent {
+export class LoginComponent implements OnInit {
   private authService = inject(AuthService);
   private router = inject(Router);
+  private route = inject(ActivatedRoute);
 
   username = 'admin';
   password = 'demo123';
   error = '';
   loading = false;
+  private redirectUrl = '/';
+
+  ngOnInit() {
+    this.route.queryParams.subscribe(params => {
+      this.redirectUrl = params['redirect'] || '/';
+    });
+  }
 
   onSubmit() {
     this.error = '';
@@ -32,7 +40,7 @@ export class LoginComponent {
     this.authService.login(credentials).subscribe({
       next: (response: LoginResponse) => {
         this.authService.saveAuth(response.token, response.user);
-        this.router.navigate(['/']);
+        this.router.navigate([this.redirectUrl]);
       },
       error: (err: any) => {
         this.error = err.error?.error || 'Login failed';

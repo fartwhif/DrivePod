@@ -10,6 +10,20 @@ export const authGuard: CanActivateFn = () => {
     return true;
   }
 
-  router.navigate(['/login']);
+  // Save the current URL so login can redirect back
+  router.navigate(['/login'], { queryParams: { redirect: router.url.split('?')[0] } });
   return false;
+};
+
+export const loginGuard: CanActivateFn = () => {
+  const authService = inject(AuthService);
+  const router = inject(Router);
+
+  // If already logged in, redirect to main app
+  if (authService.isAuthenticated()) {
+    router.navigate(['/']);
+    return false;
+  }
+
+  return true;
 };
