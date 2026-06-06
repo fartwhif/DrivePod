@@ -874,6 +874,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.http.delete(`${this.apiUrl}/channels/${channelId}`).subscribe(() => this.loadChannels());
   }
 
+  toggleChannelActive(channelId: string, active: boolean) {
+    this.http.patch(`${this.apiUrl}/channels/${channelId}/active`, { active }).subscribe(() => this.loadChannels());
+  }
+
   importChannels(rawText: string) {
     const lines = rawText.trim().split('\n').map(l => l.trim()).filter(l => l.length > 0);
     if (lines.length === 0) return;
