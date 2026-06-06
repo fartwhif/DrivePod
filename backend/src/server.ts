@@ -1580,29 +1580,104 @@ function classifyYouTubeUrl(input: string): ParsedImportItem | null {
   return { type: 'channel', channelId: trimmed, originalInput: trimmed };
 }
 
-// Resolve @handle, /c/name, /user/name to actual UC... channel ID using yt-dlp
+// Resolve @handle, /c/name, /user/name to actual UC... channel ID using yt-dlp.
+// Probes the channel page, then falls back to listing videos to find a real UC... ID.
 async function resolveChannelHandle(handle: string): Promise<string | null> {
-  const url = `https://www.youtube.com/${handle.startsWith('@') ? handle : '@' + handle}`;
+  const normalized = handle.startsWith('@') ? handle : '@' + handle;
+  const url = `https://www.youtube.com/${normalized}`;
+
+  // Strategy 1: probe the channel page for channel_id / uploader_url
   try {
     const cmd = `yt-dlp --skip-download --dump-json --no-progress "${url}" 2>/dev/null | head -1`;
-    const { stdout } = await safeExec(cmd, `resolve handle ${handle}`);
+    const { stdout } = await safeExec(cmd, `resolve handle ${normalized}`);
     const info = JSON.parse(stdout);
-    return info.channel_id || null;
+
+    // Extract UC... from any available field
+    const extracted = extractChannelId(info);
+    if (extracted) return extracted;
+
+    // channel_id might be the handle itself — not useful
+    if (info.channel_id && info.channel_id.startsWith('UC')) return info.channel_id;
   } catch {
-    console.warn(`Failed to resolve handle: ${handle}`);
-    return null;
+    console.warn(`[resolveChannelHandle] Strategy 1 failed for ${normalized}`);
   }
+
+  // Strategy 2: list channel videos and grab channel_id from the first video
+  try {
+    const playlistUrl = `https://www.youtube.com/${normalized}/videos`;
+    const cmd = `yt-dlp --flat-playlist --dump-json --no-progress "${playlistUrl}" 2>/dev/null | head -1`;
+    const { stdout } = await safeExec(cmd, `resolve handle via playlist ${normalized}`);
+    const videoInfo = JSON.parse(stdout);
+    const extracted = extractChannelId(videoInfo);
+    if (extracted) return extracted;
+    if (videoInfo.channel_id && videoInfo.channel_id.startsWith('UC')) return videoInfo.channel_id;
+  } catch {
+    console.warn(`[resolveChannelHandle] Strategy 2 failed for ${normalized}`);
+  }
+
+  console.warn(`[resolveChannelHandle] Could not resolve "${normalized}" to a UC... ID`);
+  return null;
 }
 
-// Get channel ID from a video using yt-dlp
+// Extract a UC... channel ID from yt-dlp metadata.
+// Tries channel_id, uploader_url, channel_url, url fields.
+// Returns null if no valid UC... ID can be extracted.
+function extractChannelId(info: any): string | null {
+  // Helper: extract UC... from a string that might contain it
+  function tryExtract(str: string): string | null {
+    if (!str || typeof str !== 'string') return null;
+    // Already a UC... ID
+    if (str.startsWith('UC') && /^[A-Za-z0-9_-]+$/.test(str)) return str;
+    // In a channel URL: /channel/UCxxxxxxxxxxxxxx
+    const m = str.match(/(?:^|\/|channel=)(UC[A-Za-z0-9_-]{22})/);
+    if (m) return m[1];
+    return null;
+  }
+
+  // 1. channel_id — often the UC... ID directly
+  const found = tryExtract(info.channel_id);
+  if (found) return found;
+
+  // 2. uploader_url — e.g. "https://www.youtube.com/channel/UCxxxxxxxxxxxxxx"
+  const found2 = tryExtract(info.uploader_url);
+  if (found2) return found2;
+
+  // 3. channel_url
+  const found3 = tryExtract(info.channel_url);
+  if (found3) return found3;
+
+  return null;
+}
+
+// Get channel info from a video using yt-dlp.
+// Returns { channelId (UC...), channelTitle, videoTitle } or null.
 async function getChannelFromVideo(videoId: string): Promise<{ channelId: string; channelTitle: string; videoTitle: string } | null> {
   try {
     const cmd = `yt-dlp --skip-download --dump-json --no-progress "https://www.youtube.com/watch?v=${videoId}" 2>/dev/null | head -1`;
     const { stdout } = await safeExec(cmd, `get channel for video ${videoId}`);
     const info = JSON.parse(stdout);
+
+    // Extract UC... channel ID
+    let channelId = extractChannelId(info);
+
+    // Fallback: if channel_id is a handle (not UC...), resolve it
+    if (!channelId && info.channel_id && typeof info.channel_id === 'string' && !info.channel_id.startsWith('UC')) {
+      console.log(`[IMPORT] channel_id is a handle "${info.channel_id}" — resolving via yt-dlp...`);
+      const handle = info.channel_id.startsWith('@') ? info.channel_id : '@' + info.channel_id;
+      const resolved = await resolveChannelHandle(handle);
+      if (resolved) channelId = resolved;
+    }
+
+    if (!channelId) {
+      console.warn(`[IMPORT] Could not extract channel ID for video ${videoId}: channel_id=${JSON.stringify(info.channel_id)}, uploader_url=${JSON.stringify(info.uploader_url)}, channel_url=${JSON.stringify(info.channel_url)}`);
+      return null;
+    }
+
+    console.log(`[IMPORT] Video ${videoId} -> Channel ${channelId} (${info.channel || info.uploader || 'Unknown'})`);
+
     return {
-      channelId: info.channel_id,
-      channelTitle: info.channel || 'Unknown Channel',
+      channelId,
+      channelTitle: info.channel || info.uploader || 'Unknown Channel',
       videoTitle: info.title || 'Untitled'
     };
   } catch (err: any) {
