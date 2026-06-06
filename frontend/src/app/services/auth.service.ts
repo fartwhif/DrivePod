@@ -1,6 +1,7 @@
 import { Injectable, signal, computed, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
+import { catchError, throwError } from 'rxjs';
 
 export interface AuthUser {
   sub: string;
@@ -55,6 +56,18 @@ export class AuthService {
     localStorage.setItem(USER_KEY, JSON.stringify(user));
     this.token.set(token);
     this.user.set(user);
+  }
+
+  refreshToken(): Observable<LoginResponse> {
+    const token = this.token();
+    if (!token) return new Observable(sub => sub.complete());
+    return this.http.post<LoginResponse>('/api/auth/refresh', {}, {
+      headers: { Authorization: `Bearer ${token}` }
+    }).pipe(
+      catchError((err) => {
+        return throwError(() => err);
+      })
+    );
   }
 
   logout() {

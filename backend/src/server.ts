@@ -1318,7 +1318,7 @@ async function harvestAndPurge() {
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body;
   if (username === 'admin' && password === 'demo123') {
-    const token = jwtLib.sign(DEMO_USER, DEMO_SECRET, { expiresIn: '7d' });
+    const token = jwtLib.sign(DEMO_USER, DEMO_SECRET, { expiresIn: '90d' });
     console.log(`🔓 [DEMO] User logged in as ${DEMO_USER.name}`);
     res.json({ token, user: DEMO_USER });
   } else {
@@ -1329,6 +1329,22 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/auth/me', requireAuth, (req: Request, res) => {
   if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
   res.json({ user: req.user });
+});
+
+app.post('/api/auth/refresh', (req: Request, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const token = authHeader.substring(7);
+  try {
+    jwtLib.verify(token, DEMO_SECRET);
+    const newToken = jwtLib.sign(DEMO_USER, DEMO_SECRET, { expiresIn: '90d' });
+    console.log(`🔄 [DEMO] Token refreshed for ${DEMO_USER.name}`);
+    res.json({ token: newToken, user: DEMO_USER });
+  } catch {
+    return res.status(401).json({ error: 'Token expired' });
+  }
 });
 
 // === HARVEST STATUS ===

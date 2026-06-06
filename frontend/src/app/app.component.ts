@@ -155,6 +155,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private saveDebounceTimer: any = null;
   private harvestPollInterval: any = null;
   private playlistRefreshInterval: any = null;
+  private tokenRefreshInterval: any = null;
 
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
   private lastPositionUpdate = 0;
@@ -242,6 +243,20 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
+    // Refresh auth token silently on load
+    this.authService.refreshToken().subscribe({
+      next: (resp) => this.authService.saveAuth(resp.token, resp.user),
+      error: () => {}
+    });
+
+    // Auto-refresh token every 24 hours
+    this.tokenRefreshInterval = setInterval(() => {
+      this.authService.refreshToken().subscribe({
+        next: (resp) => this.authService.saveAuth(resp.token, resp.user),
+        error: () => {}
+      });
+    }, 24 * 60 * 60 * 1000);
+
     // Playlist auto-refresh every 2 minutes
     this.playlistRefreshInterval = setInterval(() => this.loadInitialPlaylist(null, false), 120000);
   }
@@ -266,6 +281,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.stopHarvestPolling();
     if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
     if (this.playlistRefreshInterval) clearInterval(this.playlistRefreshInterval);
+    if (this.tokenRefreshInterval) clearInterval(this.tokenRefreshInterval);
 
     // Remove event listeners
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
