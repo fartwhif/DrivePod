@@ -146,7 +146,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   editingChannelId = signal<string | null>(null);
   editTitle = signal('');
 
-  private defaultPageTitle = '🎧 YT Drive Audio Queue';
+  private defaultPageTitle = 'YT Drive Audio Queue';
   private lastProgressSave = 0;
   private readonly PROGRESS_SAVE_INTERVAL = 10000;
 
@@ -157,6 +157,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private harvestPollInterval: any = null;
   private playlistRefreshInterval: any = null;
   private tokenRefreshInterval: any = null;
+
+  // Network resilience: operation queue with exponential-backoff retry
+  private pendingVideoOps: Array<{ videoId: string; type: 'watched' | 'progress'; payload?: any }> = [];
+  private retryTimer: any = null;
+  private retryAttempts = 0;
+  private readonly MAX_RETRY_ATTEMPTS = 10;
+  private readonly BASE_RETRY_DELAY = 2000;
+
+  // Active connectivity probe: pings backend every 3s while ops are pending
+  private connectivityProbeTimer: any = null;
+  private readonly PROBE_INTERVAL = 3000;
 
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
   private lastPositionUpdate = 0;
@@ -174,7 +185,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   ngOnInit() {
-    console.log(`%c🚙📻 DrivePod Frontend v${this.APP_VERSION}`, 'font-weight: bold; color: #22c55e; font-size: 13px');
+    console.log(`%c DrivePod Frontend v${this.APP_VERSION}`, 'font-weight: bold; color: #22c55e; font-size: 13px');
 
     this.titleService.setTitle(this.defaultPageTitle);
     this.activeTab.set('queue');
@@ -226,7 +237,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
         const savedId = this.currentVideoId();
         let autoPlay: boolean = !!savedId || targetMode !== 'off';
-      
+
         this.loadInitialPlaylist(
           config.lastPlayedVideoId || null,
           autoPlay
@@ -283,10 +294,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
     if (this.playlistRefreshInterval) clearInterval(this.playlistRefreshInterval);
     if (this.tokenRefreshInterval) clearInterval(this.tokenRefreshInterval);
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    if (this.connectivityProbeTimer) clearInterval(this.connectivityProbeTimer);
+    this.pendingVideoOps = [];
 
     // Remove event listeners
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
     window.removeEventListener('keydown', this.handleKeyboardShortcut.bind(this));
+    window.removeEventListener('online', this.handleOnline.bind(this));
   }
 
   private setupKeyboardShortcuts(): void {
@@ -388,6 +403,109 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.http.patch(`${this.apiUrl}/player/current`, { videoId }).subscribe({ error: () => {} });
   }
 
+  // === Network resilience: operation queue with retry ===
+
+  private queueOperation(op: { videoId: string; type: 'watched' | 'progress'; payload?: any }): void {
+    // For progress, keep only the latest per videoId (dedup)
+    if (op.type === 'progress') {
+      this.pendingVideoOps = this.pendingVideoOps.filter(
+        existing => existing.videoId !== op.videoId || existing.type !== 'progress'
+      );
+    }
+    // For watched, skip if already queued
+    if (op.type === 'watched' && this.pendingVideoOps.some(e => e.videoId === op.videoId && e.type === 'watched')) {
+      return;
+    }
+    this.pendingVideoOps.push(op);
+    this.startConnectivityProbe();
+    this.scheduleRetry();
+  }
+
+  private scheduleRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    const delay = Math.min(this.BASE_RETRY_DELAY * Math.pow(2, this.retryAttempts), 60000);
+    this.retryTimer = setTimeout(() => this.flushPendingOps(), delay);
+  }
+
+  private flushPendingOps(): void {
+    if (this.pendingVideoOps.length === 0) {
+      this.retryAttempts = 0;
+      this.stopConnectivityProbe();
+      return;
+    }
+
+    const op = this.pendingVideoOps[0];
+    this.pendingVideoOps.shift();
+
+    let req: any;
+    if (op.type === 'watched') {
+      req = this.http.post(`${this.apiUrl}/video/${op.videoId}/watched`, {});
+    } else {
+      req = this.http.patch(`${this.apiUrl}/video/${op.videoId}/progress`, op.payload || {});
+    }
+
+    req.subscribe({
+      next: () => {
+        this.retryAttempts = 0;
+        this.flushPendingOps();
+      },
+      error: () => {
+        this.retryAttempts++;
+        if (this.retryAttempts >= this.MAX_RETRY_ATTEMPTS) {
+          console.error(`Gave up on ${op.type} for ${op.videoId} after ${this.MAX_RETRY_ATTEMPTS} attempts`);
+          this.flushPendingOps();
+        } else {
+          this.pendingVideoOps.unshift(op);
+          // Probe handles retries now; don't re-schedule here
+        }
+      }
+    });
+  }
+
+  // Active connectivity probe: polls backend every PROBE_INTERVAL while ops are pending
+  // This is far more reliable than window.online which only fires once per NIC state change
+  private startConnectivityProbe(): void {
+    if (this.connectivityProbeTimer) return;
+    this.connectivityProbeTimer = setInterval(() => {
+      this.probeBackend();
+    }, this.PROBE_INTERVAL);
+  }
+
+  private stopConnectivityProbe(): void {
+    if (this.connectivityProbeTimer) {
+      clearInterval(this.connectivityProbeTimer);
+      this.connectivityProbeTimer = null;
+    }
+  }
+
+  private probeBackend(): void {
+    if (this.pendingVideoOps.length === 0) {
+      this.stopConnectivityProbe();
+      return;
+    }
+
+    // Use fetch for a lightweight HEAD request -- no Angular HTTP interceptors
+    fetch(`${this.apiUrl}/config`, { method: 'HEAD', mode: 'cors' })
+      .then(res => {
+        if (res.ok) {
+          console.log('Connection restored via probe -- flushing pending operations');
+          this.retryAttempts = 0;
+          this.flushPendingOps();
+        }
+      })
+      .catch(() => {
+        // Still offline, probe will retry in PROBE_INTERVAL
+      });
+  }
+
+  private handleOnline(): void {
+    // window.online is unreliable -- it fires when the NIC comes up, not when internet works
+    // The active probe handles real connectivity detection
+    console.log('OS reports network online -- probing backend');
+    this.retryAttempts = 0;
+    this.probeBackend();
+  }
+
   private setupProgressListeners(): void {
     this.audio.onpause = () => {
       this.saveProgress(this.audio.currentTime);
@@ -398,6 +516,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.saveProgress(this.audio.currentTime || this.audio.duration || 0);
       this.markAsWatchedAndPlayNext();
       this.setMediaPlaybackState('paused');
+    };
+
+    this.audio.onerror = () => {
+      console.warn('Audio playback error -- track may have failed to load');
+      this.setMediaPlaybackState('none');
     };
 
     this.audio.onseeked = () => {
@@ -413,6 +536,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.audio.onplay = () => this.setMediaPlaybackState('playing');
 
     window.addEventListener('beforeunload', this.handleBeforeUnload.bind(this));
+    window.addEventListener('online', this.handleOnline.bind(this));
   }
 
   private handleBeforeUnload(): void {
@@ -442,7 +566,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     this.http.patch(`${this.apiUrl}/video/${video.videoId}/progress`, {
       progress: progressInt
-    }).subscribe({ error: () => {} });
+    }).subscribe({
+      error: () => {
+        // Queue for retry if offline
+        this.queueOperation({ videoId: video.videoId, type: 'progress', payload: { progress: progressInt } });
+      }
+    });
   }
 
   onRangeInput(value: string | number) {
@@ -483,7 +612,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       if (targetProgress > 0) {
         if (targetProgress < (this.audio.duration || Infinity) * 0.98) {
           this.audio.currentTime = targetProgress;
-          console.log(`✅ Resumed ${video.videoId} from ${targetProgress.toFixed(1)}s`);
+          console.log(`Resumed ${video.videoId} from ${targetProgress.toFixed(1)}s`);
         }
       }
       this.updateMediaPositionState();
@@ -518,27 +647,45 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     this.saveCurrentVideo(null);
 
+    // Immediately update UI state -- do NOT wait for the network call
+    this.currentVideo.set(null);
+    this.updatePageTitle(null);
+
+    // Remove finished video from playlist locally
+    this.playlist.update(current => current.filter(v => v.videoId !== finishedVideoId));
+
+    // Queue the watched mark for retry if needed
+    this.queueOperation({ videoId: finishedVideoId, type: 'watched' });
+
+    // Also try immediately (fire-and-forget -- retry handles the rest)
     this.http.post(`${this.apiUrl}/video/${finishedVideoId}/watched`, {})
-      .subscribe(() => {
-        this.currentVideo.set(null);
-        this.updatePageTitle(null);
-
-        this.playlist.update(current => current.filter(v => v.videoId !== finishedVideoId));
-
-        const mode = this.autoplayMode();
-
-        if (mode === 'off') {
-          this.loadInitialPlaylist(null, false);
-          return;
+      .subscribe({
+        error: () => {
+          // Already queued, no need to re-queue
         }
-
-        if (mode === 'newest') {
-          this.loadInitialPlaylist(null, true);
-          return;
-        }
-
-        this.loadPlaylistForAutoplay(mode, finishedPublishedAt);
       });
+
+    // Advance to next track regardless of network state
+    const mode = this.autoplayMode();
+
+    if (mode === 'off') {
+      // Offline-safe: don't reload from server, just stop
+      return;
+    }
+
+    if (mode === 'newest') {
+      // Try to play from local cache first, fall back to server reload
+      const localCandidate = this.playlist().length > 0 ? this.playlist()[0] : null;
+      if (localCandidate) {
+        this.playVideo(localCandidate);
+        return;
+      }
+      // No local cache -- try server, but don't block if offline
+       this.loadInitialPlaylist(null, true);
+       return;
+    }
+
+    this.loadPlaylistForAutoplay(mode, finishedPublishedAt);
   }
 
   private loadPlaylistForAutoplay(mode: 'newer' | 'older' | 'oldest', finishedTime: number) {
@@ -562,10 +709,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     if (isFullyLoaded) {
       if (playlist.length > 0) this.playVideo(playlist[0]);
-      else this.loadInitialPlaylist(null, false);
+      // No local candidates and fully loaded -- nothing to play
       return;
     }
 
+    // Need more data from server to find a candidate
     this.isLoadingMore.set(true);
     const skip = playlist.length;
 
@@ -578,7 +726,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       },
       error: () => {
         this.isLoadingMore.set(false);
-        this.loadInitialPlaylist(null, false);
+        // Server unreachable and no local candidate -- nothing to play
       }
     });
   }
@@ -597,11 +745,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   skipPrevious() {
     if (!this.currentVideo()) return;
-    
+
     const currentId = this.currentVideo()!.videoId;
     const playlist = this.playlist();
     const idx = playlist.findIndex(v => v.videoId === currentId);
-    
+
     if (idx > 0) {
       this.playVideo(playlist[idx - 1]);
     } else {
@@ -667,7 +815,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     let duration = this.audio.duration && isFinite(this.audio.duration) && !isNaN(this.audio.duration)
       ? this.audio.duration
       : (video ? video.duration : 0) || 0;
-    
+
     duration = Math.floor(duration);
 
     if (duration <= 0) return;
@@ -948,9 +1096,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       error: (err) => {
         this.isImporting.set(false);
         const reason = err.status === 409
-          ? 'Harvest or import already running \u2014 try again later'
+          ? 'Harvest or import already running -- try again later'
           : err.status === 0
-            ? 'Request timed out \u2014 import may still be processing'
+            ? 'Request timed out -- import may still be processing'
             : `Server error (${err.status || 'unknown'})`;
         this.importResults.set([{
           input: 'Error',
