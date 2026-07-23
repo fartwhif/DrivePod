@@ -435,14 +435,24 @@
       </div>
 
       <div class="flex items-center mt-4 gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
-        <label class="flex items-center gap-2 cursor-pointer">
-          <input type="checkbox" 
-                  [ngModel]="lowBandwidthMode()" 
-                  (ngModelChange)="toggleLowBandwidth()">
-          <span class="font-medium">Low Bandwidth Mode</span>
-        </label>
-        <span class="text-xs text-amber-400">(hides thumbnails • 56K modem friendly)</span>
-      </div>
+         <label class="flex items-center gap-2 cursor-pointer">
+           <input type="checkbox"
+                   [ngModel]="lowBandwidthMode()"
+                   (ngModelChange)="toggleLowBandwidth()">
+           <span class="font-medium">Low Bandwidth Mode</span>
+         </label>
+         <span class="text-xs text-amber-400">(hides thumbnails &middot; 56K modem friendly)</span>
+       </div>
+
+       <div class="flex items-center mt-3 gap-3 bg-zinc-800 px-5 py-3 rounded-2xl">
+         <label class="flex items-center gap-2 cursor-pointer">
+           <input type="checkbox"
+                  [ngModel]="skipMarksWatched()"
+                  (ngModelChange)="toggleSkipMarksWatched()">
+           <span class="font-medium">Skip marks as finished</span>
+         </label>
+         <span class="text-xs text-amber-400">(next track treats current as fully played)</span>
+       </div>
 
       <div class="flex flex-col sm:flex-row items-start sm:items-center gap-3 bg-zinc-800 px-5 py-3 rounded-2xl mt-3">
         <label class="flex items-center gap-2 cursor-pointer flex-shrink-0">
