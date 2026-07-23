@@ -110,10 +110,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   maxDurationMinutes = signal(720);
 
   // 56K MODEM OPTIMIZATIONS
-  lowBandwidthMode = signal(false);
+   lowBandwidthMode = signal(false);
 
-  // 5-WAY AUTOPLAY MODE
-  autoplayMode = signal<'newest' | 'newer' | 'older' | 'oldest' | 'off'>('newest');
+   // 5-WAY AUTOPLAY MODE
+   autoplayMode = signal<'newest' | 'newer' | 'older' | 'oldest' | 'off'>('newest');
+
+   // SKIP MARKS WATCHED: treat skip-next as if the track finished playing
+   skipMarksWatched = signal(false);
 
   private readonly APP_VERSION = '1.9.0';
 
@@ -194,9 +197,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.loadChannels();
 
     const savedLowBW = localStorage.getItem('drivepod-lowBandwidth');
-    if (savedLowBW !== null) this.lowBandwidthMode.set(savedLowBW === 'true');
+     if (savedLowBW !== null) this.lowBandwidthMode.set(savedLowBW === 'true');
 
-    // Autoplay mode migration
+     // Skip marks watched
+     const savedSkipWatched = localStorage.getItem('drivepod-skipMarksWatched');
+     if (savedSkipWatched !== null) this.skipMarksWatched.set(savedSkipWatched === 'true');
+
+     // Autoplay mode migration
     const savedMode = localStorage.getItem('drivepod-autoplayMode');
     let targetMode: 'newest' | 'newer' | 'older' | 'oldest' | 'off' = 'newest';
     if (savedMode === 'next') targetMode = 'older';
@@ -732,16 +739,23 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   skipNext() {
-    const idx = this.playlist().findIndex(v => v.videoId === this.currentVideo()?.videoId);
-    if (idx < this.playlist().length - 1) {
-      this.playVideo(this.playlist()[idx + 1]);
-    } else {
-      this.currentVideo.set(null);
-      this.updatePageTitle(null);
-      this.saveCurrentVideo(null);
-      this.loadInitialPlaylist(null, false);
-    }
-  }
+     // When skipMarksWatched is enabled, treat skip as if the track just finished
+     if (this.skipMarksWatched() && this.currentVideo()) {
+       this.saveProgress(this.audio.duration || this.audio.currentTime || 0);
+       this.markAsWatchedAndPlayNext();
+       return;
+     }
+
+     const idx = this.playlist().findIndex(v => v.videoId === this.currentVideo()?.videoId);
+     if (idx < this.playlist().length - 1) {
+       this.playVideo(this.playlist()[idx + 1]);
+     } else {
+       this.currentVideo.set(null);
+       this.updatePageTitle(null);
+       this.saveCurrentVideo(null);
+       this.loadInitialPlaylist(null, false);
+     }
+   }
 
   skipPrevious() {
     if (!this.currentVideo()) return;
@@ -930,10 +944,16 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   toggleLowBandwidth() {
-    const newValue = !this.lowBandwidthMode();
-    this.lowBandwidthMode.set(newValue);
-    localStorage.setItem('drivepod-lowBandwidth', String(newValue));
-  }
+      const newValue = !this.lowBandwidthMode();
+      this.lowBandwidthMode.set(newValue);
+      localStorage.setItem('drivepod-lowBandwidth', String(newValue));
+    }
+
+    toggleSkipMarksWatched() {
+      const newValue = !this.skipMarksWatched();
+      this.skipMarksWatched.set(newValue);
+      localStorage.setItem('drivepod-skipMarksWatched', String(newValue));
+    }
 
   onBitrateChange() { this.saveConfig(); }
   onMonoChange() { this.saveConfig(); }
