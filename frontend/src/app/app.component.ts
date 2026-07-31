@@ -491,13 +491,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    // Use fetch for a lightweight HEAD request -- no Angular HTTP interceptors
-    fetch(`${this.apiUrl}/config`, { method: 'HEAD', mode: 'cors' })
+    // Use fetch for a lightweight HEAD request -- include token so it doesn't 401
+    const probeToken = localStorage.getItem('drivepod_token');
+    const probeHeaders: Record<string, string> = {};
+    if (probeToken) probeHeaders['Authorization'] = `Bearer ${probeToken}`;
+    fetch(`${this.apiUrl}/config`, { method: 'HEAD', headers: probeHeaders })
       .then(res => {
         if (res.ok) {
           console.log('Connection restored via probe -- flushing pending operations');
           this.retryAttempts = 0;
           this.flushPendingOps();
+          // Restore audio if it was interrupted
+          this.recoverAudioPlayback();
         }
       })
       .catch(() => {
@@ -511,6 +516,28 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     console.log('OS reports network online -- probing backend');
     this.retryAttempts = 0;
     this.probeBackend();
+    // Restore audio playback if the current track was interrupted by the network loss
+    this.recoverAudioPlayback();
+  }
+
+  /**
+   * After network loss, the <Audio> element can be in a terminal error state.
+   * Re-load the current track so the element resets and can play again.
+   */
+  private recoverAudioPlayback(): void {
+    const video = this.currentVideo();
+    if (!video) return;
+
+    // If audio is not in an error-like state (playing or fine), nothing to recover
+    if (!this.audio.paused && this.audio.readyState >= 2) {
+      return;
+    }
+
+    console.log('Network restored -- reloading audio for', video.videoId);
+    // Re-load the same track. loadAndSeekVideo sets src + calls .load(),
+    // and the onloadedmetadata handler seeks to the right position.
+    this.loadAndSeekVideo(video);
+    this.audio.play().catch(() => {});
   }
 
   private setupProgressListeners(): void {
@@ -596,6 +623,30 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.saveProgress(time);
     this.lastProgressSave = Date.now();
     this.updateMediaPositionState();
+  }
+
+  /**
+   * Toggle play/pause with network-recovery fallback.
+   * If the <Audio> element is stuck in a network error state, reload the track.
+   */
+  togglePlay() {
+    if (this.audio.paused) {
+      const promise = this.audio.play();
+      // play() returns a rejected Promise silently when the element is in a network error
+      if (promise !== undefined) {
+        promise.catch(() => {
+          // Audio element is likely stuck from a network drop — reload and retry
+          const video = this.currentVideo();
+          if (video) {
+            console.log('Play failed — reloading audio for', video.videoId);
+            this.loadAndSeekVideo(video);
+            this.audio.play().catch(() => {});
+          }
+        });
+      }
+    } else {
+      this.audio.pause();
+    }
   }
 
   playVideo(video: Video) {

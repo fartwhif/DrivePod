@@ -26,7 +26,7 @@
           <div class="flex items-center gap-0 text-4xl">
             <button (click)="skipPrevious()" 
                     class="hover:scale-110 active:scale-95 transition text-zinc-400 hover:text-white">⏮️</button>
-            <button (click)="audio.paused ? audio.play() : audio.pause()" 
+            <button (click)="togglePlay()"
                     class="text-5xl hover:scale-110 active:scale-95 transition">
               {{ audio.paused ? '▶️' : '⏸️' }}
             </button>
