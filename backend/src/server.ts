@@ -266,6 +266,17 @@ async function cleanupCorruptedFolders() {
     const videoRecord = await prisma.video.findUnique({ where: { videoId } });
 
     if (!videoRecord) {
+      // Check if this is a GrabbyTube item (has a per-item .json with videoId key)
+      const grabbyMeta = path.join(folderPath, `${videoId}.json`);
+      if (fs.existsSync(grabbyMeta)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(grabbyMeta, 'utf-8'));
+          if (meta.videoId) {
+            console.log(`   🎵 GrabbyTube item (skipping): ${videoId}`);
+            continue;
+          }
+        } catch { /* not valid JSON, fall through to orphan deletion */ }
+      }
       console.log(`   🗑️ ORPHAN FOLDER (no DB Video entity): ${videoId}`);
       try { fs.rmSync(folderPath, { recursive: true, force: true }); await updateIndexFile(); } catch { }
       continue;
