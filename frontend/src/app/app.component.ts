@@ -388,10 +388,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       .catch(err => console.error('Failed to load index.json', err));
   }
 
-  /** Get all queue (unwatched, non-ignored, non-grabby) videos from index, sorted newest first. */
+  /** Get all queue (unwatched, non-ignored) videos from index, sorted newest first. */
   private getQueueVideos(): Video[] {
     return this.rawIndex()
-      .filter(v => !v.watched && !v.ignored && !v.isGrabby)
+      .filter(v => !v.watched && !v.ignored)
       .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
   }
 

@@ -1162,6 +1162,11 @@ async function updateIndexFile() {
         }
       }
 
+      // For grabby items, preserve the DB's clustered timestamp (file has original YouTube date)
+      if (v.isGrabby) {
+        meta.publishedAt = v.publishedAt;
+      }
+
       // Paths are relative to CACHE_DIR — keep /cache/ prefix for nginx
       if (meta.thumbnailPath && !meta.thumbnailPath.startsWith('http')) {
         if (!meta.thumbnailPath.startsWith('/cache/')) {
