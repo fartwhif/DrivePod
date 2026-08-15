@@ -4,7 +4,6 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Title } from '@angular/platform-browser';
 import { Router } from '@angular/router';
-import { forkJoin } from 'rxjs';
 import { AuthService } from './services/auth.service';
 
 interface Video {
@@ -17,6 +16,9 @@ interface Video {
   progress: number;
   duration?: number;
   protected: boolean;
+  watched: boolean;
+  ignored: boolean;
+  isGrabby: boolean;
 }
 
 interface Config {
@@ -138,10 +140,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     lastUpdate: null
   });
 
-  // Infinite Scroll
+  // Index-based client-side paging
+  rawIndex = signal<Video[]>([]);
   readonly PAGE_SIZE = 20;
   isLoadingMore = signal(false);
   hasMore = signal(true);
+
+  private queuePage = 0;
 
   @ViewChild('loadMoreTrigger') loadMoreTrigger!: ElementRef<HTMLDivElement>;
   private observer: IntersectionObserver | null = null;
@@ -216,10 +221,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       localStorage.setItem('drivepod-autoplayMode', targetMode);
     }
 
-    forkJoin({
-      config: this.http.get<Config>(`${this.apiUrl}/config`)
-    }).subscribe({
-      next: ({ config }) => {
+    // Load the full index first
+    this.loadIndex();
+
+    // Load config in parallel
+    this.http.get<Config>(`${this.apiUrl}/config`).subscribe({
+      next: (config) => {
         this.maxHarvestDays.set(config.maxHarvestDays);
         this.preferredBitrate.set(config.preferredBitrate);
         this.preferredMono.set(config.preferredMono);
@@ -245,12 +252,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         const savedId = this.currentVideoId();
         let autoPlay: boolean = !!savedId || targetMode !== 'off';
 
-        this.loadInitialPlaylist(
-          config.lastPlayedVideoId || null,
-          autoPlay
-        );
+        // Derive initial playlists from index
+        this.derivePlaylists();
+        if (autoPlay && !this.currentVideo()) {
+          const queue = this.getQueueVideos();
+          if (queue.length > 0) {
+            this.initializeCurrentVideo(queue);
+          }
+        }
       },
-      error: () => this.loadInitialPlaylist(null, true)
+      error: () => {
+        // Config failed — still derive playlists from index
+        this.derivePlaylists();
+      }
     });
 
     this.audio.ontimeupdate = () => {
@@ -276,8 +290,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       });
     }, 24 * 60 * 60 * 1000);
 
-    // Playlist auto-refresh every 2 minutes
-    this.playlistRefreshInterval = setInterval(() => this.loadInitialPlaylist(null, false), 120000);
+    // Poll index.json every 2 minutes for new content
+    this.playlistRefreshInterval = setInterval(() => this.loadIndex(), 120000);
   }
 
   ngAfterViewInit() {
@@ -329,52 +343,102 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  private loadInitialPlaylist(targetVideoId: string | null = null, autoplayAfterLoad: boolean = false) {
-    this.isLoadingMore.set(false);
-    this.hasMore.set(true);
+  // === Index-based client-side paging ===
 
-    const loadPage = (skip: number, accumulated: Video[] = []) => {
-      this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`).subscribe({
-        next: (data) => {
-          const newList = [...accumulated, ...data];
-          this.playlist.set(newList);
-          this.hasMore.set(data.length === this.PAGE_SIZE);
-
-          const targetFound = !targetVideoId || newList.some(v => v.videoId === targetVideoId);
-
-          if (targetFound || data.length < this.PAGE_SIZE) {
-            if (autoplayAfterLoad && !this.currentVideo()) {
-              this.initializeCurrentVideo(newList);
-            }
-          } else if (targetVideoId) {
-            loadPage(skip + this.PAGE_SIZE, newList);
-          }
-        },
-        error: (err) => {
-          console.error('Failed to load playlist', err);
-          this.playlist.set(accumulated);
-          this.hasMore.set(false);
+  /** Fetch the full index.json from nginx and derive all playlist signals. */
+  private loadIndex(): void {
+    const token = localStorage.getItem('drivepod_token');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    fetch('/cache/index.json', { headers })
+      .then(res => {
+        if (!res.ok) throw new Error(`index.json ${res.status}`);
+        return res.json();
+      })
+      .then((data: Video[]) => {
+        // Preserve local progress/watched state for videos already in our signals
+        const oldQueue = this.playlist();
+        const oldProtected = this.protectedPlaylist();
+        const oldWatched = this.watchedPlaylist();
+        const oldMap = new Map<string, Partial<Video>>();
+        for (const v of [...oldQueue, ...oldProtected, ...oldWatched]) {
+          oldMap.set(v.videoId, { progress: v.progress, watched: v.watched });
         }
-      });
-    };
 
-    loadPage(0);
+        // Merge local state into fresh index data
+        const merged = data.map(v => {
+          const local = oldMap.get(v.videoId);
+          if (local) {
+            return { ...v, progress: local.progress ?? v.progress, watched: local.watched ?? v.watched };
+          }
+          return v;
+        });
+
+        this.rawIndex.set(merged);
+        this.derivePlaylists();
+      })
+      .catch(err => console.error('Failed to load index.json', err));
   }
 
-  private loadMore() {
-    if (this.isLoadingMore() || !this.hasMore()) return;
-    const skip = this.playlist().length;
-    this.isLoadingMore.set(true);
+  /** Get all queue (unwatched, non-ignored, non-grabby) videos from index, sorted newest first. */
+  private getQueueVideos(): Video[] {
+    return this.rawIndex()
+      .filter(v => !v.watched && !v.ignored && !v.isGrabby)
+      .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
+  }
 
-    this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`)
-      .subscribe({
-        next: (newVideos) => {
-          this.playlist.update(current => [...current, ...newVideos]);
-          this.hasMore.set(newVideos.length === this.PAGE_SIZE);
-          this.isLoadingMore.set(false);
-        },
-        error: () => this.isLoadingMore.set(false)
-      });
+  /** Get protected videos from index. */
+  private getProtectedVideos(): Video[] {
+    return this.rawIndex()
+      .filter(v => v.protected && !v.ignored)
+      .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
+  }
+
+  /** Get watched videos from index. */
+  private getWatchedVideos(): Video[] {
+    return this.rawIndex()
+      .filter(v => v.watched && !v.ignored)
+      .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
+  }
+
+  /** Derive all playlist signals from rawIndex. */
+  private derivePlaylists(): void {
+    const queue = this.getQueueVideos();
+    this.updatePage(this.queuePage, queue, this.PAGE_SIZE, (page) => this.playlist.set(page));
+
+    const protectedVids = this.getProtectedVideos();
+    this.protectedPlaylist.set(protectedVids);
+
+    const watchedVids = this.getWatchedVideos();
+    this.watchedPlaylist.set(watchedVids);
+  }
+
+  /** Paginate a full list into a page. */
+  private updatePage(page: number, items: Video[], pageSize: number, setter: (videos: Video[]) => void): void {
+    const start = page * pageSize;
+    const pageItems = items.slice(start, start + pageSize);
+    setter(pageItems);
+    this.hasMore.set(start + pageSize < items.length);
+  }
+
+  /** Load the next page of the queue playlist. */
+  private loadMore(): void {
+    if (this.isLoadingMore() || !this.hasMore()) return;
+    this.isLoadingMore.set(true);
+    const queue = this.getQueueVideos();
+    this.queuePage++;
+    this.updatePage(this.queuePage, queue, this.PAGE_SIZE, (page) => {
+      this.playlist.update(current => [...current, ...page]);
+    });
+    this.isLoadingMore.set(false);
+  }
+
+  /** Reset to first page of queue. */
+  private resetQueuePage(): void {
+    this.queuePage = 0;
+    this.hasMore.set(true);
+    const queue = this.getQueueVideos();
+    this.updatePage(0, queue, this.PAGE_SIZE, (page) => this.playlist.set(page));
   }
 
   private setupInfiniteScroll() {
@@ -738,26 +802,21 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.playVideo(localCandidate);
         return;
       }
-      // No local cache -- try server, but don't block if offline
-       this.loadInitialPlaylist(null, true);
-       return;
+      // No local cache -- try reloading index, but don't block if offline
+      this.loadIndex();
+      return;
     }
 
-    this.loadPlaylistForAutoplay(mode, finishedPublishedAt);
-  }
-
-  private loadPlaylistForAutoplay(mode: 'newer' | 'older' | 'oldest', finishedTime: number) {
-    const playlist = this.playlist();
-    const isFullyLoaded = !this.hasMore();
-
+    // newer/older/oldest modes
+    const queue = this.getQueueVideos();
     let candidate: Video | undefined;
 
     if (mode === 'oldest') {
-      if (isFullyLoaded && playlist.length > 0) {
-        candidate = playlist[playlist.length - 1];
+      if (queue.length > 0) {
+        candidate = queue[queue.length - 1];
       }
     } else {
-      candidate = this.getCandidate(playlist, mode, finishedTime);
+      candidate = this.getCandidate(queue, mode, finishedPublishedAt);
     }
 
     if (candidate) {
@@ -765,28 +824,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    if (isFullyLoaded) {
-      if (playlist.length > 0) this.playVideo(playlist[0]);
-      // No local candidates and fully loaded -- nothing to play
-      return;
-    }
-
-    // Need more data from server to find a candidate
-    this.isLoadingMore.set(true);
-    const skip = playlist.length;
-
-    this.http.get<Video[]>(`${this.apiUrl}/playlist?take=${this.PAGE_SIZE}&skip=${skip}`).subscribe({
-      next: (newVideos) => {
-        this.playlist.update(current => [...current, ...newVideos]);
-        this.hasMore.set(newVideos.length === this.PAGE_SIZE);
-        this.isLoadingMore.set(false);
-        this.loadPlaylistForAutoplay(mode, finishedTime);
-      },
-      error: () => {
-        this.isLoadingMore.set(false);
-        // Server unreachable and no local candidate -- nothing to play
-      }
-    });
+    // No local candidates — reload index in case new content arrived
+    this.loadIndex();
   }
 
   skipNext() {
@@ -804,7 +843,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
        this.currentVideo.set(null);
        this.updatePageTitle(null);
        this.saveCurrentVideo(null);
-       this.loadInitialPlaylist(null, false);
+       this.resetQueuePage();
      }
    }
 
@@ -924,37 +963,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     if (tab === 'queue') {
-      this.loadInitialPlaylist(null, false);
+      this.resetQueuePage();
       setTimeout(() => this.setupInfiniteScroll(), 300);
     }
 
     if (tab === 'protected') {
-      this.loadProtectedPlaylist();
+      this.derivePlaylists();
     }
 
     if (tab === 'watched') {
-      this.loadWatchedPlaylist();
+      this.derivePlaylists();
     }
-  }
-
-  loadProtectedPlaylist() {
-    this.http.get<Video[]>(`${this.apiUrl}/playlist/protected`).subscribe({
-      next: (data) => this.protectedPlaylist.set(data),
-      error: (err) => {
-        console.error('Failed to load protected videos', err);
-        this.protectedPlaylist.set([]);
-      }
-    });
-  }
-
-  loadWatchedPlaylist() {
-    this.http.get<Video[]>(`${this.apiUrl}/playlist/watched`).subscribe({
-      next: (data) => this.watchedPlaylist.set(data),
-      error: (err) => {
-        console.error('Failed to load watched videos', err);
-        this.watchedPlaylist.set([]);
-      }
-    });
   }
 
   toggleWatched(videoId: string, watched: boolean) {
@@ -1082,7 +1101,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   purgeAll() {
     if (!confirm('Delete ALL cached videos and clear the playlist?')) return;
-    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadInitialPlaylist(null, false));
+    this.http.post(`${this.apiUrl}/purge-all`, {}).subscribe(() => this.loadIndex());
   }
 
   toggleProtect(videoId: string, isProtected: boolean) {
@@ -1160,8 +1179,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.loadChannels();
         const hasVideoAdds = res.results.some(r => r.status === 'added' && r.type === 'video');
         if (hasVideoAdds) {
-          this.loadInitialPlaylist(null, false);
-          this.loadProtectedPlaylist();
+          this.loadIndex();
         }
       },
       error: (err) => {
