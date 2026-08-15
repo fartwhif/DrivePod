@@ -182,6 +182,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private connectivityProbeTimer: any = null;
   private readonly PROBE_INTERVAL = 3000;
 
+  // Index fetch reachability: track whether backend is online for index polling
+  private backendOnline = true;
+  private indexFetchPending = false;
+
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
   private lastPositionUpdate = 0;
   private readonly POSITION_UPDATE_INTERVAL = 1800;
@@ -355,15 +359,26 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   /** Fetch the full index.json from nginx and derive all playlist signals. */
   private loadIndex(): void {
+    // If backend is unreachable, defer the fetch until connectivity returns
+    if (!this.backendOnline) {
+      this.indexFetchPending = true;
+      return;
+    }
+
     const token = localStorage.getItem('drivepod_token');
     const headers: Record<string, string> = {};
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    fetch('/cache/index.json', { headers })
+    // Cache-bust: timestamp query param + no-store prevents browser from serving stale cached index
+    const url = `/cache/index.json?_t=${Date.now()}`;
+    fetch(url, { headers, cache: 'no-store' })
       .then(res => {
         if (!res.ok) throw new Error(`index.json ${res.status}`);
         return res.json();
       })
       .then((data: Video[]) => {
+        this.backendOnline = true;
+        this.indexFetchPending = false;
+
         // Preserve local progress/watched state for videos already in our signals
         const oldQueue = this.playlist();
         const oldProtected = this.protectedPlaylist();
@@ -385,7 +400,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.rawIndex.set(merged);
         this.derivePlaylists();
       })
-      .catch(err => console.error('Failed to load index.json', err));
+      .catch(err => {
+        this.backendOnline = false;
+        this.indexFetchPending = true;
+        console.error('Failed to load index.json — backend offline, deferring', err);
+        this.startConnectivityProbe();
+      });
   }
 
   /** Get all queue (unwatched, non-ignored) videos from index, sorted newest first. */
@@ -560,7 +580,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private probeBackend(): void {
-    if (this.pendingVideoOps.length === 0) {
+    if (this.pendingVideoOps.length === 0 && !this.indexFetchPending) {
       this.stopConnectivityProbe();
       return;
     }
@@ -577,6 +597,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           this.flushPendingOps();
           // Restore audio if it was interrupted
           this.recoverAudioPlayback();
+          // Flush deferred index fetch
+          if (this.indexFetchPending) {
+            this.backendOnline = true;
+            this.indexFetchPending = false;
+            this.loadIndex();
+          }
         }
       })
       .catch(() => {
@@ -592,6 +618,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.probeBackend();
     // Restore audio playback if the current track was interrupted by the network loss
     this.recoverAudioPlayback();
+    // Try fetching index if it was deferred
+    if (this.indexFetchPending) {
+      this.backendOnline = true;
+      this.indexFetchPending = false;
+      this.loadIndex();
+    }
   }
 
   /**
