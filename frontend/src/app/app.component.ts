@@ -40,6 +40,8 @@ interface Config {
   durationFilterEnabled: boolean;
   minDurationMinutes: number;
   maxDurationMinutes: number;
+  // NEW: GrabbyTube shufflebag mix
+  grabbyMixEnabled: boolean;
 }
 
 interface ImportResult {
@@ -110,6 +112,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   durationFilterEnabled = signal(false);
   minDurationMinutes = signal(0);
   maxDurationMinutes = signal(720);
+
+  // NEW: GrabbyTube shufflebag mix toggle
+  grabbyMixEnabled = signal(true);
 
   // 56K MODEM OPTIMIZATIONS
    lowBandwidthMode = signal(false);
@@ -248,6 +253,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.durationFilterEnabled.set(config.durationFilterEnabled ?? false);
         this.minDurationMinutes.set(config.minDurationMinutes ?? 0);
         this.maxDurationMinutes.set(config.maxDurationMinutes ?? 720);
+
+        // NEW: Load GrabbyTube shufflebag mix
+        this.grabbyMixEnabled.set(config.grabbyMixEnabled ?? true);
 
         const savedId = this.currentVideoId();
         let autoPlay: boolean = !!savedId || targetMode !== 'off';
@@ -1009,7 +1017,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       // NEW duration filter
       durationFilterEnabled: this.durationFilterEnabled(),
       minDurationMinutes: this.minDurationMinutes(),
-      maxDurationMinutes: this.maxDurationMinutes()
+      maxDurationMinutes: this.maxDurationMinutes(),
+      // NEW GrabbyTube shufflebag mix
+      grabbyMixEnabled: this.grabbyMixEnabled()
     }).subscribe();
   }
 

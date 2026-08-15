@@ -39,6 +39,9 @@ const DATA_DIR = process.env.DATA_DIR;
 const TEMP_COOKIES_FILE = path.join(DATA_DIR, 'cookies.txt');
 const INDEX_JSON_PATH = path.join(CACHE_DIR, 'index.json');
 const INDEX_TEMP_PATH = path.join(CACHE_DIR, 'index.tmp.json');
+const GRABBY_INDEX_PATH = path.join(CACHE_DIR, 'grabby-index.json');
+const SHUFFLEBAG_JSON_PATH = path.join(CACHE_DIR, 'shufflebag.json');
+const GRABBY_CHANNEL_ID = 'UCGrabbyTube';
 
 const prisma = new PrismaClient();
 const parser = new Parser({
@@ -294,24 +297,30 @@ async function cleanupCorruptedFolders() {
     let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 2;
 
     if (isCorrupted) {
+      // Check if this is a grabby item — protect its files on disk
+      const isGrabbyItem = videoRecord?.isGrabby === true;
+
       let reason = isEmpty ? 'Empty folder' : 'Unknown';
       if (mp3Count !== 1) reason = mp3Count === 0 ? 'No .mp3 file' : 'Multiple .mp3 files';
       else if (jsonCount !== 1) reason = jsonCount === 0 ? 'No .json file' : 'Multiple .json files';
       else if (thumbCount > 2) reason = `Too many thumbnails (${thumbCount})`;
-      console.log(`   🚨 CORRUPTED: ${videoId} → ${reason}`);
+      console.log(`   🚨 CORRUPTED: ${videoId} → ${reason}${isGrabbyItem ? ' (🎵 grabby — preserving files)' : ''}`);
       try {
-        fs.rmSync(folderPath, { recursive: true, force: true });
+        if (!isGrabbyItem) {
+          fs.rmSync(folderPath, { recursive: true, force: true });
+        }
         await prisma.video.deleteMany({ where: { videoId: videoId } });
         await updateIndexFile();
-        console.log(`   ✅ Deleted corrupted folder + DB entry: ${videoId}`);
+        console.log(`   ✅ Deleted ${isGrabbyItem ? 'DB entry only (files preserved)' : 'corrupted folder + DB entry'}: ${videoId}`);
       } catch (e) {
         console.error(`   ❌ Failed to delete ${videoId}`);
       }
     }
   }
 
+  // Check orphan DB entities (skip grabby items — never delete their DB entries if files go missing)
   const allVideos = await prisma.video.findMany({
-    where: { ignored: false },
+    where: { ignored: false, isGrabby: false },
     select: { id: true, videoId: true }
   });
 
@@ -338,6 +347,255 @@ async function backfillChannelOrders() {
     await prisma.channel.update({ where: { id: channels[i].id }, data: { order: i } });
   }
   console.log(`✅ Channel order backfill complete`);
+}
+
+// ====================== SHUFFLEBAG (GrabbyTube) ======================
+
+interface ShuffleBagEntry {
+  videoId: string;
+  used: boolean;
+}
+
+/**
+ * Load grabby-index.json, filter defunct items (MP3 missing),
+ * Fisher-Yates shuffle, and persist to shufflebag.json.
+ */
+async function initShuffleBag(): Promise<void> {
+  console.log(`🎵 [ShuffleBag] Initializing shufflebag...`);
+
+  // Ensure GrabbyTube placeholder channel exists
+  await prisma.channel.upsert({
+    where: { channelId: GRABBY_CHANNEL_ID },
+    update: {},
+    create: { channelId: GRABBY_CHANNEL_ID, title: 'GrabbyTube', order: 999999, active: false }
+  });
+
+  if (!fs.existsSync(GRABBY_INDEX_PATH)) {
+    console.log(`⚠️ [ShuffleBag] No ${GRABBY_INDEX_PATH} found — shufflebag disabled`);
+    fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify([], null, 2));
+    return;
+  }
+
+  const grabbyIndex: any[] = JSON.parse(fs.readFileSync(GRABBY_INDEX_PATH, 'utf-8'));
+
+  // Filter out defunct items (MP3 missing on disk)
+  const valid: ShuffleBagEntry[] = [];
+  for (const item of grabbyIndex) {
+    const mp3Path = path.join(CACHE_DIR, item.audioPath);
+    if (fs.existsSync(mp3Path)) {
+      valid.push({ videoId: item.videoId, used: false });
+    } else {
+      console.log(`   🗑️ [ShuffleBag] Skipping defunct item: ${item.videoId} (no MP3)`);
+    }
+  }
+
+  // Fisher-Yates shuffle
+  for (let i = valid.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [valid[i], valid[j]] = [valid[j], valid[i]];
+  }
+
+  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(valid, null, 2));
+  console.log(`✅ [ShuffleBag] Initialized with ${valid.length} valid items (shuffled)`);
+}
+
+/**
+ * Pull N unused items from the shufflebag. Reinitializes when exhausted.
+ * Returns the pulled items (marks them as used).
+ */
+async function pullFromShuffleBag(count: number): Promise<ShuffleBagEntry[]> {
+  if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) {
+    console.log(`⚠️ [ShuffleBag] No shufflebag file — pulling 0 items`);
+    return [];
+  }
+
+  const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
+
+  const unused = bag.filter(e => !e.used);
+  if (unused.length === 0) {
+    console.log(`🔄 [ShuffleBag] Exhausted — reinitializing`);
+    await initShuffleBag();
+    return pullFromShuffleBag(count); // retry with fresh bag
+  }
+
+  const pulled = unused.slice(0, count);
+  for (const entry of pulled) {
+    entry.used = true;
+  }
+
+  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(bag, null, 2));
+  console.log(`🎵 [ShuffleBag] Pulled ${pulled.length} items (${bag.filter(e => e.used).length} used / ${bag.length} total)`);
+  return pulled;
+}
+
+/**
+ * Load grabby-index.json and return it as a map videoId -> metadata.
+ */
+function loadGrabbyIndex(): Map<string, any> {
+  if (!fs.existsSync(GRABBY_INDEX_PATH)) return new Map();
+  const grabbyIndex: any[] = JSON.parse(fs.readFileSync(GRABBY_INDEX_PATH, 'utf-8'));
+  const map = new Map<string, any>();
+  for (const item of grabbyIndex) {
+    map.set(item.videoId, item);
+  }
+  return map;
+}
+
+/**
+ * Distribute GrabbyTube items after harvest completes.
+ *
+ * Evaluates normal:grabby duration ratio in the past hour of content.
+ * Target ratio is configurable (default 3:1).
+ * Pulls grabby items from shufflebag and inserts them as DB records
+ * with isGrabby: true and timestamp clustering near the newest normal content.
+ */
+async function distributeGrabbyItems(): Promise<void> {
+  const grabbyEnabled = (await getConfig('grabbyMixEnabled', 'true')) === 'true';
+  if (!grabbyEnabled) {
+    console.log(`⏭️ [ShuffleBag] GrabbyTube mix disabled — skipping distribution`);
+    return;
+  }
+
+  const targetRatio = parseFloat(await getConfig('grabbyMixRatio', '3')); // normal:grabby
+  if (targetRatio <= 0) {
+    console.log(`⏭️ [ShuffleBag] Invalid grabbyMixRatio (${targetRatio}) — skipping`);
+    return;
+  }
+
+  // Ensure GrabbyTube channel exists
+  await prisma.channel.upsert({
+    where: { channelId: GRABBY_CHANNEL_ID },
+    update: {},
+    create: { channelId: GRABBY_CHANNEL_ID, title: 'GrabbyTube', order: 999999, active: false }
+  });
+
+  // Find the newest normal video to establish the timestamp band
+  const newestNormal = await prisma.video.findFirst({
+    where: { isGrabby: false, ignored: false },
+    orderBy: { publishedAt: 'desc' },
+    select: { publishedAt: true, duration: true }
+  });
+
+  if (!newestNormal) {
+    console.log(`⏭️ [ShuffleBag] No normal videos found — skipping distribution`);
+    return;
+  }
+
+  const newestTime = newestNormal.publishedAt.getTime();
+  const oneHourAgo = newestTime - 60 * 60 * 1000;
+
+  // Calculate total duration of normal videos in the past hour
+  const normalVideos = await prisma.video.findMany({
+    where: {
+      isGrabby: false,
+      ignored: false,
+      publishedAt: { gte: new Date(oneHourAgo), lte: newestNormal.publishedAt }
+    },
+    select: { duration: true }
+  });
+
+  const normalDurationSec = normalVideos.reduce((sum, v) => sum + (v.duration || 0), 0);
+
+  // Calculate total duration of grabby videos in the past hour
+  const grabbyVideos = await prisma.video.findMany({
+    where: {
+      isGrabby: true,
+      ignored: false,
+      publishedAt: { gte: new Date(oneHourAgo), lte: newestNormal.publishedAt }
+    },
+    select: { duration: true }
+  });
+
+  const grabbyDurationSec = grabbyVideos.reduce((sum, v) => sum + (v.duration || 0), 0);
+
+  // Target grabby duration = normalDuration / ratio
+  const targetGrabbyDuration = normalDurationSec / targetRatio;
+  const deficitDuration = targetGrabbyDuration - grabbyDurationSec;
+
+  if (deficitDuration <= 0) {
+    console.log(`✅ [ShuffleBag] Grabby ratio satisfied (normal: ${Math.round(normalDurationSec)}s, grabby: ${Math.round(grabbyDurationSec)}s, target: ${Math.round(targetGrabbyDuration)}s)`);
+    return;
+  }
+
+  console.log(`🎵 [ShuffleBag] Grabby deficit: ${Math.round(deficitDuration)}s (need ~${Math.round(deficitDuration / 60)}min of music)`);
+
+  // Load grabby index for metadata lookups
+  const grabbyMap = loadGrabbyIndex();
+
+  // Walk backwards through the shufflebag to find items that fill the deficit.
+  // We need "built" duration going backwards until we have 60+ minutes.
+  const minGrabbyMinutes = 60 * 60; // at least 60 minutes of grabby content
+  const neededDuration = Math.max(deficitDuration, minGrabbyMinutes);
+
+  // Pull enough items from shufflebag to cover the needed duration
+  // Estimate average grabby duration (~4 min = 240s)
+  const avgGrabbyDuration = 240;
+  const estimatedCount = Math.ceil(neededDuration / avgGrabbyDuration) + 5; // buffer
+
+  const pulled = await pullFromShuffleBag(estimatedCount);
+  if (pulled.length === 0) {
+    console.log(`⚠️ [ShuffleBag] No items available in shufflebag`);
+    return;
+  }
+
+  // Collect grabby items until we have enough duration
+  const toInsert: any[] = [];
+  let accumulatedDuration = 0;
+
+  for (const entry of pulled) {
+    const meta = grabbyMap.get(entry.videoId);
+    if (!meta) continue;
+
+    const duration = meta.duration || 0;
+    if (duration <= 0) continue;
+
+    // Check if already in DB
+    const existing = await prisma.video.findUnique({ where: { videoId: entry.videoId } });
+    if (existing) {
+      console.log(`   ⏭️ [ShuffleBag] Already in DB: ${entry.videoId}`);
+      continue;
+    }
+
+    // Check MP3 exists
+    const mp3Path = path.join(CACHE_DIR, meta.audioPath);
+    if (!fs.existsSync(mp3Path)) continue;
+
+    toInsert.push({
+      videoId: entry.videoId,
+      channelId: GRABBY_CHANNEL_ID,
+      title: meta.title || 'GrabbyTube Track',
+      publishedAt: clusterTimestamp(newestNormal.publishedAt),
+      thumbnailPath: meta.thumbnailPath ? `/cache/${meta.thumbnailPath}` : null,
+      audioPath: mp3Path,
+      duration,
+      ignored: false,
+      protected: false,
+      isGrabby: true
+    });
+
+    accumulatedDuration += duration;
+
+    if (accumulatedDuration >= neededDuration) break;
+  }
+
+  if (toInsert.length === 0) {
+    console.log(`⚠️ [ShuffleBag] No new grabby items to insert`);
+    return;
+  }
+
+  await prisma.video.createMany({ data: toInsert });
+  await updateIndexFile();
+
+  console.log(`✅ [ShuffleBag] Inserted ${toInsert.length} grabby items (${Math.round(accumulatedDuration)}s total)`);
+}
+
+/**
+ * Cluster a grabby item's timestamp near the newest normal content.
+ * Places it within ±30 minutes of the reference time.
+ */
+function clusterTimestamp(reference: Date): Date {
+  const offsetMs = (Math.random() - 0.5) * 60 * 60 * 1000; // ±30 min
+  return new Date(reference.getTime() + offsetMs);
 }
 
 // === HELPER: Channel title extraction ===
@@ -904,12 +1162,14 @@ async function updateIndexFile() {
         }
       }
 
-      // Paths are relative to CACHE_DIR
+      // Paths are relative to CACHE_DIR — keep /cache/ prefix for nginx
       if (meta.thumbnailPath && !meta.thumbnailPath.startsWith('http')) {
-        meta.thumbnailPath = `${v.videoId}/${path.basename(meta.thumbnailPath)}`;
+        if (!meta.thumbnailPath.startsWith('/cache/')) {
+          meta.thumbnailPath = `/cache/${v.videoId}/${path.basename(meta.thumbnailPath)}`;
+        }
       }
       if (meta.audioPath) {
-        meta.audioPath = `${v.videoId}/${v.videoId}.mp3`;
+        meta.audioPath = `/cache/${v.videoId}/${v.videoId}.mp3`;
       }
 
       playlist.push(meta);
@@ -1295,9 +1555,18 @@ async function harvestAndPurge() {
     }
 
     harvestStatus.activeItems = [];
+
+    // === DISTRIBUTE GRABBY ITEMS (after harvest, before auto-purge) ===
+    try {
+      await distributeGrabbyItems();
+    } catch (err: any) {
+      console.error(`🚨 [ShuffleBag] Error distributing grabby items:`, err.message);
+    }
+
+    // === AUTO-PURGE (skip grabby items) ===
     const cutoff = new Date(Date.now() - autoPurgeDays * 24 * 60 * 60 * 1000);
     const oldVideos: Video[] = await prisma.video.findMany({
-      where: { publishedAt: { lt: cutoff }, ignored: false, protected: false }
+      where: { publishedAt: { lt: cutoff }, ignored: false, protected: false, isGrabby: false }
     });
     
     for (const video of oldVideos) {
@@ -1494,9 +1763,15 @@ app.delete('/api/channels/:channelId', requireAuth, async (req, res) => {
   const channelId = req.params.channelId;
   console.log(`🗑️ Deleting channel: ${channelId}`);
 
+  // Protect the GrabbyTube placeholder channel from deletion
+  if (channelId === GRABBY_CHANNEL_ID) {
+    console.log(`🛡️ Refusing to delete GrabbyTube placeholder channel`);
+    return res.status(403).json({ error: 'Cannot delete GrabbyTube channel' });
+  }
+
   try {
     const videos = await prisma.video.findMany({
-      where: { channelId },
+      where: { channelId, isGrabby: false },
       select: { videoId: true }
     });
 
@@ -1515,9 +1790,9 @@ app.delete('/api/channels/:channelId', requireAuth, async (req, res) => {
     }
 
     const deletedVideos = await prisma.video.deleteMany({
-      where: { channelId }
+      where: { channelId, isGrabby: false }
     });
-    console.log(`   ✅ Deleted ${deletedVideos.count} video records`);
+    console.log(`   ✅ Deleted ${deletedVideos.count} video records (grabby items preserved)`);
 
     const currentVideoId = await getConfig('currentVideoId', '');
     if (currentVideoId && videoIds.includes(currentVideoId)) {
@@ -2102,11 +2377,11 @@ app.patch('/api/player/current', requireAuth, async (req, res) => {
 });
 
 app.post('/api/purge-all', requireAuth, async (req, res) => {
-  console.log(`🗑️ [PURGE-ALL] Starting purge of non-ignored videos only`);
+  console.log(`🗑️ [PURGE-ALL] Starting purge of non-ignored, non-grabby videos only`);
 
   if (fs.existsSync(CACHE_DIR)) {
     const nonIgnoredVideos = await prisma.video.findMany({
-      where: { ignored: false, protected: false },
+      where: { ignored: false, protected: false, isGrabby: false },
       select: { videoId: true }
     });
 
@@ -2124,10 +2399,10 @@ app.post('/api/purge-all', requireAuth, async (req, res) => {
   }
 
   const deletedCount = await prisma.video.deleteMany({
-    where: { ignored: false, protected: false }
+    where: { ignored: false, protected: false, isGrabby: false }
   });
   await updateIndexFile();
-  console.log(`✅ Purge complete — ${deletedCount.count} non-ignored videos removed`);
+  console.log(`✅ Purge complete — ${deletedCount.count} non-ignored videos removed (grabby items preserved)`);
   res.json({ success: true, deletedCount: deletedCount.count });
 });
 
@@ -2176,6 +2451,10 @@ app.get('/api/stream/:videoId', async (req, res) => {
 });
 
 // === START ===
+initShuffleBag().then(() => {
+  console.log(`🎵 [ShuffleBag] Startup init complete`);
+});
+
 cron.schedule('*/5 * * * *', harvestAndPurge);
 harvestAndPurge();
 
