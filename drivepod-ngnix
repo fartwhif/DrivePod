@@ -25,6 +25,7 @@ server {
             image/webp  webp;
             image/gif   gif;
             audio/mpeg  mp3;
+            application/json json;
         }
         default_type application/octet-stream;
     }
