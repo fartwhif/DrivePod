@@ -411,6 +411,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   /** Derive all playlist signals from rawIndex. */
   private derivePlaylists(): void {
+    this.queuePage = 0; // Reset on fresh index load to avoid stale page state
     const queue = this.getQueueVideos();
     this.updatePage(this.queuePage, queue, this.PAGE_SIZE, (page) => this.playlist.set(page));
 
@@ -432,8 +433,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   /** Load the next page of the queue playlist. */
   private loadMore(): void {
     if (this.isLoadingMore() || !this.hasMore()) return;
-    this.isLoadingMore.set(true);
     const queue = this.getQueueVideos();
+    if (queue.length === 0) return; // Guard: data not loaded yet (race with loadIndex)
+    this.isLoadingMore.set(true);
     this.queuePage++;
     this.updatePage(this.queuePage, queue, this.PAGE_SIZE, (page) => {
       this.playlist.update(current => [...current, ...page]);
