@@ -291,14 +291,13 @@ async function cleanupCorruptedFolders() {
     const jsonCount = files.filter(f => f === `${videoId}.json`).length;
     const otherCount = files.length - mp3Count - thumbCount - jsonCount;
 
-    let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 2 || otherCount > 0;
+    let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 2;
 
     if (isCorrupted) {
       let reason = isEmpty ? 'Empty folder' : 'Unknown';
       if (mp3Count !== 1) reason = mp3Count === 0 ? 'No .mp3 file' : 'Multiple .mp3 files';
       else if (jsonCount !== 1) reason = jsonCount === 0 ? 'No .json file' : 'Multiple .json files';
       else if (thumbCount > 2) reason = `Too many thumbnails (${thumbCount})`;
-      else if (otherCount > 0) reason = 'Unexpected files';
       console.log(`   🚨 CORRUPTED: ${videoId} → ${reason}`);
       try {
         fs.rmSync(folderPath, { recursive: true, force: true });
@@ -2010,61 +2009,7 @@ app.post('/api/channels/import', requireAuth, async (req, res) => {
   res.json({ success: true, results });
 });
 
-app.get('/api/playlist', requireAuth, async (req, res) => {
-  const take = Math.min(Math.max(parseInt(req.query.take as string) || 20, 10), 100);
-  const skip = parseInt(req.query.skip as string) || 0;
 
-  let videos = await prisma.video.findMany({
-    where: { watched: false, ignored: false },
-    orderBy: { publishedAt: 'desc' },
-    include: { channel: true },
-    take,
-    skip,
-  });
-
-  if (skip === 0) {
-    const currentVideoId = await getConfig('currentVideoId', '');
-    if (currentVideoId) {
-      if (!videos.some(v => v.videoId === currentVideoId)) {
-        const currentVideo = await prisma.video.findUnique({
-          where: {
-            videoId: currentVideoId,
-            watched: false,
-            ignored: false
-          },
-          include: { channel: true },
-        });
-
-        if (currentVideo) {
-          if (videos.length >= take) {
-            videos[videos.length - 1] = currentVideo;
-            console.log(`📌 Replaced oldest item in first page with current video ${currentVideoId}`);
-          } else {
-            videos.push(currentVideo);
-            console.log(`📌 Appended current video ${currentVideoId} to first page`);
-          }
-        }
-      }
-    }
-  }
-
-  res.json(videos);
-});
-
-app.get('/api/playlist/protected', requireAuth, async (req, res) => {
-  const take = Math.min(Math.max(parseInt(req.query.take as string) || 20, 10), 100);
-  const skip = parseInt(req.query.skip as string) || 0;
-
-  const videos = await prisma.video.findMany({
-    where: { protected: true, ignored: false },
-    orderBy: { publishedAt: 'desc' },
-    include: { channel: true },
-    take,
-    skip,
-  });
-
-  res.json(videos);
-});
 
 app.post('/api/channels/reorder', requireAuth, async (req, res) => {
   const { channelIds } = req.body as { channelIds: string[] };
@@ -2144,20 +2089,6 @@ app.patch('/api/video/:videoId/watched', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/playlist/watched', requireAuth, async (req, res) => {
-  const take = Math.min(Math.max(parseInt(req.query.take as string) || 50, 10), 100);
-  const skip = parseInt(req.query.skip as string) || 0;
-
-  const videos = await prisma.video.findMany({
-    where: { watched: true, ignored: false },
-    orderBy: { publishedAt: 'desc' },
-    include: { channel: true },
-    take,
-    skip,
-  });
-
-  res.json(videos);
-});
 
 app.get('/api/player/current', requireAuth, async (_, res) => {
   const videoId = await getConfig('currentVideoId', '');
