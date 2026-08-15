@@ -2345,6 +2345,7 @@ app.post('/api/video/:videoId/watched', requireAuth, async (req, res) => {
     if (result.count === 0) {
       console.warn(`⚠️ Mark watched skipped — video ${req.params.videoId} not found`);
     }
+    await updateIndexFile();
     res.json({ success: true });
   } catch (e: any) {
     console.error(`❌ Failed to mark watched:`, e.message);
@@ -2362,6 +2363,7 @@ app.patch('/api/video/:videoId/watched', requireAuth, async (req, res) => {
     if (result.count === 0) {
       console.warn(`⚠️ Toggle watched skipped — video ${req.params.videoId} not found`);
     }
+    await updateIndexFile();
     res.json({ success: true });
   } catch (e: any) {
     console.error(`❌ Failed to toggle watched:`, e.message);
