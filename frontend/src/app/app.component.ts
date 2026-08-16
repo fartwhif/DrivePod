@@ -214,6 +214,15 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     effect(() => {
       this.updateMediaSession(this.currentVideo());
     });
+    // Stop audio whenever player becomes visually hidden (currentVideo -> null)
+    effect(() => {
+      const video = this.currentVideo();
+      if (!video && this.audio.src) {
+        this.audio.pause();
+        this.audio.src = '';
+        this.setMediaPlaybackState('none');
+      }
+    });
   }
 
   ngOnInit() {
@@ -817,6 +826,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    * If the <Audio> element is stuck in a network error state, reload the track.
    */
   togglePlay() {
+    // If player is visually hidden (no current video), stop audio
+    if (!this.currentVideo()) {
+      this.audio.pause();
+      this.audio.src = '';
+      this.setMediaPlaybackState('none');
+      return;
+    }
     if (this.audio.paused) {
       const promise = this.audio.play();
       // play() returns a rejected Promise silently when the element is in a network error
@@ -911,6 +927,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     if (mode === 'off') {
       // Offline-safe: don't reload from server, just stop
+      this.currentVideo.set(null);
+      this.audio.pause();
+      this.audio.src = '';
+      this.setMediaPlaybackState('none');
       return;
     }
 
@@ -961,12 +981,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
      const idx = this.playlist().findIndex(v => v.videoId === this.currentVideo()?.videoId);
      if (idx < this.playlist().length - 1) {
+       // Stop current audio before probing next track (probe may fail offline)
+       this.audio.pause();
+       this.audio.src = '';
        this.playVideo(this.playlist()[idx + 1]);
      } else {
        this.currentVideo.set(null);
        this.updatePageTitle(null);
        this.saveCurrentVideo(null);
        this.resetQueuePage();
+       // Stop audio when player is visually hidden
+       this.audio.pause();
+       this.audio.src = '';
+       this.setMediaPlaybackState('none');
      }
    }
 
@@ -978,6 +1005,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const idx = playlist.findIndex(v => v.videoId === currentId);
 
     if (idx > 0) {
+      // Stop current audio before probing previous track (probe may fail offline)
+      this.audio.pause();
+      this.audio.src = '';
       this.playVideo(playlist[idx - 1]);
     } else {
       this.audio.currentTime = 0;
@@ -1226,6 +1256,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                       console.warn(`Track ${video.videoId} still failing -- stopping`);
                       this.currentVideo.set(null);
                       this.updatePageTitle(null);
+                      this.audio.pause();
+                      this.audio.src = '';
+                      this.setMediaPlaybackState('none');
                     }
                   })
                   .catch(() => {});
