@@ -48,19 +48,27 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 - **Dual RSS + yt-dlp Fallback** — Ultra-reliable video discovery (live RSS + scraping Videos/Streams/Shorts tabs)
 - **High-Quality Audio** — Downloads best audio → transcodes to MP3 with configurable bitrate (32–192 kbps) and optional mono
 - **Cookie Support** — Handles age-restricted, private, and member-only videos (upload your `cookies.txt`)
-- **Auto-Purge** — Automatically deletes content older than X days
+- **Auto-Purge** — Automatically deletes unprotected content older than X days
+- **Protected & Watched Tabs** — Protect tracks from purge; browse listening history
+- **Duration Filtering** — Filter content by minimum/maximum video length
+- **GrabbyTube ShuffleBag** — Mixes GrabbyTube music into the playlist at a configurable ratio during harvest
 - **Progress & Resume** — Saves listening progress and resumes exactly where you left off
 - **Data Throttling** — Optimized for low-bandwidth environments (56K modem friendly) with compression and caching
 - **Smart Autoplay** — 5-way autoplay modes: newest, newer, older, oldest, and off
+- **Offline Resilience** — Operation queue with exponential-backoff retry, always-on connectivity probe, and audio recovery after network loss
+- **Authentication** — JWT demo mode (default) or Auth0 production mode
 
 ### Frontend (Angular)
 - **Queue Tab** — Clean playlist with thumbnails, publish dates, and YouTube links
 - **Live Harvest Tab** — Real-time progress with concurrent channel tracking
-- **Settings Tab** — Bitrate, mono toggle, harvest window, User-Agent, auto-purge, and advanced options
-- **Import Tab** — Bulk import channel IDs
+- **Settings Tab** — Bitrate, mono toggle, harvest window, User-Agent, auto-purge, duration filter, and advanced options
+- **Import Tab** — Bulk import of channel IDs, channel URLs, or video URLs (mixed input)
+- **Protected Tab** — Browse and manage protected (purge-safe) tracks
+- **Watched Tab** — Review listening history
 - **Compact Bottom Player** — Always-visible mini-player with Media Session API (phone/car integration)
 - **Channel Reordering** — Drag-like priority controls (↑↑ ↑ ↓ ↓↓)
 - **Low Bandwidth Mode** — Option to disable thumbnails for slow connections
+- **Skip Marks Watched** — Optional: treat skip-next as finishing the track
 - **Responsive UI** — Works on both desktop and mobile devices with optimized layout
 
 ### Backend (Node.js)
@@ -71,6 +79,7 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 - **Media Session** — Play/pause/next from phone lockscreen or car controls
 - **Scalability** — Optimized for large playlists with batched database operations
 - **Consistency Checks** — Automated cleanup of DB inconsistencies and orphaned files
+- **Concurrency Locks** — Prevents harvest and import from running simultaneously
 
 ---
 
@@ -78,36 +87,51 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 
 | Layer       | Technology                          |
 |-------------|-------------------------------------|
-| **Frontend** | Angular 17+ (standalone component) + Tailwind |
+| **Frontend** | Angular 21 (standalone component) + Tailwind |
 | **Backend**  | Node.js + Express + TypeScript     |
 | **Database** | Prisma + SQLite                     |
-| **Download** | yt-dlp + ffmpeg                     |
+| **Download** | yt-dlp + ffmpeg + vbrfix           |
 | **Parsing**  | rss-parser                          |
+| **Auth**     | JWT (demo mode) or Auth0 (production) |
 | **UI**       | Modern dark theme, fully responsive with media session API |
-| **Deployment** | Docker + docker-compose support     |
+| **Deployment** | Single Docker container (nginx + Express inside) |
 
 ---
 
 ## 📦 Installation
 
-### Prerequisites
-- Node.js 18+
-- npm/yarn/pnpm
-- yt-dlp (`sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp`)
-- ffmpeg (`sudo apt install ffmpeg` or equivalent)
-- Angular CLI (`npm install -g @angular/cli`)
-- Nginx (for production)
-- Docker and docker-compose (for containerized deployment)
+### Docker (Recommended)
+
+```bash
+cd /path/to/drivepod
+cp .env.example .env  # Edit settings
+docker compose build && docker compose create --force-recreate && docker compose start
+```
+
+Open `http://localhost:24320` (or your configured port).
+
+### Bare-metal (Advanced)
+
+Requires: Node.js 20+, npm, yt-dlp, ffmpeg, nginx.
+
+```bash
+cd backend && npm ci && npx prisma generate && npx prisma db push
+cd frontend && npm ci && ng build --configuration production
+```
+
+See the Production Deployment section below for nginx and PM2 setup.
 
 ---
 
-## 🚀 Production Deployment
+## 🚀 Production Deployment (Bare-metal)
+
+> **Docker users skip this** — the `docker compose` setup above handles everything. This section is for running without Docker.
 
 ### 1. Prisma Database Initialization (One-time – Required for Production)
 Run these commands **once** after cloning the repo (or after any schema changes):
 
 ```bash
-cd /root/drivepod/backend
+cd backend
 npm install
 
 # === Prisma Database Setup ===
@@ -115,11 +139,11 @@ npx prisma generate      # Generates the Prisma Client
 npx prisma db push       # Creates/updates the SQLite database (data/database.db)
 ```
 
-> This step creates the SQLite database file at `/root/drivepod/data/database.db` and prepares the Prisma client for production use.
+> This step creates the SQLite database file at `data/database.db` and prepares the Prisma client for production use.
 
 ### 2. Backend with PM2 (24/7 operation)
 ```bash
-cd /root/drivepod/backend
+cd backend
 
 # Install ts-node (if not already installed)
 npm install ts-node
@@ -145,7 +169,7 @@ module.exports = {
 
 Start the backend:
 ```bash
-cd /root/drivepod/backend
+cd backend
 pm2 start ecosystem.config.js
 pm2 save
 pm2 startup                  # Follow the printed instructions for boot autostart
@@ -164,7 +188,7 @@ The project includes a ready-made Nginx config file **`drivepod-ngnix`** (locate
 
 1. Copy it to Nginx:
    ```bash
-   sudo cp /root/drivepod/drivepod-ngnix /etc/nginx/sites-available/drivepod-ngnix
+   sudo cp drivepod-ngnix /etc/nginx/sites-available/drivepod-ngnix
    ```
 
 2. Enable the site:
@@ -182,13 +206,12 @@ The project includes a ready-made Nginx config file **`drivepod-ngnix`** (locate
 **What this config does:**
 - Serves the Angular frontend from `/var/www/drivepod`
 - Proxies `/api/` requests to the backend running on port 3000
-- Serves `/cache/` (MP3s + thumbnails) directly from `/var/www/cache` with proper CORS headers
+- Serves `/cache/` (MP3s + thumbnails) directly from the cache directory with proper MIME types and CORS headers
 
 ### 4. Frontend Deployment
 Use the included **`deploy-frontend.sh`** script (in the repository root):
 
 ```bash
-cd /root/drivepod
 chmod +x deploy-frontend.sh
 ./deploy-frontend.sh
 ```
@@ -199,7 +222,7 @@ chmod +x deploy-frontend.sh
 - Sets correct permissions for Nginx (`www-data:www-data`)
 - Restarts Nginx
 
-After deployment, open **http://hostname-or-ip-address** (or your server’s IP).
+After deployment, open **http://hostname-or-ip-address** (or your server's IP).
 
 ---
 
@@ -227,8 +250,10 @@ All settings are stored in the database and editable in the **Settings** tab:
 - One-per-x-hours rate limiting
 - Duration filtering (min/max video length)
 - Alternative metadata scraping (Videos/Streams/Shorts tabs)
+- GrabbyTube ShuffleBag mix toggle and ratio
 - 5-way autoplay modes (newest, newer, older, oldest, off)
 - Low bandwidth mode (disables thumbnails)
+- Skip marks watched (treat skip-next as finishing the track)
 - Smart playlist loading and auto-refresh
 - Progress tracking and resume functionality
 
@@ -240,7 +265,6 @@ All settings are stored in the database and editable in the **Settings** tab:
 drivepod/
 ├── backend/
 │   ├── ... (Node.js boilerplate)
-│   ├── ecosystem.config.js     ← PM2 configuration
 │   ├── src/server.ts           ← Harvesting daemon and API server
 │   ├── prisma/schema.prisma    ← Database schema
 ├── frontend/
@@ -249,6 +273,7 @@ drivepod/
 ├── docker-compose.yml          ← Docker configuration
 ├── Dockerfile                  ← Docker build file
 ├── drivepod-ngnix              ← Nginx config (copy to /etc/nginx/sites-available/)
+├── .env.example                ← Environment template
 ├── screenshots/                ← Example screenshots for README.md
 ├── cache/                      ← Downloaded audio cache (automatically created)
 ├── data/                       ← Database and configuration data
@@ -262,22 +287,28 @@ drivepod/
 
 | Method | Endpoint                        | Description                     |
 |--------|----------------------------------|---------------------------------|
+| POST   | `/api/auth/login`               | Login (demo mode only)          |
+| GET    | `/api/auth/me`                  | Current user info               |
+| POST   | `/api/auth/refresh`             | Refresh token (demo mode only)  |
 | GET    | `/api/channels`                 | Monitored channels              |
 | POST   | `/api/channels`                 | Add channel                     |
-| POST   | `/api/channels/import`          | Bulk import                     |
+| POST   | `/api/channels/import`          | Bulk import (legacy alias)      |
 | POST   | `/api/channels/reorder`         | Update priority order           |
+| PATCH  | `/api/channels/:channelId/active` | Enable/disable channel        |
+| DELETE | `/api/channels/:channelId`      | Delete channel                  |
+| POST   | `/api/import`                   | Import channels/videos (mixed)  |
 | GET    | `/api/harvest-status`           | Live harvest progress           |
+| GET    | `/api/config`                   | Get settings                    |
 | POST   | `/api/config`                   | Save settings                   |
 | POST   | `/api/cookies`                  | Upload cookies.txt              |
 | GET    | `/api/stream/:videoId`          | Stream MP3                      |
-| POST   | `/api/purge-all`                | Delete all cached data          |
-| DELETE | `/api/channels/:channelId`      | Delete channel                  |
+| POST   | `/api/purge-all`                | Delete all non-protected content|
 | GET    | `/api/player/current`           | Get current playing video       |
 | PATCH  | `/api/player/current`           | Set current playing video       |
 | PATCH  | `/api/video/:videoId/progress`  | Update video progress           |
-| GET    | `/api/video/:videoId/progress`  | Get video progress              |
 | POST   | `/api/video/:videoId/watched`   | Mark video as watched           |
-| GET    | `/api/stats`                    | System statistics               |
+| PATCH  | `/api/video/:videoId/watched`   | Toggle watched state            |
+| PATCH  | `/api/video/:videoId/protect`   | Toggle protected state          |
 
 ---
 
@@ -312,18 +343,20 @@ drivepod/
 - [ ] **Accessibility** - Improved screen reader and keyboard navigation support
 
 ### Completed Features
-- [x] Offline play
-- [x] unhardcode /root
-- [x] Mobile PWA support
+- [x] Offline playback resilience
 - [x] Docker + docker-compose
-- [x] WebSocket live updates
 - [x] 56K modem optimization
 - [x] Enhanced metadata handling
-- [x] fallback content discovery method
+- [x] Fallback content discovery method
 - [x] Auto-purge optimization
 - [x] Progress bar improvements
 - [x] Responsive UI design
 - [x] Audio session API integration
+- [x] Authentication (JWT demo + Auth0)
+- [x] GrabbyTube ShuffleBag
+- [x] Duration filtering
+- [x] Protected & Watched tabs
+- [x] Network recovery with exponential backoff
 
 ## 📈 Project Evolution
 
