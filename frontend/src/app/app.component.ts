@@ -42,6 +42,7 @@ interface Config {
   maxDurationMinutes: number;
   // NEW: GrabbyTube shufflebag mix
   grabbyMixEnabled: boolean;
+  grabbyMixRatio: number;
 }
 
 interface ImportResult {
@@ -115,6 +116,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   // NEW: GrabbyTube shufflebag mix toggle
   grabbyMixEnabled = signal(true);
+  grabbyMixRatio = signal(3);
 
   // 56K MODEM OPTIMIZATIONS
    lowBandwidthMode = signal(false);
@@ -260,6 +262,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
         // NEW: Load GrabbyTube shufflebag mix
         this.grabbyMixEnabled.set(config.grabbyMixEnabled ?? true);
+        this.grabbyMixRatio.set(config.grabbyMixRatio ?? 3);
 
         const savedId = this.currentVideoId();
         let autoPlay: boolean = !!savedId || targetMode !== 'off';
@@ -1053,7 +1056,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       minDurationMinutes: this.minDurationMinutes(),
       maxDurationMinutes: this.maxDurationMinutes(),
       // NEW GrabbyTube shufflebag mix
-      grabbyMixEnabled: this.grabbyMixEnabled()
+      grabbyMixEnabled: this.grabbyMixEnabled(),
+      grabbyMixRatio: this.grabbyMixRatio()
     }).subscribe();
   }
 
@@ -1071,6 +1075,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   onBitrateChange() { this.saveConfig(); }
   onMonoChange() { this.saveConfig(); }
+  setGrabbyRatio(val: number) { this.grabbyMixRatio.set(Math.min(20, Math.max(1, val))); this.saveConfig(); }
 
   startEditing(channelId: string, currentTitle: string) {
     this.editingChannelId.set(channelId);
