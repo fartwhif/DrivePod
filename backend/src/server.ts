@@ -1662,6 +1662,10 @@ app.get('/api/config', requireAuth, async (_, res) => {
   const minDurationMinutes = await getConfig('minDurationMinutes', '0');
   const maxDurationMinutes = await getConfig('maxDurationMinutes', '720');
 
+  // NEW: GrabbyTube shufflebag mix
+  const grabbyMixEnabled = await getConfig('grabbyMixEnabled', 'true');
+  const grabbyMixRatio = await getConfig('grabbyMixRatio', '3');
+
   res.json({
     maxHarvestDays: parseInt(maxHarvestDays),
     preferredBitrate: parseInt(preferredBitrate),
@@ -1680,7 +1684,10 @@ app.get('/api/config', requireAuth, async (_, res) => {
     // NEW duration filter fields
     durationFilterEnabled: durationFilterEnabled === 'true',
     minDurationMinutes: parseInt(minDurationMinutes),
-    maxDurationMinutes: parseInt(maxDurationMinutes)
+    maxDurationMinutes: parseInt(maxDurationMinutes),
+    // NEW GrabbyTube shufflebag mix
+    grabbyMixEnabled: grabbyMixEnabled === 'true',
+    grabbyMixRatio: parseInt(grabbyMixRatio)
   });
 });
 
@@ -1689,7 +1696,9 @@ app.post('/api/config', requireAuth, async (req, res) => {
     limitEnabled, limitVideos, limitHours,
     alternativeMetadataEnabled, scrapeVideosTab, scrapeStreamsTab, scrapeShortsTab,
     // NEW duration filter
-    durationFilterEnabled, minDurationMinutes, maxDurationMinutes } = req.body;
+    durationFilterEnabled, minDurationMinutes, maxDurationMinutes,
+    // NEW GrabbyTube shufflebag mix
+    grabbyMixEnabled, grabbyMixRatio } = req.body;
 
   if (maxHarvestDays !== undefined) await setConfig('maxHarvestDays', String(maxHarvestDays));
   if (preferredBitrate !== undefined) await setConfig('preferredBitrate', String(preferredBitrate));
@@ -1711,6 +1720,10 @@ app.post('/api/config', requireAuth, async (req, res) => {
   if (durationFilterEnabled !== undefined) await setConfig('durationFilterEnabled', String(durationFilterEnabled));
   if (minDurationMinutes !== undefined) await setConfig('minDurationMinutes', String(minDurationMinutes));
   if (maxDurationMinutes !== undefined) await setConfig('maxDurationMinutes', String(maxDurationMinutes));
+
+  // NEW GrabbyTube shufflebag mix config
+  if (grabbyMixEnabled !== undefined) await setConfig('grabbyMixEnabled', String(grabbyMixEnabled));
+  if (grabbyMixRatio !== undefined) await setConfig('grabbyMixRatio', String(grabbyMixRatio));
 
   res.json({ success: true });
 });
