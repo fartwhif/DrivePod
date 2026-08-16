@@ -2329,6 +2329,7 @@ app.patch('/api/video/:videoId/progress', requireAuth, async (req, res) => {
     }
 
     await setConfig('currentVideoId', videoId);
+    await updateIndexFile();
     res.json({ success: true });
   } catch (e: any) {
     console.error(`❌ Failed to save progress for ${videoId}:`, e.message);

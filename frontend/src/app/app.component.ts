@@ -188,6 +188,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private backendOnline = true;
   private indexFetchPending = false;
 
+  // Playback retry state (HEAD probe before play)
+  private _playRetryTimer: any = null;
+  private _playRetryCount = 0;
+  private readonly BASE_PLAY_RETRY_DELAY = 3000;
+  private readonly MAX_PLAY_RETRY_DELAY = 30000;
+  private readonly PLAY_RETRY_MULTIPLIER = 1.5;
+
+  // Always-on connectivity probe for playback recovery
+  private alwaysOnProbeTimer: any = null;
+  private readonly ALWAYS_ON_PROBE_INTERVAL = 5000;
+  private _consecutiveProbeFails = 0;
+  private initialAutoplayAttempted = false;
+
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
   private lastPositionUpdate = 0;
   private readonly POSITION_UPDATE_INTERVAL = 1800;
@@ -264,21 +277,16 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.grabbyMixEnabled.set(config.grabbyMixEnabled ?? true);
         this.grabbyMixRatio.set(config.grabbyMixRatio ?? 3);
 
-        const savedId = this.currentVideoId();
-        let autoPlay: boolean = !!savedId || targetMode !== 'off';
-
-        // Derive initial playlists from index
-        this.derivePlaylists();
-        if (autoPlay && !this.currentVideo()) {
-          const queue = this.getQueueVideos();
-          if (queue.length > 0) {
-            this.initializeCurrentVideo(queue);
-          }
+        // Derive initial playlists from index if already loaded
+        if (this.rawIndex().length > 0) {
+          this.derivePlaylists();
         }
       },
       error: () => {
-        // Config failed — still derive playlists from index
-        this.derivePlaylists();
+        // Config failed — still derive playlists from index if loaded
+        if (this.rawIndex().length > 0) {
+          this.derivePlaylists();
+        }
       }
     });
 
@@ -307,6 +315,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     // Poll index.json every 2 minutes for new content
     this.playlistRefreshInterval = setInterval(() => this.loadIndex(), 120000);
+
+    // Always-on connectivity probe for playback recovery
+    this.startAlwaysOnProbe();
   }
 
   ngAfterViewInit() {
@@ -332,6 +343,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (this.tokenRefreshInterval) clearInterval(this.tokenRefreshInterval);
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.connectivityProbeTimer) clearInterval(this.connectivityProbeTimer);
+    this.connectivityProbeTimer = null;
+    this._stopAlwaysOnProbe();
+    this._clearPlayRetry();
     this.pendingVideoOps = [];
 
     // Remove event listeners
@@ -402,6 +416,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
         this.rawIndex.set(merged);
         this.derivePlaylists();
+
+        // Trigger autoplay on first successful index load
+        if (!this.initialAutoplayAttempted) {
+          this.initialAutoplayAttempted = true;
+          this._attemptInitialAutoplay();
+        }
       })
       .catch(err => {
         this.backendOnline = false;
@@ -575,6 +595,56 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }, this.PROBE_INTERVAL);
   }
 
+  /** Always-on connectivity probe for playback recovery (runs every 5s). */
+  private startAlwaysOnProbe(): void {
+    if (this.alwaysOnProbeTimer) return;
+    this.alwaysOnProbeTimer = setInterval(() => {
+      this._doConnectivityProbe();
+    }, this.ALWAYS_ON_PROBE_INTERVAL);
+  }
+
+  private _stopAlwaysOnProbe(): void {
+    if (this.alwaysOnProbeTimer) {
+      clearInterval(this.alwaysOnProbeTimer);
+      this.alwaysOnProbeTimer = null;
+    }
+  }
+
+  /** Lightweight HEAD probe to check if backend is reachable. */
+  private _doConnectivityProbe(): void {
+    const probeToken = localStorage.getItem('drivepod_token');
+    const probeHeaders: Record<string, string> = {};
+    if (probeToken) probeHeaders['Authorization'] = `Bearer ${probeToken}`;
+    fetch(`${this.apiUrl}/config`, { method: 'HEAD', headers: probeHeaders })
+      .then(res => {
+        if (res.ok || res.status === 401) {
+          if (this._consecutiveProbeFails > 0) {
+            console.log(`Backend reachable again after ${this._consecutiveProbeFails} failures`);
+            this._consecutiveProbeFails = 0;
+            this._resumePlaybackRetry();
+            this.recoverAudioPlayback();
+          }
+          if (this.pendingVideoOps.length > 0) {
+            this.retryAttempts = 0;
+            this.flushPendingOps();
+          }
+          if (this.indexFetchPending) {
+            this.backendOnline = true;
+            this.indexFetchPending = false;
+            this.loadIndex();
+          }
+        } else {
+          this._consecutiveProbeFails++;
+        }
+      })
+      .catch(() => {
+        this._consecutiveProbeFails++;
+        if (this._consecutiveProbeFails === 3) {
+          console.warn('Backend unreachable (3 consecutive probe failures)');
+        }
+      });
+  }
+
   private stopConnectivityProbe(): void {
     if (this.connectivityProbeTimer) {
       clearInterval(this.connectivityProbeTimer);
@@ -597,8 +667,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         if (res.ok) {
           console.log('Connection restored via probe -- flushing pending operations');
           this.retryAttempts = 0;
+          this._consecutiveProbeFails = 0;
           this.flushPendingOps();
           // Restore audio if it was interrupted
+          this._resumePlaybackRetry();
           this.recoverAudioPlayback();
           // Flush deferred index fetch
           if (this.indexFetchPending) {
@@ -662,8 +734,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     };
 
     this.audio.onerror = () => {
-      console.warn('Audio playback error -- track may have failed to load');
-      this.setMediaPlaybackState('none');
+      const video = this.currentVideo();
+      if (video) {
+        console.warn('Audio playback error for', video.videoId, '-- probing');
+        this._handleAudioError(video.videoId);
+      } else {
+        console.warn('Audio playback error (no current video)');
+        this.setMediaPlaybackState('none');
+      }
     };
 
     this.audio.onseeked = () => {
@@ -759,9 +837,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   playVideo(video: Video) {
-    this.loadAndSeekVideo(video);
-    this.audio.play().catch(() => {});
-    this.saveCurrentVideo(video.videoId);
+    this._tryPlay(video);
   }
 
   private loadAndSeekVideo(video: Video) {
@@ -812,10 +888,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const finishedVideoId = finishedVideo.videoId;
     const finishedPublishedAt = new Date(finishedVideo.publishedAt).getTime();
 
-    this.saveCurrentVideo(null);
-
     // Immediately update UI state -- do NOT wait for the network call
-    this.currentVideo.set(null);
+    // (clear currentVideo AFTER we know the next track, see below)
     this.updatePageTitle(null);
 
     // Remove finished video from playlist locally
@@ -844,11 +918,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       // Try to play from local cache first, fall back to server reload
       const localCandidate = this.playlist().length > 0 ? this.playlist()[0] : null;
       if (localCandidate) {
+        this.currentVideo.set(null);
         this.playVideo(localCandidate);
         return;
       }
-      // No local cache -- try reloading index, but don't block if offline
-      this.loadIndex();
+      // No local cache -- reload index and play when ready
+      this.currentVideo.set(null);
+      this._loadIndexAndPlay();
       return;
     }
 
@@ -865,12 +941,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     if (candidate) {
+      this.currentVideo.set(null);
       this.playVideo(candidate);
       return;
     }
 
-    // No local candidates — reload index in case new content arrived
-    this.loadIndex();
+    // No local candidates — reload index and play when ready
+    this.currentVideo.set(null);
+    this._loadIndexAndPlay();
   }
 
   skipNext() {
@@ -996,6 +1074,318 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       navigator.mediaSession.playbackState = state;
     } catch (e) {}
   }
+
+
+  // === Initial autoplay on page load ===
+
+  /**
+   * Attempt autoplay on page load. Handles browser autoplay policy gracefully.
+   * Audio is loaded and ready; play() may be blocked until user gesture.
+   */
+  private _attemptInitialAutoplay(): void {
+    const mode = this.autoplayMode();
+    if (mode === 'off') return;
+
+    const queue = this.getQueueVideos();
+    if (queue.length === 0) return;
+
+    let video: Video;
+    const savedId = this.currentVideoId();
+
+    if (savedId) {
+      video = queue.find(v => v.videoId === savedId) || queue[0];
+    } else if (mode === 'oldest') {
+      video = queue[queue.length - 1];
+    } else {
+      video = queue[0];
+    }
+
+    // Set up the video in the audio element
+    this.currentVideo.set(video);
+    this.updatePageTitle(video);
+    this.saveCurrentVideo(video.videoId);
+
+    const monoStr = this.preferredMono() ? '-mono' : '';
+    const token = localStorage.getItem('drivepod_token');
+    const tokenParam = token ? `&token=${token}` : '';
+    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}${tokenParam}`;
+
+    const targetProgress = video.progress || 0;
+    this.audio.onloadedmetadata = () => {
+      if (targetProgress > 0 && targetProgress < (this.audio.duration || Infinity) * 0.98) {
+        this.audio.currentTime = targetProgress;
+      }
+      this.updateMediaPositionState();
+      this.setMediaPlaybackState('playing');
+      this.audio.onloadedmetadata = null;
+    };
+    this.audio.load();
+
+    // Attempt play — may be blocked by autoplay policy, which is fine
+    const playPromise = this.audio.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(err => {
+        console.log('Autoplay blocked by browser policy — ready for user gesture', err.name);
+        this.setMediaPlaybackState('paused');
+      });
+    }
+  }
+
+  // === Playback retry: HEAD probe before play ===
+
+  /**
+   * Probe the track before loading. If defunct (404), skip immediately.
+   * If unreachable, enter indefinite retry loop. If OK, load and play.
+   */
+  private _tryPlay(video: Video): void {
+    this._clearPlayRetry();
+    const token = localStorage.getItem('drivepod_token');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
+      .then(res => {
+        if (res.ok) {
+          this._loadAndPlay(video);
+        } else if (res.status === 404) {
+          console.warn(`Track ${video.videoId} is defunct (404) -- skipping`);
+          this._skipDefunctTrack(video.videoId);
+        } else {
+          this._probeAndPlay(video);
+        }
+      })
+      .catch(() => {
+        this._probeAndPlay(video);
+      });
+  }
+
+  /** Indefinite retry loop with exponential backoff. */
+  private _probeAndPlay(video: Video): void {
+    const token = localStorage.getItem('drivepod_token');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const delay = Math.min(
+      this.BASE_PLAY_RETRY_DELAY * Math.pow(this.PLAY_RETRY_MULTIPLIER, this._playRetryCount),
+      this.MAX_PLAY_RETRY_DELAY
+    );
+
+    this._playRetryTimer = setTimeout(() => {
+      this._playRetryCount++;
+      console.log(`Playback retry #${this._playRetryCount} for ${video.videoId} (delay ${delay}ms)`);
+
+      fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
+        .then(res => {
+          if (res.ok) {
+            this._clearPlayRetry();
+            this._loadAndPlay(video);
+          } else if (res.status === 404) {
+            this._clearPlayRetry();
+            console.warn(`Track ${video.videoId} is defunct (404) -- skipping`);
+            this._skipDefunctTrack(video.videoId);
+          } else {
+            this._probeAndPlay(video);
+          }
+        })
+        .catch(() => {
+          this._probeAndPlay(video);
+        });
+    }, delay);
+  }
+
+  /** Load the audio element and attempt to play. */
+  private _loadAndPlay(video: Video): void {
+    this.loadAndSeekVideo(video);
+    this.saveCurrentVideo(video.videoId);
+
+    const playPromise = this.audio.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(err => {
+        if (err.name === 'NotAllowedError') {
+          console.log('Play blocked by autoplay policy for', video.videoId);
+          this.setMediaPlaybackState('paused');
+          return;
+        }
+        // Real error -- probe to decide
+        const token = localStorage.getItem('drivepod_token');
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+
+        fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
+          .then(res => {
+            if (res.status === 404) {
+              console.warn(`Track ${video.videoId} defunct after play reject -- skipping`);
+              this._skipDefunctTrack(video.videoId);
+            } else {
+              console.log(`Play rejected for ${video.videoId} -- reloading audio`);
+              this.loadAndSeekVideo(video);
+              this.audio.play().catch(() => {
+                fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
+                  .then(res2 => {
+                    if (res2.status === 404 || res2.status >= 500) {
+                      console.warn(`Track ${video.videoId} still failing -- stopping`);
+                      this.currentVideo.set(null);
+                      this.updatePageTitle(null);
+                    }
+                  })
+                  .catch(() => {});
+              });
+            }
+          })
+          .catch(() => {});
+      });
+    }
+  }
+
+  /** Called from audio.onerror. Probe to decide: skip (defunct) or retry (transient). */
+  private _handleAudioError(videoId: string): void {
+    if (this.currentVideo()?.videoId !== videoId) return;
+
+    const token = localStorage.getItem('drivepod_token');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    fetch(`/api/stream/${videoId}`, { method: 'HEAD', headers })
+      .then(res => {
+        if (res.status === 404) {
+          console.warn(`Audio error: track ${videoId} is defunct -- skipping`);
+          this._skipDefunctTrack(videoId);
+        } else if (res.ok) {
+          const video = this.currentVideo();
+          if (video) {
+            console.log(`Audio error: reloading ${videoId}`);
+            this.loadAndSeekVideo(video);
+            this.audio.play().catch(() => {});
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
+  /** Skip a defunct track: mark watched locally, remove from playlist, advance. */
+  private _skipDefunctTrack(videoId: string): void {
+    const finishedVideo = this.currentVideo();
+    if (!finishedVideo || finishedVideo.videoId !== videoId) return;
+
+    this.currentVideo.set(null);
+    this.updatePageTitle(null);
+    this.playlist.update(current => current.filter(v => v.videoId !== videoId));
+
+    this.queueOperation({ videoId, type: 'watched' });
+    this.http.post(`${this.apiUrl}/video/${videoId}/watched`, {})
+      .subscribe({ error: () => {} });
+
+    const mode = this.autoplayMode();
+    if (mode !== 'off') {
+      this.advanceToNextTrack();
+    }
+  }
+
+  /** Clear playback retry timer and reset counter. */
+  private _clearPlayRetry(): void {
+    if (this._playRetryTimer) {
+      clearTimeout(this._playRetryTimer);
+      this._playRetryTimer = null;
+    }
+    this._playRetryCount = 0;
+  }
+
+  /** Immediately fire a pending playback retry. */
+  private _resumePlaybackRetry(): void {
+    if (this._playRetryTimer) {
+      clearTimeout(this._playRetryTimer);
+      this._playRetryTimer = null;
+      const video = this.currentVideo();
+      if (video) {
+        console.log('Connectivity restored -- immediate playback retry for', video.videoId);
+        this._tryPlay(video);
+      }
+    }
+  }
+
+  /** Reload index and automatically play the first available track when ready. */
+  private _loadIndexAndPlay(): void {
+    if (!this.backendOnline) {
+      this.indexFetchPending = true;
+      return;
+    }
+
+    const token = localStorage.getItem('drivepod_token');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    fetch(`/cache/index.json?_t=${Date.now()}`, { headers, cache: 'no-store' })
+      .then(res => {
+        if (!res.ok) throw new Error(`index.json ${res.status}`);
+        return res.json();
+      })
+      .then((data: Video[]) => {
+        this.backendOnline = true;
+        this.indexFetchPending = false;
+
+        const oldQueue = this.playlist();
+        const oldProtected = this.protectedPlaylist();
+        const oldWatched = this.watchedPlaylist();
+        const oldMap = new Map<string, Partial<Video>>();
+        for (const v of [...oldQueue, ...oldProtected, ...oldWatched]) {
+          oldMap.set(v.videoId, { progress: v.progress, watched: v.watched });
+        }
+        const merged = data.map(v => {
+          const local = oldMap.get(v.videoId);
+          if (local) {
+            return { ...v, progress: local.progress ?? v.progress, watched: local.watched ?? v.watched };
+          }
+          return v;
+        });
+
+        this.rawIndex.set(merged);
+        this.derivePlaylists();
+
+        const mode = this.autoplayMode();
+        if (mode !== 'off') {
+          const queue = this.getQueueVideos();
+          if (queue.length > 0) {
+            if (mode === 'oldest') {
+              this.playVideo(queue[queue.length - 1]);
+            } else {
+              this.playVideo(queue[0]);
+            }
+          }
+        }
+      })
+      .catch(err => {
+        this.backendOnline = false;
+        this.indexFetchPending = true;
+        console.error('Failed to load index for autoplay', err);
+      });
+  }
+
+  /** Advance to next track based on autoplay mode. */
+  private advanceToNextTrack(): void {
+    const mode = this.autoplayMode();
+    if (mode === 'off') return;
+
+    if (mode === 'newest') {
+      const localCandidate = this.playlist().length > 0 ? this.playlist()[0] : null;
+      if (localCandidate) {
+        this.playVideo(localCandidate);
+        return;
+      }
+      this._loadIndexAndPlay();
+      return;
+    }
+
+    const queue = this.getQueueVideos();
+    if (queue.length > 0) {
+      if (mode === 'oldest') {
+        this.playVideo(queue[queue.length - 1]);
+      } else {
+        this.playVideo(queue[0]);
+      }
+    } else {
+      this._loadIndexAndPlay();
+    }
+}
 
   setTab(tab: 'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched') {
     this.activeTab.set(tab);
