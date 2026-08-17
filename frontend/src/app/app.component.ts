@@ -3,8 +3,6 @@ import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Title } from '@angular/platform-browser';
-import { Router } from '@angular/router';
-import { AuthService } from './services/auth.service';
 
 interface Video {
   id: string;
@@ -82,8 +80,6 @@ interface HarvestStatus {
 })
 export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   apiUrl = '/api';
-  router = inject(Router);
-  authService!: AuthService;
   channels = signal<any[]>([]);
   playlist = signal<Video[]>([]);
   currentVideo = signal<Video | null>(null);
@@ -171,7 +167,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private saveDebounceTimer: any = null;
   private harvestPollInterval: any = null;
   private playlistRefreshInterval: any = null;
-  private tokenRefreshInterval: any = null;
 
   // Network resilience: operation queue with exponential-backoff retry
   private pendingVideoOps: Array<{ videoId: string; type: 'watched' | 'progress'; payload?: any }> = [];
@@ -210,7 +205,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     private titleService: Title,
     private zone: NgZone
   ) {
-    this.authService = inject(AuthService);
     effect(() => {
       this.updateMediaSession(this.currentVideo());
     });
@@ -308,19 +302,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.setupProgressListeners();
     this.setupMediaSessionHandlers();
 
-    // Refresh auth token silently on load
-    this.authService.refreshToken().subscribe({
-      next: (resp) => this.authService.saveAuth(resp.token, resp.user),
-      error: () => {}
-    });
-
-    // Auto-refresh token every 24 hours
-    this.tokenRefreshInterval = setInterval(() => {
-      this.authService.refreshToken().subscribe({
-        next: (resp) => this.authService.saveAuth(resp.token, resp.user),
-        error: () => {}
-      });
-    }, 24 * 60 * 60 * 1000);
 
     // Poll index.json every 2 minutes for new content
     this.playlistRefreshInterval = setInterval(() => this.loadIndex(), 120000);
@@ -349,7 +330,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.stopHarvestPolling();
     if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
     if (this.playlistRefreshInterval) clearInterval(this.playlistRefreshInterval);
-    if (this.tokenRefreshInterval) clearInterval(this.tokenRefreshInterval);
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.connectivityProbeTimer) clearInterval(this.connectivityProbeTimer);
     this.connectivityProbeTimer = null;
@@ -391,9 +371,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    const token = localStorage.getItem('drivepod_token');
     const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
     // Cache-bust: timestamp query param + no-store prevents browser from serving stale cached index
     const url = `/cache/index.json?_t=${Date.now()}`;
     fetch(url, { headers, cache: 'no-store' })
@@ -621,9 +599,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   /** Lightweight HEAD probe to check if backend is reachable. */
   private _doConnectivityProbe(): void {
-    const probeToken = localStorage.getItem('drivepod_token');
     const probeHeaders: Record<string, string> = {};
-    if (probeToken) probeHeaders['Authorization'] = `Bearer ${probeToken}`;
     fetch(`${this.apiUrl}/config`, { method: 'HEAD', headers: probeHeaders })
       .then(res => {
         if (res.ok || res.status === 401) {
@@ -668,9 +644,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     // Use fetch for a lightweight HEAD request -- include token so it doesn't 401
-    const probeToken = localStorage.getItem('drivepod_token');
     const probeHeaders: Record<string, string> = {};
-    if (probeToken) probeHeaders['Authorization'] = `Bearer ${probeToken}`;
     fetch(`${this.apiUrl}/config`, { method: 'HEAD', headers: probeHeaders })
       .then(res => {
         if (res.ok) {
@@ -861,9 +835,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.updatePageTitle(video);
 
     const monoStr = this.preferredMono() ? '-mono' : '';
-    const token = localStorage.getItem('drivepod_token');
-    const tokenParam = token ? `&token=${token}` : '';
-    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}${tokenParam}`;
+    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
 
     const targetProgress = video.progress || 0;
 
@@ -1136,9 +1108,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.saveCurrentVideo(video.videoId);
 
     const monoStr = this.preferredMono() ? '-mono' : '';
-    const token = localStorage.getItem('drivepod_token');
-    const tokenParam = token ? `&token=${token}` : '';
-    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}${tokenParam}`;
+    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
 
     const targetProgress = video.progress || 0;
     this.audio.onloadedmetadata = () => {
@@ -1169,9 +1139,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    */
   private _tryPlay(video: Video): void {
     this._clearPlayRetry();
-    const token = localStorage.getItem('drivepod_token');
     const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
 
     fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
       .then(res => {
@@ -1191,9 +1159,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   /** Indefinite retry loop with exponential backoff. */
   private _probeAndPlay(video: Video): void {
-    const token = localStorage.getItem('drivepod_token');
     const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
 
     const delay = Math.min(
       this.BASE_PLAY_RETRY_DELAY * Math.pow(this.PLAY_RETRY_MULTIPLIER, this._playRetryCount),
@@ -1237,9 +1203,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           return;
         }
         // Real error -- probe to decide
-        const token = localStorage.getItem('drivepod_token');
         const headers: Record<string, string> = {};
-        if (token) headers['Authorization'] = `Bearer ${token}`;
 
         fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
           .then(res => {
@@ -1274,9 +1238,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private _handleAudioError(videoId: string): void {
     if (this.currentVideo()?.videoId !== videoId) return;
 
-    const token = localStorage.getItem('drivepod_token');
     const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
 
     fetch(`/api/stream/${videoId}`, { method: 'HEAD', headers })
       .then(res => {
@@ -1343,9 +1305,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    const token = localStorage.getItem('drivepod_token');
     const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
 
     fetch(`/cache/index.json?_t=${Date.now()}`, { headers, cache: 'no-store' })
       .then(res => {
@@ -1608,18 +1568,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     });
   }
 
-  logout() {
-    // Save progress before stopping
-    if (this.currentVideo()) {
-      this.saveProgress(this.audio.currentTime);
-    }
-    // Stop audio and cleanup before navigating
-    this.cleanup();
-    this.zone.runOutsideAngular(() => {
-      this.authService.logout();
-      this.router.navigate(['/login']);
-    });
-  }
 
   addChannel(channelId: string, title: string) {
     this.http.post(`${this.apiUrl}/channels`, { channelId, title }).subscribe(() => this.loadChannels());
