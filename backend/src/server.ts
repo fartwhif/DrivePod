@@ -902,7 +902,11 @@ async function getBaseYtDlpCommand(): Promise<string> {
   }
 
   const cmd = `yt-dlp --no-progress ` +
-    `--js-runtimes node --remote-components ejs:github ` +
+    `--remote-components ejs:github ` +
+    `--extractor-args youtube:player_client=mweb ` +
+    `--extractor-args youtubepot-bgutilhttp:base_url=http://drivepod-bgutil:4416 ` +
+    `--min-sleep-interval 5 ` +
+    `--max-sleep-interval 15 ` +
     `--user-agent "${userAgent}" ` +
     cookieFlag;
 
@@ -933,7 +937,6 @@ async function downloadAndProcessVideo(
     const downloadCmd = (await getBaseYtDlpCommand()) +
       `-f bestaudio/best --write-thumbnail --no-overwrites --continue ` +
       `--match-filter "live_status != is_live & live_status != is_upcoming" ` +
-      `--js-runtimes node --remote-components ejs:github ` +
       `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`;
 
     await safeExec(downloadCmd, `yt-dlp download ${videoId}`);
@@ -1816,7 +1819,8 @@ async function resolveChannelHandle(handle: string): Promise<string | null> {
 
   // Strategy 1: probe the channel page for channel_id / uploader_url
   try {
-    const cmd = `yt-dlp --skip-download --dump-json --no-progress "${url}" 2>/dev/null | head -1`;
+    const base = await getBaseYtDlpCommand();
+    const cmd = `${base} --skip-download --dump-json "${url}" 2>/dev/null | head -1`;
     const { stdout } = await safeExec(cmd, `resolve handle ${normalized}`);
     const info = JSON.parse(stdout);
 
@@ -1833,7 +1837,8 @@ async function resolveChannelHandle(handle: string): Promise<string | null> {
   // Strategy 2: list channel videos and grab channel_id from the first video
   try {
     const playlistUrl = `https://www.youtube.com/${normalized}/videos`;
-    const cmd = `yt-dlp --flat-playlist --dump-json --no-progress "${playlistUrl}" 2>/dev/null | head -1`;
+    const base2 = await getBaseYtDlpCommand();
+    const cmd = `${base2} --flat-playlist --dump-json "${playlistUrl}" 2>/dev/null | head -1`;
     const { stdout } = await safeExec(cmd, `resolve handle via playlist ${normalized}`);
     const videoInfo = JSON.parse(stdout);
     const extracted = extractChannelId(videoInfo);
@@ -1881,7 +1886,8 @@ function extractChannelId(info: any): string | null {
 // Returns { channelId (UC...), channelTitle, videoTitle } or null.
 async function getChannelFromVideo(videoId: string): Promise<{ channelId: string; channelTitle: string; videoTitle: string } | null> {
   try {
-    const cmd = `yt-dlp --skip-download --dump-json --no-progress "https://www.youtube.com/watch?v=${videoId}" 2>/dev/null`;
+    const base = await getBaseYtDlpCommand();
+    const cmd = `${base} --skip-download --dump-json "https://www.youtube.com/watch?v=${videoId}" 2>/dev/null`;
     const { stdout } = await safeExec(cmd, `get channel for video ${videoId}`);
     const trimmed = stdout.trim();
 

@@ -10,18 +10,30 @@ RUN npm run build --configuration=production
 FROM node:20-bookworm-slim AS runtime
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    python3-venv \
     ffmpeg \
     vbrfix \
     curl \
     nginx \
     wireguard \
     iproute2 \
+    procps \
+    iptables \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install latest yt-dlp
+# Install latest yt-dlp + bgutil PO Token provider + Deno (for JS challenge solving)
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp
+    && chmod a+rx /usr/local/bin/yt-dlp \
+    && pip3 install --break-system-packages bgutil-ytdlp-pot-provider 2>/dev/null || pip3 install bgutil-ytdlp-pot-provider \
+    && curl -fsSL https://deno.land/install.sh | sh \
+    && mv /root/.deno/bin/deno /usr/local/bin/deno \
+    && chmod +x /usr/local/bin/deno \
+    && rm -rf /root/.deno
 
 WORKDIR /app
 
