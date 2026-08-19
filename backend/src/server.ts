@@ -1133,14 +1133,21 @@ async function isFilteredOutByPubDate(item: any): Promise<boolean> {
   }
   return false;
 }
-async function isFilteredOutByDuration(item: any): Promise<boolean> {
+async function isFilteredOutByDuration(item: any, channel?: any): Promise<boolean> {
   if (item.duration) {
     const durationFilterEnabled = (await getConfig('durationFilterEnabled', 'false')) === 'true';
-    const minDurationMinutes = parseInt(await getConfig('minDurationMinutes', '0'));
-    const maxDurationMinutes = parseInt(await getConfig('maxDurationMinutes', '720'));
-    if (durationFilterEnabled) {
+    const globalMin = parseInt(await getConfig('minDurationMinutes', '0'));
+    const globalMax = parseInt(await getConfig('maxDurationMinutes', '720'));
+
+    // Per-channel overrides: null = use global, set = override that field
+    const channelMin = channel?.minDuration ?? globalMin;
+    const channelMax = channel?.maxDuration ?? globalMax;
+    const hasChannelOverride = channel?.minDuration != null || channel?.maxDuration != null;
+    const enabled = hasChannelOverride || durationFilterEnabled;
+
+    if (enabled) {
       const durMinutes = (item.duration || 0) / 60;
-      if (durMinutes < minDurationMinutes || durMinutes > maxDurationMinutes) {
+      if (durMinutes < channelMin || durMinutes > channelMax) {
         return true;
       }
     }
@@ -1383,7 +1390,7 @@ async function harvestAndPurge() {
                 pubDate: item.pubDate || new Date(),
                 duration: item.duration || 0
               };
-              if (await isFilteredOutByPubDate(item) || await isFilteredOutByDuration(item)) {
+              if (await isFilteredOutByPubDate(item) || await isFilteredOutByDuration(item, currentChannel)) {
                 await ignoreVideo(item2);
                 continue;
               }
@@ -1399,7 +1406,7 @@ async function harvestAndPurge() {
               }
               if (item.VODFuture) continue;
 
-              if (await isFilteredOutByPubDate(item) || await isFilteredOutByDuration(item)) {
+              if (await isFilteredOutByPubDate(item) || await isFilteredOutByDuration(item, currentChannel)) {
                 await ignoreVideo(item2);
                 continue;
               }
@@ -1651,6 +1658,20 @@ app.patch('/api/channels/:channelId/active', async (req, res) => {
     data: { active }
   });
   console.log(`${active ? '✅' : '⏸️'} [CHANNEL] ${req.params.channelId} → active=${active}`);
+  res.json({ success: true });
+});
+
+app.patch('/api/channels/:channelId/duration', async (req, res) => {
+  const { minDuration, maxDuration } = req.body as { minDuration: number | null; maxDuration: number | null };
+  const data: { minDuration?: number | null; maxDuration?: number | null } = {};
+  if (minDuration !== undefined) data.minDuration = minDuration;
+  if (maxDuration !== undefined) data.maxDuration = maxDuration;
+  if (Object.keys(data).length === 0) return res.status(400).json({ success: false, error: 'No fields to update' });
+  const result = await prisma.channel.update({
+    where: { channelId: req.params.channelId },
+    data,
+  });
+  console.log(`⏱️ [CHANNEL] ${req.params.channelId} → min=${result.minDuration}, max=${result.maxDuration}`);
   res.json({ success: true });
 });
 

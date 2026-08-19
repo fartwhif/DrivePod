@@ -14,6 +14,8 @@ model Channel {
   order            Int      @default(0)
   ignoreScrapeDone Boolean  @default(false)
   active           Boolean  @default(true)
+  minDuration      Int?     // per-channel override (minutes). Null = use global.
+  maxDuration      Int?     // per-channel override (minutes). Null = use global.
   createdAt        DateTime @default(now())
   videos           Video[]
 

@@ -156,6 +156,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   editingChannelId = signal<string | null>(null);
   editTitle = signal('');
+  editingDurationChannelId = signal<string | null>(null);
+  editDurationMin = signal<number | null>(null);
+  editDurationMax = signal<number | null>(null);
 
   private defaultPageTitle = 'YT Drive Audio Queue';
   private lastProgressSave = 0;
@@ -1592,6 +1595,32 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   toggleChannelActive(channelId: string, active: boolean) {
     this.http.patch(`${this.apiUrl}/channels/${channelId}/active`, { active }).subscribe(() => this.loadChannels());
+  }
+
+  setChannelDuration(channelId: string, minDuration: number | null, maxDuration: number | null) {
+    this.http.patch(`${this.apiUrl}/channels/${channelId}/duration`, { minDuration, maxDuration }).subscribe(() => this.loadChannels());
+  }
+
+  startEditingDuration(channelId: string, minDuration: number | null, maxDuration: number | null) {
+    this.editingDurationChannelId.set(channelId);
+    this.editDurationMin.set(minDuration);
+    this.editDurationMax.set(maxDuration);
+  }
+
+  cancelEditingDuration() {
+    this.editingDurationChannelId.set(null);
+    this.editDurationMin.set(null);
+    this.editDurationMax.set(null);
+  }
+
+  saveChannelDuration() {
+    const channelId = this.editingDurationChannelId();
+    if (!channelId) return;
+    // If both null, that means "use global" — send nulls to clear overrides
+    const minVal = this.editDurationMin();
+    const maxVal = this.editDurationMax();
+    this.setChannelDuration(channelId, minVal, maxVal);
+    this.cancelEditingDuration();
   }
 
   importChannels(rawText: string) {

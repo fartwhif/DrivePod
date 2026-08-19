@@ -667,30 +667,35 @@
           <li class="flex justify-between items-center bg-zinc-800 px-4 py-3 rounded-xl">
             <div class="flex-1 min-w-0 flex items-center gap-3">
               @if (editingChannelId() === c.channelId) {
-                <input [(ngModel)]="editTitle" 
+                <input [(ngModel)]="editTitle"
                        class="flex-1 bg-zinc-700 text-white px-4 py-2 rounded-2xl outline-none border border-zinc-600 focus:border-sky-400"
                        (keyup.enter)="saveRename()"
                        (keyup.escape)="cancelEditing()">
                 <button (click)="saveRename()" class="text-emerald-400 hover:text-emerald-300 text-2xl">✓</button>
                 <button (click)="cancelEditing()" class="text-red-400 hover:text-red-300 text-2xl">✕</button>
               } @else {
-                <a [href]="'https://www.youtube.com/channel/' + c.channelId" 
-                   target="_blank" 
-                   rel="noopener noreferrer" 
+                <a [href]="'https://www.youtube.com/channel/' + c.channelId"
+                   target="_blank"
+                   rel="noopener noreferrer"
                    class="hover:text-sky-400 flex items-center gap-2 flex-1 min-w-0 truncate"
                    [class.opacity-40]="!c.active">
                   {{ c.title }}
                   <span class="text-xs text-sky-400">↗</span>
                 </a>
-                <button (click)="toggleChannelActive(c.channelId, !c.active); $event.stopImmediatePropagation()" 
+                <button (click)="toggleChannelActive(c.channelId, !c.active); $event.stopImmediatePropagation()"
                         [class.text-emerald-400]="c.active"
                         [class.text-zinc-500]="!c.active"
                         [class.hover:text-emerald-300]="c.active"
                         [class.hover:text-emerald-200]="!c.active"
                         title="{{ c.active ? 'Harvesting active' : 'Harvesting paused' }}"
                         class="px-2 text-xl">{{ c.active ? '🟢' : '⏸️' }}</button>
-                <button (click)="startEditing(c.channelId, c.title); $event.stopImmediatePropagation()" 
+                <button (click)="startEditing(c.channelId, c.title); $event.stopImmediatePropagation()"
                         class="text-zinc-400 hover:text-white px-2 text-xl">✏️</button>
+                <button (click)="startEditingDuration(c.channelId, c.minDuration, c.maxDuration); $event.stopImmediatePropagation()"
+                        [class.text-amber-400]="c.minDuration != null || c.maxDuration != null"
+                        [class.text-zinc-500]="c.minDuration == null && c.maxDuration == null"
+                        title="{{ c.minDuration != null || c.maxDuration != null ? 'Duration override active — click to edit' : 'No duration override — click to set' }}"
+                        class="px-2 text-xl">⏱️</button>
               }
             </div>
 
@@ -703,9 +708,36 @@
               </div>
             }
 
-            <button (click)="deleteChannel(c.channelId); $event.stopImmediatePropagation()" 
+            <button (click)="deleteChannel(c.channelId); $event.stopImmediatePropagation()"
                     class="text-red-400 hover:text-red-500 text-2xl leading-none ml-4">×</button>
           </li>
+
+          <!-- Duration override editor -->
+          @if (editingDurationChannelId() === c.channelId) {
+            <li class="bg-zinc-800 px-4 py-3 rounded-xl ml-4 border border-amber-500/30">
+              <div class="text-xs text-amber-400 mb-2">Duration override (minutes, leave empty for global default)</div>
+              <div class="flex items-center gap-3 flex-wrap">
+                <label class="flex items-center gap-2">
+                  <span class="text-zinc-400 text-sm">Min:</span>
+                  <input type="number" min="0" max="10080"
+                         [ngModel]="editDurationMin()"
+                         (ngModelChange)="editDurationMin.set($event === '' ? null : $event)"
+                         placeholder="—"
+                         class="w-20 bg-zinc-700 text-white px-3 py-1 rounded-lg outline-none border border-zinc-600 focus:border-amber-400 text-sm">
+                </label>
+                <label class="flex items-center gap-2">
+                  <span class="text-zinc-400 text-sm">Max:</span>
+                  <input type="number" min="0" max="10080"
+                         [ngModel]="editDurationMax()"
+                         (ngModelChange)="editDurationMax.set($event === '' ? null : $event)"
+                         placeholder="—"
+                         class="w-20 bg-zinc-700 text-white px-3 py-1 rounded-lg outline-none border border-zinc-600 focus:border-amber-400 text-sm">
+                </label>
+                <button (click)="saveChannelDuration()" class="text-emerald-400 hover:text-emerald-300 text-sm font-medium">Save</button>
+                <button (click)="cancelEditingDuration()" class="text-zinc-400 hover:text-white text-sm">Cancel</button>
+              </div>
+            </li>
+          }
         }
         @if (channels().length === 0) {
           <li class="bg-zinc-800 px-4 py-8 rounded-2xl text-center text-zinc-400">
