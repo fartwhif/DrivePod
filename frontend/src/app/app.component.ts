@@ -1139,6 +1139,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    */
   private _tryPlay(video: Video): void {
     this._clearPlayRetry();
+    // Set currentVideo before probing so _skipDefunctTrack can match it
+    this.currentVideo.set(video);
+    this.updatePageTitle(video);
     const headers: Record<string, string> = {};
 
     fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
@@ -1223,9 +1226,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                       this.audio.pause();
                       this.audio.src = '';
                       this.setMediaPlaybackState('none');
+                      this.advanceToNextTrack();
                     }
                   })
-                  .catch(() => {});
+                  .catch(() => {
+                    // Final probe failed -- stop and advance
+                    console.warn(`Track ${video.videoId} probe failed -- stopping`);
+                    this.currentVideo.set(null);
+                    this.updatePageTitle(null);
+                    this.audio.pause();
+                    this.audio.src = '';
+                    this.setMediaPlaybackState('none');
+                    this.advanceToNextTrack();
+                  });
               });
             }
           })
