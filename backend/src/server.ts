@@ -322,7 +322,9 @@ async function initShuffleBag(): Promise<void> {
 
   const grabbyIndex: any[] = JSON.parse(fs.readFileSync(GRABBY_INDEX_PATH, 'utf-8'));
 
-  // Filter out defunct items (MP3 missing on disk)
+  // Filter out defunct items (MP3 missing on disk). Items already in the DB
+  // stay in the bag on purpose: grabby tracks are reused indefinitely —
+  // distributeGrabbyItems reconditions existing rows instead of skipping them.
   const valid: ShuffleBagEntry[] = [];
   for (const item of grabbyIndex) {
     const mp3Path = path.join(CACHE_DIR, item.audioPath);
@@ -347,7 +349,7 @@ async function initShuffleBag(): Promise<void> {
  * Pull N unused items from the shufflebag. Reinitializes when exhausted.
  * Returns the pulled items (marks them as used).
  */
-async function pullFromShuffleBag(count: number): Promise<ShuffleBagEntry[]> {
+async function pullFromShuffleBag(count: number, reinitialized = false): Promise<ShuffleBagEntry[]> {
   if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) {
     console.log(`⚠️ [ShuffleBag] No shufflebag file — pulling 0 items`);
     return [];
@@ -357,9 +359,15 @@ async function pullFromShuffleBag(count: number): Promise<ShuffleBagEntry[]> {
 
   const unused = bag.filter(e => !e.used);
   if (unused.length === 0) {
+    if (reinitialized) {
+      // No new items available (everything in the index is already in the DB
+      // or defunct) — don't loop forever reinitializing.
+      console.log(`⚠️ [ShuffleBag] No unused items available (all index items already in DB or defunct)`);
+      return [];
+    }
     console.log(`🔄 [ShuffleBag] Exhausted — reinitializing`);
     await initShuffleBag();
-    return pullFromShuffleBag(count); // retry with fresh bag
+    return pullFromShuffleBag(count, true); // single retry with fresh bag
   }
 
   const pulled = unused.slice(0, count);
@@ -485,6 +493,7 @@ async function distributeGrabbyItems(): Promise<void> {
   // Collect grabby items until we have enough duration
   const toInsert: any[] = [];
   let accumulatedDuration = 0;
+  let reusedCount = 0;
 
   for (const entry of pulled) {
     const meta = grabbyMap.get(entry.videoId);
@@ -493,44 +502,63 @@ async function distributeGrabbyItems(): Promise<void> {
     const duration = meta.duration || 0;
     if (duration <= 0) continue;
 
-    // Check if already in DB
-    const existing = await prisma.video.findUnique({ where: { videoId: entry.videoId } });
-    if (existing) {
-      console.log(`   ⏭️ [ShuffleBag] Already in DB: ${entry.videoId}`);
-      continue;
-    }
-
     // Check MP3 exists
     const mp3Path = path.join(CACHE_DIR, meta.audioPath);
     if (!fs.existsSync(mp3Path)) continue;
 
-    toInsert.push({
-      videoId: entry.videoId,
-      channelId: GRABBY_CHANNEL_ID,
-      title: meta.title || 'GrabbyTube Track',
-      publishedAt: clusterTimestamp(newestNormal.publishedAt),
-      thumbnailPath: meta.thumbnailPath ? `/cache/${meta.thumbnailPath}` : null,
-      audioPath: mp3Path,
-      duration,
-      ignored: false,
-      protected: false,
-      isGrabby: true
-    });
+    // Check if already in DB
+    const existing = await prisma.video.findUnique({ where: { videoId: entry.videoId } });
+    if (existing) {
+      // Recondition the existing row: refresh its timestamp to cluster near the
+      // newest normal content and reset its playback state, so it re-enters the
+      // mix window instead of being skipped.
+      await prisma.video.update({
+        where: { id: existing.id },
+        data: {
+          publishedAt: clusterTimestamp(newestNormal.publishedAt),
+          duration,
+          title: meta.title || existing.title,
+          thumbnailPath: meta.thumbnailPath ? `/cache/${meta.thumbnailPath}` : existing.thumbnailPath,
+          audioPath: mp3Path,
+          isGrabby: true,
+          watched: false,
+          progress: 0
+        }
+      });
+      reusedCount++;
+      console.log(`   ♻️ [ShuffleBag] Reconditioned existing: ${entry.videoId}`);
+    } else {
+      toInsert.push({
+        videoId: entry.videoId,
+        channelId: GRABBY_CHANNEL_ID,
+        title: meta.title || 'GrabbyTube Track',
+        publishedAt: clusterTimestamp(newestNormal.publishedAt),
+        thumbnailPath: meta.thumbnailPath ? `/cache/${meta.thumbnailPath}` : null,
+        audioPath: mp3Path,
+        duration,
+        ignored: false,
+        protected: false,
+        isGrabby: true
+      });
+    }
 
     accumulatedDuration += duration;
 
     if (accumulatedDuration >= neededDuration) break;
   }
 
-  if (toInsert.length === 0) {
-    console.log(`⚠️ [ShuffleBag] No new grabby items to insert`);
+  const totalChanged = toInsert.length + reusedCount;
+  if (totalChanged === 0) {
+    console.log(`⚠️ [ShuffleBag] No usable grabby items`);
     return;
   }
 
-  await prisma.video.createMany({ data: toInsert });
+  if (toInsert.length > 0) {
+    await prisma.video.createMany({ data: toInsert });
+  }
   await updateIndexFile();
 
-  console.log(`✅ [ShuffleBag] Inserted ${toInsert.length} grabby items (${Math.round(accumulatedDuration)}s total)`);
+  console.log(`✅ [ShuffleBag] ${toInsert.length} inserted + ${reusedCount} reconditioned grabby items (${Math.round(accumulatedDuration)}s total)`);
 }
 
 /**
