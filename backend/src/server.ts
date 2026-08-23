@@ -34,6 +34,14 @@ const CACHE_DIR = process.env.CACHE_DIR;
 const RSS_CACHE_DIR = path.join(CACHE_DIR, 'rss');
 const DATA_DIR = process.env.DATA_DIR;
 const TEMP_COOKIES_FILE = path.join(DATA_DIR, 'cookies.txt');
+// Shared cookie export from the ytcookies container (RO mount), continuously
+// refreshed by its CDP cookie exporter. Preferred over manually uploaded cookies.
+const SHARED_COOKIES_FILE = '/shared-cookies/cookies.txt';
+function effectiveCookiesFile(): string | null {
+  if (fs.existsSync(SHARED_COOKIES_FILE) && fs.statSync(SHARED_COOKIES_FILE).size > 0) return SHARED_COOKIES_FILE;
+  if (fs.existsSync(TEMP_COOKIES_FILE) && fs.statSync(TEMP_COOKIES_FILE).size > 0) return TEMP_COOKIES_FILE;
+  return null;
+}
 const INDEX_JSON_PATH = path.join(CACHE_DIR, 'index.json');
 const INDEX_TEMP_PATH = path.join(CACHE_DIR, 'index.tmp.json');
 const GRABBY_INDEX_PATH = path.join(CACHE_DIR, 'grabby-index.json');
@@ -148,6 +156,11 @@ async function getCookies(): Promise<string> {
 }
 
 async function writeTempCookiesFile() {
+  if (effectiveCookiesFile() === SHARED_COOKIES_FILE) {
+    // Shared ytcookies export is present and takes precedence; local file not needed
+    console.log(`🍪 Using shared ytcookies export at ${SHARED_COOKIES_FILE}`);
+    return true;
+  }
   const cookieText = await getCookies();
   if (!cookieText.trim()) return false;
 
@@ -896,9 +909,10 @@ async function getBaseYtDlpCommand(): Promise<string> {
   const userAgent = await getConfig('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36');
 
   let cookieFlag = '';
-  if (cookies.trim()) {
-    cookieFlag = `--cookies "${TEMP_COOKIES_FILE}" `;
-    console.log(`🍪 Using cookies`);
+  const cookieFile = effectiveCookiesFile();
+  if (cookieFile) {
+    cookieFlag = `--cookies "${cookieFile}" `;
+    console.log(`🍪 Using cookies: ${cookieFile}`);
   }
 
   const cmd = `yt-dlp --no-progress ` +

@@ -18,6 +18,7 @@ services:
     volumes:
       - /home/user/projects/drivepod/data:/home/user/projects/drivepod/data
       - /home/user/projects/drivepod/cache:/home/user/projects/drivepod/cache
+      - /home/user/projects/ytcookies/data:/shared-cookies
       - /lib/modules:/lib/modules:ro
     env_file:
       - .env
