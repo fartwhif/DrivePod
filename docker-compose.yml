@@ -18,6 +18,7 @@ services:
     volumes:
       - /mnt/e/projects/drivepod/data:/mnt/e/projects/drivepod/data
       - /mnt/e/projects/drivepod/cache:/mnt/e/projects/drivepod/cache
+      - /mnt/e/projects/ytcookies/data:/shared-cookies
       - /lib/modules:/lib/modules:ro
     env_file:
       - .env
