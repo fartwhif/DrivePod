@@ -1005,6 +1005,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this._loadIndexAndPlay();
   }
 
+  getVideoLinkUrl(video: Video): string {
+    const t = Math.floor(this.audio.currentTime || 0);
+    return `https://www.youtube.com/watch?v=${video.videoId}${t > 0 ? `&t=${t}s` : ''}`;
+  }
+
   skipNext() {
      // When skipMarksWatched is enabled, treat skip as if the track just finished
      if (this.skipMarksWatched() && this.currentVideo()) {
