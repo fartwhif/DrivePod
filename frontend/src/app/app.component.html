@@ -40,7 +40,7 @@
                 [class.hover:text-amber-200]="!video.protected"
                 title="{{ video.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}"
                 class="text-3xl leading-none">{{ video.protected ? '🔒' : '🔓' }}</button>
-              <a [href]="'https://www.youtube.com/watch?v=' + video.videoId"
+              <a [href]="getVideoLinkUrl(video)"
                 target="_blank"
                 rel="noopener noreferrer"
                 class="text-sky-400 hover:text-sky-300 text-3xl leading-none flex items-center gap-1">
