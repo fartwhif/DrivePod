@@ -2411,6 +2411,61 @@ app.patch('/api/video/:videoId/protect', async (req, res) => {
   res.json({ success: true, protected: isProtected });
 });
 
+app.delete('/api/video/:videoId/grabby', async (req, res) => {
+  const { videoId } = req.params;
+
+  // Concurrency lock — same pattern as import. Protects distributeGrabbyItems
+  // from inserting a DB record for a file being deleted mid-harvest.
+  if (isHarvesting || isImporting) {
+    return res.status(409).json({ success: false, error: 'Harvest or import already running — try again in a moment' });
+  }
+
+  const video = await prisma.video.findUnique({ where: { videoId } });
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+  if (!video.isGrabby) return res.status(400).json({ success: false, error: 'Not a GrabbyTube item' });
+
+  // Remote delete (GrabbyTube owns its catalog/index/files — single writer).
+  // 200 = deleted, 404 = already gone remotely (treat as success).
+  const grabbyUrl = `http://grabbytube:8101/tracks/${videoId}`;
+  let remote: 'deleted' | 'already-gone' | 'error';
+  try {
+    const r = await fetch(grabbyUrl, {
+      method: 'DELETE',
+      headers: { 'X-Grabby-Token': process.env.GRABBY_API_TOKEN || '' },
+      signal: AbortSignal.timeout(15000)
+    });
+    if (r.ok) remote = 'deleted';
+    else if (r.status === 404) remote = 'already-gone';
+    else {
+      console.error(`❌ [GRABBY-DELETE] Remote delete ${videoId} failed: HTTP ${r.status}`);
+      return res.status(502).json({ success: false, error: `GrabbyTube delete failed (HTTP ${r.status}) — nothing was deleted` });
+    }
+  } catch (e: any) {
+    console.error(`❌ [GRABBY-DELETE] GrabbyTube unreachable for ${videoId}:`, e.message);
+    return res.status(502).json({ success: false, error: 'GrabbyTube unreachable — nothing was deleted' });
+  }
+
+  // Local cleanup — only after the remote side succeeded (fail-closed).
+  const deleted = await prisma.video.deleteMany({ where: { videoId, isGrabby: true } });
+
+  // Remove from shufflebag so it can't be re-distributed
+  if (fs.existsSync(SHUFFLEBAG_JSON_PATH)) {
+    try {
+      const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
+      const filtered = bag.filter(e => e.videoId !== videoId);
+      if (filtered.length !== bag.length) {
+        fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(filtered, null, 2));
+      }
+    } catch (e: any) {
+      console.warn(`⚠️ [GRABBY-DELETE] Could not prune shufflebag:`, e.message);
+    }
+  }
+
+  await updateIndexFile();
+  console.log(`🗑️ [GRABBY-DELETE] ${videoId} → remote: ${remote}, local records removed: ${deleted.count}`);
+  res.json({ success: true, deleted: videoId, remote, localRecords: deleted.count });
+});
+
 app.get('/api/stream/:videoId', async (req, res) => {
   const video = await prisma.video.findUnique({ where: { videoId: req.params.videoId } });
   if (!video || !fs.existsSync(video.audioPath)) return res.status(404).send('Video not found');

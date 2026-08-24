@@ -46,6 +46,11 @@
                 class="text-sky-400 hover:text-sky-300 text-3xl leading-none flex items-center gap-1">
                 🔗
               </a>
+              @if (video.isGrabby) {
+                <button (click)="$event.stopPropagation(); consumeGrabbyTrack(video.videoId)"
+                  title="Mark played & permanently delete from GrabbyTube (key: Delete)"
+                  class="text-rose-400 hover:text-rose-300 text-3xl leading-none">🗑️</button>
+              }
             </div>
           </div>
         </div>
