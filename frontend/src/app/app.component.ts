@@ -381,7 +381,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    *  from GrabbyTube (remote catalog + files). Shared by the 🗑️ button and
    *  the Delete hotkey so behavior can never diverge. */
   consumeGrabbyTrack(videoId: string) {
-    if (!confirm('Mark as played and permanently delete this track from GrabbyTube?')) return;
     this.http.delete(`${this.apiUrl}/video/${videoId}/grabby`).subscribe({
       next: () => {
         // DB record already deleted server-side; advance like track completion.
