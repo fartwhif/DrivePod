@@ -554,7 +554,16 @@ async function distributeGrabbyItems(): Promise<void> {
   }
 
   if (toInsert.length > 0) {
-    await prisma.video.createMany({ data: toInsert });
+    // Last-moment recheck: a concurrent grabby delete may have removed an MP3
+    // after the per-item check above. Don't insert DB rows for missing files
+    // (updateIndexFile's defunct filter is the backstop if one slips through).
+    const live = toInsert.filter(i => fs.existsSync(path.join(CACHE_DIR, i.videoId, `${i.videoId}.mp3`)));
+    if (live.length < toInsert.length) {
+      console.log(`⏭️ [ShuffleBag] Skipping ${toInsert.length - live.length} items deleted mid-harvest`);
+    }
+    if (live.length > 0) {
+      await prisma.video.createMany({ data: live });
+    }
   }
   await updateIndexFile();
 
@@ -1126,6 +1135,18 @@ async function updateIndexFile() {
     for (const v of videos) {
       const folder = path.join(CACHE_DIR, v.videoId);
       const jsonPath = path.join(folder, `${v.videoId}.json`);
+
+      // Self-heal: drop grabby items whose MP3 is gone. Grabby MP3s are
+      // pre-downloaded, so a missing file means the track was deleted (mid-harvest
+      // here, or via the GrabbyTube UI). The stale DB row is removed too so it
+      // can't be reconditioned back into the mix on the next harvest.
+      if (v.isGrabby) {
+        if (!fs.existsSync(path.join(folder, `${v.videoId}.mp3`))) {
+          console.log(`🗑️ [Index] Dropping defunct grabby item: ${v.videoId} (no MP3)`);
+          await prisma.video.deleteMany({ where: { videoId: v.videoId, isGrabby: true } });
+          continue;
+        }
+      }
 
       let meta: any = { ...v }; // fallback from DB
 
@@ -2414,11 +2435,10 @@ app.patch('/api/video/:videoId/protect', async (req, res) => {
 app.delete('/api/video/:videoId/grabby', async (req, res) => {
   const { videoId } = req.params;
 
-  // Concurrency lock — same pattern as import. Protects distributeGrabbyItems
-  // from inserting a DB record for a file being deleted mid-harvest.
-  if (isHarvesting || isImporting) {
-    return res.status(409).json({ success: false, error: 'Harvest or import already running — try again in a moment' });
-  }
+  // No concurrency lock here — delete-during-harvest is allowed on purpose.
+  // The only race (harvest inserting a DB row for a track whose MP3 was just
+  // deleted) is neutralized by updateIndexFile()'s defunct-grabby filter, which
+  // also self-heals deletes made directly from the GrabbyTube UI.
 
   const video = await prisma.video.findUnique({ where: { videoId } });
   if (!video) return res.status(404).json({ error: 'Video not found' });
