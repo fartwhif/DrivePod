@@ -200,6 +200,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private alwaysOnProbeTimer: any = null;
   private readonly ALWAYS_ON_PROBE_INTERVAL = 5000;
   private _consecutiveProbeFails = 0;
+  // Outage bookkeeping: snapshot of playback state at the moment the
+  // connection was lost. Used to decide whether to auto-resume on recovery —
+  // a track the user had paused must stay paused.
+  private _dropInProgress = false;
+  private _wasPlayingBeforeDrop = false;
   private initialAutoplayAttempted = false;
 
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
@@ -342,6 +347,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this._stopAlwaysOnProbe();
     this._clearPlayRetry();
     this.pendingVideoOps = [];
+    this._dropInProgress = false;
+    this._wasPlayingBeforeDrop = false;
 
     // Remove event listeners
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
@@ -630,6 +637,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  /** Snapshot playback state the moment the connection is lost. */
+  private _snapshotPlaybackStateOnDrop(): void {
+    this._dropInProgress = true;
+    // audio.error !== null means the element was mid-playback and got
+    // interrupted by the drop (a paused element never enters an error state).
+    this._wasPlayingBeforeDrop = !!this.currentVideo() && (!this.audio.paused || this.audio.error !== null);
+  }
+
   /** Lightweight HEAD probe to check if backend is reachable. */
   private _doConnectivityProbe(): void {
     const probeHeaders: Record<string, string> = {};
@@ -638,9 +653,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         if (res.ok || res.status === 401) {
           if (this._consecutiveProbeFails > 0) {
             console.log(`Backend reachable again after ${this._consecutiveProbeFails} failures`);
+            // Consume the outage snapshot before recovering so a second
+            // spurious recovery path (window.online) can't double-trigger.
+            const resumeAudio = this._dropInProgress && this._wasPlayingBeforeDrop;
             this._consecutiveProbeFails = 0;
+            this._dropInProgress = false;
+            this._wasPlayingBeforeDrop = false;
             this._resumePlaybackRetry();
-            this.recoverAudioPlayback();
+            if (resumeAudio) this.recoverAudioPlayback();
           }
           if (this.pendingVideoOps.length > 0) {
             this.retryAttempts = 0;
@@ -653,12 +673,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           }
         } else {
           this._consecutiveProbeFails++;
+          if (this._consecutiveProbeFails === 3) this._snapshotPlaybackStateOnDrop();
         }
       })
       .catch(() => {
         this._consecutiveProbeFails++;
         if (this._consecutiveProbeFails === 3) {
           console.warn('Backend unreachable (3 consecutive probe failures)');
+          this._snapshotPlaybackStateOnDrop();
         }
       });
   }
@@ -682,12 +704,15 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       .then(res => {
         if (res.ok) {
           console.log('Connection restored via probe -- flushing pending operations');
+          const resumeAudio = this._dropInProgress && this._wasPlayingBeforeDrop;
           this.retryAttempts = 0;
           this._consecutiveProbeFails = 0;
+          this._dropInProgress = false;
+          this._wasPlayingBeforeDrop = false;
           this.flushPendingOps();
           // Restore audio if it was interrupted
           this._resumePlaybackRetry();
-          this.recoverAudioPlayback();
+          if (resumeAudio) this.recoverAudioPlayback();
           // Flush deferred index fetch
           if (this.indexFetchPending) {
             this.backendOnline = true;
@@ -705,10 +730,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     // window.online is unreliable -- it fires when the NIC comes up, not when internet works
     // The active probe handles real connectivity detection
     console.log('OS reports network online -- probing backend');
+    // If the track was paused when the connection dropped, it must stay paused.
+    const resumeAudio = this._dropInProgress && this._wasPlayingBeforeDrop;
     this.retryAttempts = 0;
+    this._dropInProgress = false;
+    this._wasPlayingBeforeDrop = false;
     this.probeBackend();
-    // Restore audio playback if the current track was interrupted by the network loss
-    this.recoverAudioPlayback();
+    // Restore audio playback if the current track was playing when the loss hit
+    if (resumeAudio) this.recoverAudioPlayback();
     // Try fetching index if it was deferred
     if (this.indexFetchPending) {
       this.backendOnline = true;
@@ -1016,7 +1045,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.playVideo(playlist[idx - 1]);
     } else {
       this.audio.currentTime = 0;
-      if (this.audio.paused) this.audio.play();
+      if (this.audio.paused) {
+        this.audio.play();
+        // Explicit play intent: a replay from the start should also resume
+        // after a network drop, even if the track was paused before it.
+        this._wasPlayingBeforeDrop = true;
+      }
     }
   }
 
@@ -1048,7 +1082,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private setupMediaSessionHandlers() {
     if (!('mediaSession' in navigator)) return;
 
-    navigator.mediaSession.setActionHandler('play', () => this.audio.play());
+    navigator.mediaSession.setActionHandler('play', () => {
+      // Car head-unit play button is an explicit play intent —
+      // mark it so a later network drop/resume restores playback.
+      this._wasPlayingBeforeDrop = true;
+      this.audio.play();
+    });
     navigator.mediaSession.setActionHandler('pause', () => this.audio.pause());
     navigator.mediaSession.setActionHandler('nexttrack', () => this.skipNext());
     navigator.mediaSession.setActionHandler('previoustrack', () => this.skipPrevious());
