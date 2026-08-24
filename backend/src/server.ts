@@ -474,14 +474,20 @@ async function distributeGrabbyItems(): Promise<void> {
   // Load grabby index for metadata lookups
   const grabbyMap = loadGrabbyIndex();
 
-  // Walk backwards through the shufflebag to find items that fill the deficit.
-  // We need "built" duration going backwards until we have 60+ minutes.
-  const minGrabbyMinutes = 60 * 60; // at least 60 minutes of grabby content
-  const neededDuration = Math.max(deficitDuration, minGrabbyMinutes);
+  // Floor on grabby content per distribution: keeps music flowing in quiet
+  // hours without overriding the user's ratio. The old 60-min floor made
+  // 10:1 meaningless — a tiny deficit still injected a full hour of grabby.
+  // At high ratios the floor scales down to 15 min (still ~3x the 10:1
+  // target for a typical hour of normal content).
+  const minGrabbySec = targetRatio <= 5 ? 5 * 60 : 15 * 60;
+  const neededDuration = Math.max(deficitDuration, minGrabbySec);
 
-  // Pull enough items from shufflebag to cover the needed duration
-  // Estimate average grabby duration (~4 min = 240s)
-  const avgGrabbyDuration = 240;
+  // Pull enough items from shufflebag to cover the needed duration.
+  // Use the real average from the index (catalog avg is ~18 min, not 4).
+  const allDurations = [...grabbyMap.values()].map(m => m.duration || 0).filter(d => d > 0);
+  const avgGrabbyDuration = allDurations.length
+    ? allDurations.reduce((a, b) => a + b, 0) / allDurations.length
+    : 240;
   const estimatedCount = Math.ceil(neededDuration / avgGrabbyDuration) + 5; // buffer
 
   const pulled = await pullFromShuffleBag(estimatedCount);
