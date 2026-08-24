@@ -79,6 +79,9 @@ interface HarvestStatus {
   styleUrls: []
 })
 export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
+  /** Global hotkey that consumes the current GrabbyTube track (see consumeGrabbyTrack). */
+  static readonly GRABBY_DELETE_KEY = 'Delete';
+
   apiUrl = '/api';
   channels = signal<any[]>([]);
   playlist = signal<Video[]>([]);
@@ -350,7 +353,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     window.addEventListener('keydown', this.handleKeyboardShortcut.bind(this));
   }
 
-  private handleKeyboardShortcut(event: KeyboardEvent): void {
+  private handleKeyboardShortcut(event: KeyboardEvent) {
+    // Don't hijack keys while typing in a form field (search, settings inputs, etc.)
+    const t = event.target as HTMLElement;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+
     if (event.key === 'ArrowLeft') {
       if (this.audio && this.audio.duration && !isNaN(this.audio.duration)) {
         this.audio.currentTime = Math.max(0, this.audio.currentTime - 10);
@@ -361,7 +368,31 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.audio.currentTime = Math.min(this.audio.duration, this.audio.currentTime + 10);
         event.preventDefault();
       }
+    } else if (event.key === AppComponent.GRABBY_DELETE_KEY) {
+      const v = this.currentVideo();
+      if (v && v.isGrabby) {
+        event.preventDefault();
+        this.consumeGrabbyTrack(v.videoId);
+      }
     }
+  }
+
+  /** GrabbyTube-only control: mark the track played and permanently delete it
+   *  from GrabbyTube (remote catalog + files). Shared by the 🗑️ button and
+   *  the Delete hotkey so behavior can never diverge. */
+  consumeGrabbyTrack(videoId: string) {
+    if (!confirm('Mark as played and permanently delete this track from GrabbyTube?')) return;
+    this.http.delete(`${this.apiUrl}/video/${videoId}/grabby`).subscribe({
+      next: () => {
+        // DB record already deleted server-side; advance like track completion.
+        // (The fire-and-forget POST /watched inside is a harmless no-op on the
+        // deleted record — it returns 200 and triggers no retry loop.)
+        this.markAsWatchedAndPlayNext();
+      },
+      error: (err: any) => {
+        alert(err?.error?.error || err?.message || 'Delete failed — try again');
+      }
+    });
   }
 
   // === Index-based client-side paging ===
