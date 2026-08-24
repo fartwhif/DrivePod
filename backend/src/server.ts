@@ -986,7 +986,7 @@ async function downloadAndProcessVideo(
     console.log(`📥 Starting download: ${videoId} (${author})`);
 
     const downloadCmd = (await getBaseYtDlpCommand()) +
-      `-f bestaudio/best --write-thumbnail --no-overwrites --continue ` +
+      `-f "b[acodec!=none][height<=360]/b[acodec!=none]/ba/b" --write-thumbnail --no-overwrites --continue ` +
       `--match-filter "live_status != is_live & live_status != is_upcoming" ` +
       `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`;
 
@@ -994,7 +994,9 @@ async function downloadAndProcessVideo(
 
     let raw = path.join(videoDir, `${videoId}.webm`);
     const alt = path.join(videoDir, `${videoId}.m4a`);
+    const mp4alt = path.join(videoDir, `${videoId}.mp4`);
     if (!fs.existsSync(raw) && fs.existsSync(alt)) raw = alt;
+    if (!fs.existsSync(raw) && fs.existsSync(mp4alt)) raw = mp4alt;
 
     if (!fs.existsSync(raw)) throw new Error('No audio file was downloaded');
 
