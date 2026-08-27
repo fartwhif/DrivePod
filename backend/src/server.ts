@@ -1134,7 +1134,12 @@ async function updateIndexFile() {
 
     const videos = await prisma.video.findMany({
       where: { ignored: false },
-      orderBy: { publishedAt: 'desc' },
+      // Stable ordering: publishedAt desc, then videoId asc to break ties
+      // deterministically. Without the tie-breaker, videos sharing a
+      // publishedAt (batched imports, grabby cluster timestamps) are returned
+      // in a different order on every regeneration, so the index — and thus
+      // the playlist — looks inconsistent across refreshes.
+      orderBy: [{ publishedAt: 'desc' }, { videoId: 'asc' }],
       include: { channel: true }
     });
 

@@ -14,6 +14,21 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
+    # Live playlist index — regenerated on every state change. MUST never be
+    # cached (browser or proxy) or the queue shows a stale/inconsistent mix.
+    # Exact-match wins over the /cache/ prefix block below; MP3s + thumbnails
+    # keep their normal (cacheable) treatment.
+    location = /cache/index.json {
+        alias /mnt/e/projects/drivepod/cache/index.json;
+        add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+        add_header Pragma "no-cache" always;
+        add_header Expires "0" always;
+        add_header Cross-Origin-Resource-Policy "cross-origin" always;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        default_type application/json;
+    }
+
     location /cache/ {
         alias /mnt/e/projects/drivepod/cache/;
         add_header Cross-Origin-Resource-Policy "cross-origin" always;
