@@ -207,6 +207,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private _wasPlayingBeforeDrop = false;
   private initialAutoplayAttempted = false;
 
+  // videoIds we marked watched client-side but whose POST may still be queued
+  // for retry (network blackholes). Index refetches must keep these out of the
+  // queue until the server has persisted watched=true.
+  private _localWatched: Set<string> = new Set();
+
   // NEW: MediaSession realtime position tracking (for Ford Sync car display)
   private lastPositionUpdate = 0;
   private readonly POSITION_UPDATE_INTERVAL = 1800;
@@ -423,23 +428,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.backendOnline = true;
         this.indexFetchPending = false;
 
-        // Preserve local progress/watched state for videos already in our signals
-        const oldQueue = this.playlist();
-        const oldProtected = this.protectedPlaylist();
-        const oldWatched = this.watchedPlaylist();
-        const oldMap = new Map<string, Partial<Video>>();
-        for (const v of [...oldQueue, ...oldProtected, ...oldWatched]) {
-          oldMap.set(v.videoId, { progress: v.progress, watched: v.watched });
-        }
-
-        // Merge local state into fresh index data
-        const merged = data.map(v => {
-          const local = oldMap.get(v.videoId);
-          if (local) {
-            return { ...v, progress: local.progress ?? v.progress, watched: local.watched ?? v.watched };
-          }
-          return v;
-        });
+        const merged = this.mergeIndexWithLocal(data);
 
         this.rawIndex.set(merged);
         this.derivePlaylists();
@@ -456,6 +445,36 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         console.error('Failed to load index.json — backend offline, deferring', err);
         this.startConnectivityProbe();
       });
+  }
+
+  /**
+   * Merge locally-known state into a freshly fetched index.
+   *
+   * Watched: the server index is authoritative, EXCEPT for videos we just marked
+   * watched client-side whose POST is still queued for retry (network blackhole).
+   * Without the _localWatched guard, a refresh between the local mark and the
+   * persisted server write re-surfaces the video in the queue.
+   *
+   * Progress: local wins only when the server copy is 0 — the index itself
+   * carries progress from the periodic saves, so any non-zero server value is
+   * at least as fresh as our local one.
+   */
+  private mergeIndexWithLocal(data: Video[]): Video[] {
+    const oldQueue = this.playlist();
+    const oldProtected = this.protectedPlaylist();
+    const oldWatched = this.watchedPlaylist();
+    const oldMap = new Map<string, Partial<Video>>();
+    for (const v of [...oldQueue, ...oldProtected, ...oldWatched]) {
+      oldMap.set(v.videoId, { progress: v.progress, watched: v.watched });
+    }
+
+    return data.map(v => {
+      const local = oldMap.get(v.videoId);
+      const pendingWatched = this._localWatched.has(v.videoId);
+      const progress = local?.progress || v.progress || 0;
+      const watched = pendingWatched || (local ? local.watched : false) || v.watched;
+      return { ...v, progress, watched };
+    });
   }
 
   /** Get all queue (unwatched, non-ignored) videos from index, sorted newest first. */
@@ -938,6 +957,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const finishedVideoId = finishedVideo.videoId;
     const finishedPublishedAt = new Date(finishedVideo.publishedAt).getTime();
 
+    // Remember until the server confirms persistence (survives blackhole retries)
+    this._localWatched.add(finishedVideoId);
+
     // Immediately update UI state -- do NOT wait for the network call
     // (clear currentVideo AFTER we know the next track, see below)
     this.updatePageTitle(null);
@@ -1352,6 +1374,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const finishedVideo = this.currentVideo();
     if (!finishedVideo || finishedVideo.videoId !== videoId) return;
 
+    this._localWatched.add(videoId);
+
     this.currentVideo.set(null);
     this.updatePageTitle(null);
     this.playlist.update(current => current.filter(v => v.videoId !== videoId));
@@ -1406,20 +1430,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.backendOnline = true;
         this.indexFetchPending = false;
 
-        const oldQueue = this.playlist();
-        const oldProtected = this.protectedPlaylist();
-        const oldWatched = this.watchedPlaylist();
-        const oldMap = new Map<string, Partial<Video>>();
-        for (const v of [...oldQueue, ...oldProtected, ...oldWatched]) {
-          oldMap.set(v.videoId, { progress: v.progress, watched: v.watched });
-        }
-        const merged = data.map(v => {
-          const local = oldMap.get(v.videoId);
-          if (local) {
-            return { ...v, progress: local.progress ?? v.progress, watched: local.watched ?? v.watched };
-          }
-          return v;
-        });
+        const merged = this.mergeIndexWithLocal(data);
 
         this.rawIndex.set(merged);
         this.derivePlaylists();
@@ -1497,6 +1508,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   toggleWatched(videoId: string, watched: boolean) {
     this.http.patch(`${this.apiUrl}/video/${videoId}/watched`, { watched }).subscribe({
       next: () => {
+        // Server persisted the change (and regenerated index.json) — the index
+        // is authoritative again; drop any pending local-watched hold.
+        this._localWatched.delete(videoId);
         if (!watched) {
           this.watchedPlaylist.update(current => current.filter(v => v.videoId !== videoId));
         }
