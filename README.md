@@ -33,7 +33,7 @@ Full configuration panel including bitrate, mono toggle, harvest window, User-Ag
 Bulk import of channel IDs with instant results feedback.  
 
 ![Import Tab](https://github.com/fartwhif/DrivePod/blob/main/screenshots/import-tab.png?raw=true)  
-*Paste channel IDs → instant add/skip/failed results*
+*Paste channel IDs/URLs or video URLs (mixed) → instant add/skip/failed results*
 
 ### Obtaining a Channel ID
 the ID is the key to wiring up your DrivePod.  The manual way to obtain someone's channel ID is via their channel page.  I've created a helpful tampermonkey script for exporting the entire list in one shot: To obtain all of your subscribed-to Channel IDs in one go, use this [helper script](https://greasyfork.org/en/scripts/573430-youtube-subscription-channel-id-harvester).  If you're unfamiliar with tampermonkey that's OK, you can still use the settings or import tab to "subscribe" to individual channels one at a time.
@@ -56,7 +56,7 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 - **Data Throttling** — Optimized for low-bandwidth environments (56K modem friendly) with compression and caching
 - **Smart Autoplay** — 5-way autoplay modes: newest, newer, older, oldest, and off
 - **Offline Resilience** — Operation queue with exponential-backoff retry, always-on connectivity probe, and audio recovery after network loss
-- **Authentication** — JWT demo mode (default) or Auth0 production mode
+- **Authentication** — Removed: open access with no login required. Access control is the network/WireGuard perimeter (see `ARCHITECTURE.md` §14)
 
 ### Frontend (Angular)
 - **Queue Tab** — Clean playlist with thumbnails, publish dates, and YouTube links
@@ -92,7 +92,7 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 | **Database** | Prisma + SQLite                     |
 | **Download** | yt-dlp + ffmpeg + vbrfix           |
 | **Parsing**  | rss-parser                          |
-| **Auth**     | JWT (demo mode) or Auth0 (production) |
+| **Access**   | Open (no app auth) — WireGuard perimeter  |
 | **UI**       | Modern dark theme, fully responsive with media session API |
 | **Deployment** | Single Docker container (nginx + Express inside) |
 
@@ -263,6 +263,7 @@ All settings are stored in the database and editable in the **Settings** tab:
 
 ```
 drivepod/
+├── ARCHITECTURE.md           ← Full technical reference (read this first)
 ├── backend/
 │   ├── ... (Node.js boilerplate)
 │   ├── src/server.ts           ← Harvesting daemon and API server
@@ -287,14 +288,13 @@ drivepod/
 
 | Method | Endpoint                        | Description                     |
 |--------|----------------------------------|---------------------------------|
-| POST   | `/api/auth/login`               | Login (demo mode only)          |
-| GET    | `/api/auth/me`                  | Current user info               |
-| POST   | `/api/auth/refresh`             | Refresh token (demo mode only)  |
+| —      | (no auth routes)                    | Open access — no login/JWT (removed) |
 | GET    | `/api/channels`                 | Monitored channels              |
 | POST   | `/api/channels`                 | Add channel                     |
 | POST   | `/api/channels/import`          | Bulk import (legacy alias)      |
 | POST   | `/api/channels/reorder`         | Update priority order           |
 | PATCH  | `/api/channels/:channelId/active` | Enable/disable channel        |
+| PATCH  | `/api/channels/:channelId/duration` | Per-channel min/max duration (minutes) |
 | DELETE | `/api/channels/:channelId`      | Delete channel                  |
 | POST   | `/api/import`                   | Import channels/videos (mixed)  |
 | GET    | `/api/harvest-status`           | Live harvest progress           |
@@ -309,6 +309,7 @@ drivepod/
 | POST   | `/api/video/:videoId/watched`   | Mark video as watched           |
 | PATCH  | `/api/video/:videoId/watched`   | Toggle watched state            |
 | PATCH  | `/api/video/:videoId/protect`   | Toggle protected state          |
+| DELETE | `/api/video/:videoId/grabby`    | Consume & delete GrabbyTube track (remote-first) |
 
 ---
 
@@ -352,7 +353,7 @@ drivepod/
 - [x] Progress bar improvements
 - [x] Responsive UI design
 - [x] Audio session API integration
-- [x] Authentication (JWT demo + Auth0)
+- [x] Open access (auth layer removed)
 - [x] GrabbyTube ShuffleBag
 - [x] Duration filtering
 - [x] Protected & Watched tabs
