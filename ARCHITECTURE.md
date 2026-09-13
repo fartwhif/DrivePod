@@ -101,8 +101,8 @@ exposes **24320** on all interfaces (access actually arrives via WireGuard).
 
 | Host path                              | Container path                | Purpose                                    |
 |----------------------------------------|-------------------------------|--------------------------------------------|
-| `/home/user/projects/drivepod/data`        | same                          | SQLite DB + temp `cookies.txt`             |
-| `/home/user/projects/drivepod/cache`       | same                          | MP3s, thumbnails, index.json, rss/ cache   |
+| `/home/user/projects/DrivePod/data`        | same                          | SQLite DB + temp `cookies.txt`             |
+| `/home/user/projects/DrivePod/cache`       | same                          | MP3s, thumbnails, index.json, rss/ cache   |
 | `/home/user/projects/ytcookies/data`       | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape)    |
 | `/lib/modules`                         | same (ro)                     | WireGuard kernel modules                   |
 
@@ -808,7 +808,7 @@ an `effect()` in the constructor) — a hidden player must not keep playing.
 ### 13.1 Build & deploy (the only correct sequence)
 
 ```bash
-cd /home/user/projects/drivepod
+cd /home/user/projects/DrivePod
 docker compose build
 docker compose create --force-recreate
 docker compose start
