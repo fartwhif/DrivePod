@@ -236,7 +236,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
 **Step 3: Reinstall and rebuild**
 
 ```bash
-cd /mnt/e/projects/drivepod/backend && npm install
+cd /mnt/c/edrive/projects/DrivePod/backend && npm install
 npx tsc --noEmit
 ```
 
@@ -500,7 +500,7 @@ These are the last two buttons before the closing `</div>` of the tab bar (~line
 **Step 2: Reinstall**
 
 ```bash
-cd /mnt/e/projects/drivepod/frontend && npm install
+cd /mnt/c/edrive/projects/DrivePod/frontend && npm install
 ```
 
 ---
@@ -512,7 +512,7 @@ cd /mnt/e/projects/drivepod/frontend && npm install
 **Step 1: Build**
 
 ```bash
-cd /mnt/e/projects/drivepod && docker compose build && docker compose create --force-recreate && docker compose start
+cd /mnt/c/edrive/projects/DrivePod && docker compose build && docker compose create --force-recreate && docker compose start
 ```
 
 **Step 2: Check logs**

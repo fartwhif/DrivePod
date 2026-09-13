@@ -22,7 +22,7 @@ low-bandwidth connectivity (driving): everything about playback, state
 persistence, and indexing is designed to survive network blackholes.
 
 A second content source is **GrabbyTube** (sibling project,
-`/mnt/e/projects/grabbytube`): a pre-existing MP3 catalog that DrivePod mixes
+`/mnt/c/edrive/projects/grabbytube`): a pre-existing MP3 catalog that DrivePod mixes
 into the queue at a configurable duration ratio (the "shufflebag").
 
 Two containers, one Docker image:
@@ -101,9 +101,9 @@ exposes **24320** on all interfaces (access actually arrives via WireGuard).
 
 | Host path                              | Container path                | Purpose                                    |
 |----------------------------------------|-------------------------------|--------------------------------------------|
-| `/mnt/e/projects/drivepod/data`        | same                          | SQLite DB + temp `cookies.txt`             |
-| `/mnt/e/projects/drivepod/cache`       | same                          | MP3s, thumbnails, index.json, rss/ cache   |
-| `/mnt/e/projects/ytcookies/data`       | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape)    |
+| `/mnt/c/edrive/projects/DrivePod/data`        | same                          | SQLite DB + temp `cookies.txt`             |
+| `/mnt/c/edrive/projects/DrivePod/cache`       | same                          | MP3s, thumbnails, index.json, rss/ cache   |
+| `/mnt/c/edrive/projects/ytcookies/data`       | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape)    |
 | `/lib/modules`                         | same (ro)                     | WireGuard kernel modules                   |
 
 The shared cache dir is **shared with GrabbyTube** — both projects write
@@ -808,7 +808,7 @@ an `effect()` in the constructor) — a hidden player must not keep playing.
 ### 13.1 Build & deploy (the only correct sequence)
 
 ```bash
-cd /mnt/e/projects/drivepod
+cd /mnt/c/edrive/projects/DrivePod
 docker compose build
 docker compose create --force-recreate
 docker compose start
