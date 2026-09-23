@@ -1,0 +1,6 @@
+cache/
+data/
+screenshots/
+frontend/node_modules
+backend/node_modules
+.git

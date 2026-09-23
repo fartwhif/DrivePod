@@ -289,13 +289,35 @@ For one video, into `cache/<videoId>/`:
    `-id3v2_version 3`, embedded cover art (`mjpeg`, `attached_pic`),
    `-ac 1` when mono.
 7. `vbrfix -always` → CBR (seekable, player-friendly).
-8. Delete the raw container file.
+8. `validateMp3File()` — post-transcode integrity gate: zero-run scan
+   (any run >256KB of consecutive 0x00 = a hole), head check (ID3 tag or
+   frame sync at byte 0), Xing/Info header presence (ffprobe's
+   "Estimating duration from bitrate" warning means it's missing), a
+   duration check vs the YouTube-reported value (10%, min 30s tolerance)
+   when the caller supplied one, and a size/header check: file size must
+   equal the Xing "bytes" field + tag size (vbrfix's count is exact —
+   `readMp3HeaderClaim()`). A failure re-transcodes once (raw still on
+   disk), then discards the file and returns false — the track is never
+   published. Why: the cache dir is a 9p-mounted Windows folder; silent
+   I/O failures there have produced zero-padded files that ffprobe still
+   measures (duration estimated from file size) but no player can demux
+   (Chrome: MEDIA_ERR_SRC_NOT_SUPPORTED). On 2026-09-20 the 9p Windows
+   I/O path additionally corrupted finished files **post-publication**
+   (one track's head spliced ahead of another track's tail; a 1.8MB
+   leading zero-hole) — 11 files in one concurrent-write burst; no sync
+   software is involved (operator-verified: OneDrive uninstalled, no
+   reparse points), so the suspected actor is the 9p/drvfs layer itself.
+   Every pre-publish check had already passed — so
+   `cleanupCorruptedFolders()` re-checks head + size claim on every
+   published file each harvest and quarantines failures (§6, step 2).
+9. Delete the raw container file.
 
 Failure classification:
 
 - cookie-invalid messages → **auto-clears the DB `cookies` config**
   (`setConfig('cookies','')`);
 - live / premiere / age-gate errors → logged and skipped (return false);
+- validation failure after the re-transcode → file deleted, return false;
 - any failure with no mp3 → folder removed + index regenerated.
 
 `getAudioDuration()` (ffprobe) measures the final MP3 for the DB row.
@@ -327,6 +349,13 @@ Nginx serves it with an exact-match `location = /cache/index.json` block:
 thumbnails remain cacheable (`immutable`). The SPA additionally cache-busts
 (`?_t=…`, `cache:'no-store'`).
 
+The SPA shell gets `Cache-Control: no-cache` (revalidate via ETag) and the
+content-hashed assets (`main-*.js`, `styles-*.css`) get
+`public, max-age=31536000, immutable`. Without explicit headers, Chromium
+heuristic-caches the header-less `index.html` and kept serving an 8-day-old
+deploy's bundle indefinitely (2026-09-20: stale bundle still contained the
+unbounded error-reload loop after the fixed build was live on the server).
+
 ### 5.7 Startup sequence (bottom of file)
 
 1. If `index.json` is absent → write one immediately.
@@ -351,6 +380,10 @@ Runs every 5 minutes and once at boot. Full sequence:
    - Orphan DB rows (`ignored:false, isGrabby:false`) with missing folder/mp3
      → delete row. (Grabby rows are never deleted here; the index self-heal
      owns that path.)
+   - Structurally valid folder whose MP3 fails an integrity check (junk at
+     file start — zero-hole or merge artifact; or size vs Xing "bytes"
+     claim off by more than max(4KB, 0.5%)) → delete folder + row
+     (post-publication corruption via the 9p Windows I/O path; grabby folders exempt).
 3. **`backfillChannelOrders()`** — assign sequential `order` to any channel
    stuck at 0 (legacy data).
 4. Delete temp cookies file, write effective cookies (shared export needs no
@@ -498,7 +531,13 @@ a duration ratio, so the player is never silent.
      keeps music flowing in quiet hours without making a 10:1 ratio
      meaningless (the old flat 60-min floor did).
   4. Estimate count from the **real catalog average duration** (≈18 min) + 5
-     buffer, pull from the bag.
+     buffer, pull from the bag. If `grabbyClusterMaxSize > 0`, the whole
+     cluster band — past hour around the newest normal video, incl. the
+     ±30-min jitter (the same window the ratio measurement uses) — is capped
+     at that many items **across runs**: items already in the band count
+     against the cap, so a 5-min cron run pulls only the remaining headroom
+     and skips once the band is full; the duration target then takes several
+     runs as the band slides with new normal content.
   5. For each pulled item (re-verifying mp3 existence):
      - **already in DB → "recondition"**: update row with clustered
        `publishedAt` (±30 min of newest normal content via
@@ -562,6 +601,7 @@ reinit next harvest); grabby-index.json and the MP3s are untouched.
 | `maxDurationMinutes` | 720 | **360** | global max |
 | `grabbyMixEnabled` | true | **false** | shufflebag on/off |
 | `grabbyMixRatio` | 3 | **10** | normal:grabby duration ratio (UI clamps 1–20) |
+| `grabbyClusterMaxSize` | 0 | — | max grabby items per cluster band, counted across runs (0 = unlimited) |
 | `currentVideoId` | '' | j55r6hpyKl4 | last played video (resume target) |
 
 Per-channel overrides live on the Channel row (`minDuration`/`maxDuration`,

@@ -51,7 +51,7 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 - **Auto-Purge** — Automatically deletes unprotected content older than X days
 - **Protected & Watched Tabs** — Protect tracks from purge; browse listening history
 - **Duration Filtering** — Filter content by minimum/maximum video length
-- **GrabbyTube ShuffleBag** — Mixes GrabbyTube music into the playlist at a configurable ratio during harvest
+- **GrabbyTube ShuffleBag** — Mixes GrabbyTube music into the playlist at a configurable ratio during harvest, with an optional cap on items per cluster
 - **Progress & Resume** — Saves listening progress and resumes exactly where you left off
 - **Data Throttling** — Optimized for low-bandwidth environments (56K modem friendly) with compression and caching
 - **Smart Autoplay** — 5-way autoplay modes: newest, newer, older, oldest, and off
@@ -250,7 +250,7 @@ All settings are stored in the database and editable in the **Settings** tab:
 - One-per-x-hours rate limiting
 - Duration filtering (min/max video length)
 - Alternative metadata scraping (Videos/Streams/Shorts tabs)
-- GrabbyTube ShuffleBag mix toggle and ratio
+- GrabbyTube ShuffleBag mix toggle, ratio, and per-cluster item cap
 - 5-way autoplay modes (newest, newer, older, oldest, off)
 - Low bandwidth mode (disables thumbnails)
 - Skip marks watched (treat skip-next as finishing the track)
