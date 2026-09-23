@@ -2,9 +2,20 @@ server {
     listen 80;
     server_name _;
 
+    # SPA shell. The HTML must revalidate on every load (no-cache) or
+    # browsers serve the previous deploy's index.html from heuristic
+    # cache and never pick up the new hashed bundle.
     location / {
         root /var/www/drivepod;
         try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache" always;
+    }
+
+    # Content-hashed assets are immutable — cache for a year. Regex wins
+    # over the plain prefix above; /api/ and /cache/ never match this.
+    location ~* ^/(main|chunk|polyfills|runtime|styles)-[A-Za-z0-9_-]+\.(js|css)$ {
+        root /var/www/drivepod;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
     }
 
     location /api/ {
@@ -19,7 +30,7 @@ server {
     # Exact-match wins over the /cache/ prefix block below; MP3s + thumbnails
     # keep their normal (cacheable) treatment.
     location = /cache/index.json {
-        alias /mnt/c/edrive/projects/DrivePod/cache/index.json;
+        alias /home/lab/projects/DrivePod/cache/index.json;
         add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
         add_header Pragma "no-cache" always;
         add_header Expires "0" always;
@@ -30,7 +41,7 @@ server {
     }
 
     location /cache/ {
-        alias /mnt/c/edrive/projects/DrivePod/cache/;
+        alias /home/lab/projects/DrivePod/cache/;
         add_header Cross-Origin-Resource-Policy "cross-origin" always;
         add_header Access-Control-Allow-Origin "*" always;
         add_header X-Content-Type-Options "nosniff" always;

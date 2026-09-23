@@ -16,9 +16,9 @@ services:
     ports:
         - "${VPS_IP:-0.0.0.0}:${NGINX_PORT:-24320}:80"
     volumes:
-      - /mnt/c/edrive/projects/DrivePod/data:/mnt/c/edrive/projects/DrivePod/data
-      - /mnt/c/edrive/projects/DrivePod/cache:/mnt/c/edrive/projects/DrivePod/cache
-      - /mnt/c/edrive/projects/ytcookies/data:/shared-cookies
+      - /home/lab/projects/DrivePod/data:/home/lab/projects/DrivePod/data
+      - /home/lab/projects/DrivePod/cache:/home/lab/projects/DrivePod/cache
+      - /home/lab/projects/ytcookies/data:/shared-cookies
       - /lib/modules:/lib/modules:ro
     env_file:
       - .env
