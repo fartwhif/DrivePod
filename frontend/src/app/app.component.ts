@@ -41,6 +41,7 @@ interface Config {
   // NEW: GrabbyTube shufflebag mix
   grabbyMixEnabled: boolean;
   grabbyMixRatio: number;
+  grabbyClusterMaxSize: number;
 }
 
 interface ImportResult {
@@ -69,6 +70,7 @@ interface HarvestStatus {
   channelsProcessed: number;
   totalChannels: number;
   lastUpdate: string | null;
+  session?: { state: string; ts: number | null; fresh: boolean };
 }
 
 @Component({
@@ -116,6 +118,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // NEW: GrabbyTube shufflebag mix toggle
   grabbyMixEnabled = signal(true);
   grabbyMixRatio = signal(3);
+  grabbyClusterMaxSize = signal(0);
 
   // 56K MODEM OPTIMIZATIONS
    lowBandwidthMode = signal(false);
@@ -143,7 +146,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     totalVideosThisRun: 0,
     channelsProcessed: 0,
     totalChannels: 0,
-    lastUpdate: null
+    lastUpdate: null,
+    session: { state: 'unknown', ts: null, fresh: false }
   });
 
   // Index-based client-side paging
@@ -195,6 +199,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private readonly BASE_PLAY_RETRY_DELAY = 3000;
   private readonly MAX_PLAY_RETRY_DELAY = 30000;
   private readonly PLAY_RETRY_MULTIPLIER = 1.5;
+
+  // Bounded failure count for tracks that exist on the server (HEAD 200)
+  // but the <audio> element cannot play (corrupt cache file). Without a
+  // bound, error handlers reload the same file forever and jam the player
+  // on one unplayable track (observed: ~200 req/s error loop).
+  private _trackPlayFailures = new Map<string, number>();
+  private readonly MAX_TRACK_PLAY_FAILURES = 2;
 
   // Always-on connectivity probe for playback recovery
   private alwaysOnProbeTimer: any = null;
@@ -295,6 +306,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         // NEW: Load GrabbyTube shufflebag mix
         this.grabbyMixEnabled.set(config.grabbyMixEnabled ?? true);
         this.grabbyMixRatio.set(config.grabbyMixRatio ?? 3);
+        this.grabbyClusterMaxSize.set(config.grabbyClusterMaxSize ?? 0);
 
         // Derive initial playlists from index if already loaded
         if (this.rawIndex().length > 0) {
@@ -798,10 +810,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     };
 
     this.audio.onerror = () => {
-      const video = this.currentVideo();
-      if (video) {
-        console.warn('Audio playback error for', video.videoId, '-- probing');
-        this._handleAudioError(video.videoId);
+      // The error belongs to the src currently on the element — which may
+      // differ from currentVideo if we already advanced past the failing
+      // track. Stale errors for an abandoned track must be ignored.
+      const m = /\/api\/stream\/([A-Za-z0-9_-]+)/.exec(this.audio.src);
+      const videoId = m ? m[1] : (this.currentVideo()?.videoId ?? null);
+      if (videoId) {
+        console.warn('Audio playback error for', videoId, '-- probing');
+        this._handleAudioError(videoId);
       } else {
         console.warn('Audio playback error (no current video)');
         this.setMediaPlaybackState('none');
@@ -819,6 +835,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     };
 
     this.audio.onplay = () => this.setMediaPlaybackState('playing');
+
+    // Successful playback clears any recorded failures for this track.
+    this.audio.onplaying = () => {
+      const video = this.currentVideo();
+      if (video) this._trackPlayFailures.delete(video.videoId);
+    };
 
     window.addEventListener('beforeunload', this.handleBeforeUnload.bind(this));
     window.addEventListener('online', this.handleOnline.bind(this));
@@ -1326,6 +1348,15 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                       this.audio.src = '';
                       this.setMediaPlaybackState('none');
                       this.advanceToNextTrack();
+                    } else if (res2.ok) {
+                      // Bounded: the failure counter skips a track that keeps
+                      // failing to load; otherwise one more reload attempt.
+                      this._registerTrackPlayFailure(video.videoId);
+                      const current = this.currentVideo();
+                      if (current && current.videoId === video.videoId) {
+                        this.loadAndSeekVideo(video);
+                        this.audio.play().catch(() => {});
+                      }
                     }
                   })
                   .catch(() => {
@@ -1358,8 +1389,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           console.warn(`Audio error: track ${videoId} is defunct -- skipping`);
           this._skipDefunctTrack(videoId);
         } else if (res.ok) {
+          this._registerTrackPlayFailure(videoId);
           const video = this.currentVideo();
-          if (video) {
+          // The register call may have already skipped the track (and
+          // advanced) — only reload if this track is still current.
+          if (video && video.videoId === videoId) {
             console.log(`Audio error: reloading ${videoId}`);
             this.loadAndSeekVideo(video);
             this.audio.play().catch(() => {});
@@ -1367,6 +1401,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         }
       })
       .catch(() => {});
+  }
+
+  /**
+   * Count a playback failure for a track the server says exists but the
+   * <audio> element cannot play (corrupt cache file). After
+   * MAX_TRACK_PLAY_FAILURES, treat it as broken: mark watched and advance
+   * instead of reloading the same unplayable file forever.
+   */
+  private _registerTrackPlayFailure(videoId: string): void {
+    const n = (this._trackPlayFailures.get(videoId) || 0) + 1;
+    this._trackPlayFailures.set(videoId, n);
+    if (n >= this.MAX_TRACK_PLAY_FAILURES) {
+      this._trackPlayFailures.delete(videoId);
+      console.warn(`Track ${videoId} failed to play ${n} times despite existing on the server -- skipping as broken`);
+      this._skipDefunctTrack(videoId);
+    }
   }
 
   /** Skip a defunct track: mark watched locally, remove from playlist, advance. */
@@ -1544,7 +1594,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       maxDurationMinutes: this.maxDurationMinutes(),
       // NEW GrabbyTube shufflebag mix
       grabbyMixEnabled: this.grabbyMixEnabled(),
-      grabbyMixRatio: this.grabbyMixRatio()
+      grabbyMixRatio: this.grabbyMixRatio(),
+      grabbyClusterMaxSize: this.grabbyClusterMaxSize()
     }).subscribe();
   }
 
@@ -1563,6 +1614,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   onBitrateChange() { this.saveConfig(); }
   onMonoChange() { this.saveConfig(); }
   setGrabbyRatio(val: number) { this.grabbyMixRatio.set(Math.min(20, Math.max(1, val))); this.saveConfig(); }
+  setGrabbyClusterMaxSize(val: number) { this.grabbyClusterMaxSize.set(Math.max(0, Math.floor(val))); this.saveConfig(); }
 
   startEditing(channelId: string, currentTitle: string) {
     this.editingChannelId.set(channelId);

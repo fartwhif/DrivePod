@@ -259,6 +259,50 @@ async function cleanupCorruptedFolders() {
       } catch (e) {
         console.error(`   ❌ Failed to delete ${videoId}`);
       }
+    } else if (videoRecord.isGrabby !== true) {
+      // Post-publish integrity gate: the 9p-mounted Windows cache path
+      // has corrupted finished MP3s after validation passed (2026-09-20:
+      // one track's head spliced ahead of another track's tail, under
+      // concurrent write load; no sync software involved) and leading zero-holes
+      // (1.8MB of zeros replacing the ID3+Xing head and first minutes).
+      // A clean published file starts with an ID3 tag or a frame sync, and
+      // its Xing "bytes" field + tag size equals its file size.
+      let corruption: string | null = null;
+      const mp3Path = path.join(folderPath, `${videoId}.mp3`);
+      try {
+        const fd = fs.openSync(mp3Path, 'r');
+        const head = Buffer.alloc(16);
+        const hn = fs.readSync(fd, head, 0, 16, 0);
+        fs.closeSync(fd);
+        if (hn === 16) {
+          const isId3 = head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33; // "ID3"
+          const isFrameSync = head[0] === 0xFF && (head[1] & 0xE0) === 0xE0;
+          if (!isId3 && !isFrameSync) {
+            corruption = `junk at file start (head: ${head.slice(0, 4).toString('hex')}) — zero-hole or sync-merge artifact`;
+          }
+        }
+      } catch { /* unreadable: skip header checks */ }
+      if (!corruption) {
+        const claim = readMp3HeaderClaim(mp3Path);
+        if (claim) {
+          const actual = fs.statSync(mp3Path).size;
+          const tolerance = Math.max(4096, Math.floor(claim.claimedSize * 0.005));
+          if (Math.abs(actual - claim.claimedSize) > tolerance) {
+            corruption = `size/header mismatch (file ${actual}B vs header claim ${claim.claimedSize}B) — truncation or I/O-path merge`;
+          }
+        }
+      }
+      if (corruption) {
+        console.log(`   🚨 CORRUPTED: ${videoId} → ${corruption}`);
+        try {
+          fs.rmSync(folderPath, { recursive: true, force: true });
+          await prisma.video.deleteMany({ where: { videoId, isGrabby: false } });
+          await updateIndexFile();
+          console.log(`   ✅ Deleted corrupted folder + DB entry: ${videoId}`);
+        } catch (e) {
+          console.error(`   ❌ Failed to delete corrupted ${videoId}`);
+        }
+      }
     }
   }
 
@@ -414,6 +458,13 @@ async function distributeGrabbyItems(): Promise<void> {
     return;
   }
 
+  // Optional cap on the total number of grabby items in a cluster band
+  // (past hour around the newest normal content, incl. the ±30-min jitter).
+  // Applies across runs, not just one: the 5-min cron re-distributes
+  // constantly, so a per-run cap let a single cluster grow well past it.
+  // 0 = no limit (default, preserves current behavior).
+  const clusterMaxSize = parseInt(await getConfig('grabbyClusterMaxSize', '0')) || 0;
+
   // Ensure GrabbyTube channel exists
   await prisma.channel.upsert({
     where: { channelId: GRABBY_CHANNEL_ID },
@@ -453,7 +504,7 @@ async function distributeGrabbyItems(): Promise<void> {
     where: {
       isGrabby: true,
       ignored: false,
-      publishedAt: { gte: new Date(oneHourAgo), lte: newestNormal.publishedAt }
+      publishedAt: { gte: new Date(oneHourAgo), lte: new Date(newestTime + 30 * 60 * 1000) }
     },
     select: { duration: true }
   });
@@ -488,9 +539,26 @@ async function distributeGrabbyItems(): Promise<void> {
   const avgGrabbyDuration = allDurations.length
     ? allDurations.reduce((a, b) => a + b, 0) / allDurations.length
     : 240;
-  const estimatedCount = Math.ceil(neededDuration / avgGrabbyDuration) + 5; // buffer
+  let estimatedCount = Math.ceil(neededDuration / avgGrabbyDuration) + 5; // buffer
+  let toPull = estimatedCount;
+  if (clusterMaxSize > 0) {
+    // Cap the whole cluster band, not just this run: grabby items already
+    // clustered in the window by earlier cron runs count against the cap.
+    const inCluster = await prisma.video.count({
+      where: {
+        isGrabby: true,
+        ignored: false,
+        publishedAt: { gte: new Date(oneHourAgo), lte: new Date(newestTime + 30 * 60 * 1000) }
+      }
+    });
+    toPull = Math.min(toPull, clusterMaxSize - inCluster);
+    if (toPull <= 0) {
+      console.log(`✅ [ShuffleBag] Cluster cap ${clusterMaxSize} already met (${inCluster} in band) — skipping`);
+      return;
+    }
+  }
 
-  const pulled = await pullFromShuffleBag(estimatedCount);
+  const pulled = await pullFromShuffleBag(toPull);
   if (pulled.length === 0) {
     console.log(`⚠️ [ShuffleBag] No items available in shufflebag`);
     return;
@@ -573,7 +641,7 @@ async function distributeGrabbyItems(): Promise<void> {
   }
   await updateIndexFile();
 
-  console.log(`✅ [ShuffleBag] ${toInsert.length} inserted + ${reusedCount} reconditioned grabby items (${Math.round(accumulatedDuration)}s total)`);
+  console.log(`✅ [ShuffleBag] ${toInsert.length} inserted + ${reusedCount} reconditioned grabby items (${Math.round(accumulatedDuration)}s total${clusterMaxSize > 0 ? `, cluster cap ${clusterMaxSize}` : ''})`);
 }
 
 /**
@@ -1063,9 +1131,34 @@ comment=${JSON.stringify(commentData)}
     if (preferredMono) args.splice(args.length - 1, 0, '-ac', '1');
 
     const ffmpegCmd = `ffmpeg ${args.join(' ')}`;
-    await safeExec(ffmpegCmd, `ffmpeg transcoding ${videoId}`);
+    const vbrfixCmd = `vbrfix -always "${mp3}" "${mp3}.vbrfix.tmp" && mv -f "${mp3}.vbrfix.tmp" "${mp3}"`;
 
-    await safeExec(`vbrfix -always "${mp3}" "${mp3}.vbrfix.tmp" && mv -f "${mp3}.vbrfix.tmp" "${mp3}"`, `vbrfix ${videoId}`);
+    const transcode = async (attempt: number) => {
+      await safeExec(ffmpegCmd, `ffmpeg transcoding ${videoId} (attempt ${attempt})`);
+      await safeExec(vbrfixCmd, `vbrfix ${videoId} (attempt ${attempt})`);
+    };
+
+    await transcode(1);
+
+    // Validate the finished file before publishing. Silent I/O failures on
+    // the synced cache drive have produced zero-holed MP3s that ffprobe
+    // still reports as valid (duration estimated from file size) but that
+    // no player can demux. One re-transcode attempt, then discard.
+    const expectedDuration = typeof videoInfo.duration === 'number' && videoInfo.duration > 0
+      ? videoInfo.duration
+      : null;
+    let validation = await validateMp3File(mp3, expectedDuration);
+    if (!validation.ok) {
+      console.warn(`⚠️ MP3 validation failed for ${videoId} (${validation.reason}) — re-transcoding once`);
+      try { fs.unlinkSync(mp3); } catch { }
+      await transcode(2);
+      validation = await validateMp3File(mp3, expectedDuration);
+    }
+    if (!validation.ok) {
+      console.error(`❌ MP3 failed validation for ${videoId} after re-transcode (${validation.reason}) — discarding track`);
+      try { fs.unlinkSync(mp3); } catch { }
+      return false;
+    }
 
     if (fs.existsSync(raw)) fs.unlinkSync(raw);
 
@@ -1125,6 +1218,155 @@ async function getAudioDuration(filePath: string): Promise<number | null> {
     return isNaN(d) ? null : Math.round(d * 10) / 10;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Parse the leading ID3v2 tag + Xing/Info header of a CBR MP3 and return
+ * the total file size the header claims (tag end + Xing "bytes" field).
+ * vbrfix's byte count is exact for an untouched file, so any real deviation
+ * means the file was truncated or had foreign bytes spliced in. Returns
+ * null when the header can't be read (then the size check is skipped).
+ */
+function readMp3HeaderClaim(filePath: string): { claimedSize: number } | null {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const head = Buffer.alloc(16);
+      if (fs.readSync(fd, head, 0, 16, 0) < 16) return null;
+      let tagEnd = 0;
+      if (head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33) { // "ID3"
+        const sz = ((head[6] & 127) << 21) | ((head[7] & 127) << 14) | ((head[8] & 127) << 7) | (head[9] & 127);
+        tagEnd = 10 + sz;
+        if (tagEnd > 1 << 20) return null;
+      } else if (!(head[0] === 0xff && (head[1] & 0xe0) === 0xe0)) {
+        return null;
+      }
+      const tail = Buffer.alloc(256);
+      const tn = fs.readSync(fd, tail, 0, 256, tagEnd);
+      if (tn < 24) return null;
+      for (let i = 0; i + 16 <= tn; i++) {
+        const t = tail.slice(i, i + 4).toString('ascii');
+        if (t !== 'Xing' && t !== 'Info') continue;
+        // Accept only the canonical position (i=4, right after the frame
+        // header) or a zero-filled gap (vbrfix pads 0x00 before its Info
+        // tag) — never audio bytes that happen to spell "Xing"/"Info".
+        let canonical = true;
+        for (let j = 4; j < i; j++) {
+          if (tail[j] !== 0) { canonical = false; break; }
+        }
+        if (!canonical) break;
+        const flags = tail.readUInt32BE(i + 4);
+        if (!(flags & 2)) return null; // no "bytes" field — cannot verify
+        const countOff = i + 8 + ((flags & 1) ? 4 : 0);
+        return { claimedSize: tagEnd + tail.readUInt32BE(countOff) };
+      }
+      return null;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate a finished MP3 before it is published to the queue.
+ *
+ * The cache dir lives on a synced Windows drive (9p), where silent I/O
+ * failures have produced files with zero-padded holes (observed: 46MB of
+ * leading zeros on an otherwise complete file). ffprobe cannot catch that —
+ * it estimates duration from file size and reports success — but no player
+ * can demux such a file (Chrome: MEDIA_ERR_SRC_NOT_SUPPORTED,
+ * "DEMUXER_ERROR_COULD_NOT_OPEN"). Checks:
+ *  1. No run of 256KB+ consecutive zero bytes. Valid MP3 frames are
+ *     417–480 bytes and start with a 0xFF sync; even silence is framed,
+ *     so a run this long is always a hole, never audio.
+ *  2. File starts with an ID3 tag or an MP3 frame sync.
+ *  3. Has a Xing/Info header. vbrfix -always guarantees one; ffprobe warns
+ *     "Estimating duration from bitrate" when the header is missing.
+ *  4. Probed duration is finite and, if the caller knows the expected one,
+ *     within 10% (min 30s).
+ *  5. File size matches the Xing/Info header claim (tag end + "bytes"
+ *     field). vbrfix writes an exact count; the 9p-mounted Windows cache
+ *     path has merged bytes of a concurrently-written file into a
+ *     finished MP3 — hybrids with real audio from two videos that pass
+ *     every other check (observed 2026-09-20: 23.8MB of one track spliced
+ *     ahead of another track's tail).
+ */
+async function validateMp3File(filePath: string, expectedDuration: number | null): Promise<{ ok: boolean; reason: string }> {
+  const MAX_ZERO_RUN = 256 * 1024;
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    let totalBytes = 0;
+    try {
+      const CHUNK = 4 * 1024 * 1024;
+      const buf = Buffer.alloc(CHUNK);
+      let carriedRun = 0;
+      let offset = 0;
+      let headChecked = false;
+      while (true) {
+        const n = fs.readSync(fd, buf, 0, CHUNK, offset);
+        if (n === 0) break;
+        totalBytes += n;
+        if (!headChecked) {
+          headChecked = true;
+          const isId3 = buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33; // "ID3"
+          const isFrameSync = buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0;
+          if (!isId3 && !isFrameSync) {
+            return { ok: false, reason: `no ID3 tag or frame sync at file start (head: ${buf.slice(0, 4).toString('hex')})` };
+          }
+        }
+        let run = carriedRun;
+        for (let i = 0; i < n; i++) {
+          if (buf[i] === 0) {
+            if (++run > MAX_ZERO_RUN) {
+              return { ok: false, reason: `zero-hole: ${run >> 10}KB+ of consecutive zero bytes` };
+            }
+          } else {
+            run = 0;
+          }
+        }
+        carriedRun = run;
+        offset += n;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (totalBytes === 0) return { ok: false, reason: 'empty file' };
+
+    let stdout: string, stderr: string;
+    try {
+      ({ stdout, stderr } = await safeExec(
+        `ffprobe -v warning -show_entries format=duration -of csv=p=0 "${filePath}"`,
+        `ffprobe validate ${path.basename(filePath)}`
+      ));
+    } catch (err) {
+      return { ok: false, reason: `ffprobe failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    const duration = parseFloat(stdout.trim());
+    if (isNaN(duration) || duration <= 0) {
+      return { ok: false, reason: `ffprobe duration invalid: "${stdout.trim()}"` };
+    }
+    if (/estimating duration from bitrate/i.test(stderr)) {
+      return { ok: false, reason: 'missing Xing/Info header (vbrfix output not applied?)' };
+    }
+    if (expectedDuration && expectedDuration > 0) {
+      const tolerance = Math.max(30, expectedDuration * 0.1);
+      if (Math.abs(duration - expectedDuration) > tolerance) {
+        return { ok: false, reason: `duration mismatch: probed ${duration.toFixed(1)}s vs expected ${expectedDuration.toFixed(1)}s` };
+      }
+    }
+    const claim = readMp3HeaderClaim(filePath);
+    if (claim) {
+      const tolerance = Math.max(4096, Math.floor(claim.claimedSize * 0.005));
+      if (Math.abs(totalBytes - claim.claimedSize) > tolerance) {
+        return { ok: false, reason: `size/header mismatch: file is ${totalBytes}B but Xing header claims ${claim.claimedSize}B (truncated or I/O-path merge)` };
+      }
+    }
+    return { ok: true, reason: '' };
+  } catch (err) {
+    return { ok: false, reason: `validation error: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -1310,6 +1552,28 @@ async function ignoreVideo(videoInfo: {
   }
 }
 
+// === SESSION GATE (ytcookies) ===
+// ytcookies writes the shared cookie file's liveness next to it. While the
+// session is dead, harvesting only burns yt-dlp runs against dead cookies
+// (worse for keeping a session alive) and every write-back refreshes the
+// file's mtime, delaying ytcookies' re-seed after a re-sign-in. Missing or
+// stale file (ytcookies container down) means "don't gate".
+const SESSION_STATE_FILE = '/shared-cookies/session-state.json';
+const SESSION_STATE_MAX_AGE_MS = 30 * 60 * 1000; // probes run every ~10.5 min
+let lastSessionGateSkipLog = 0;
+
+function sessionGateOpen(): boolean {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSION_STATE_FILE, 'utf-8'));
+    if (typeof parsed?.ts !== 'number') return true;
+    if (Date.now() - parsed.ts * 1000 > SESSION_STATE_MAX_AGE_MS) return true; // ts is epoch seconds
+    return parsed.state === 'up';
+  } catch {
+    return true;
+  }
+}
+
+
 // === HARVESTER ===
 async function harvestAndPurge() {
   if (isHarvesting) {
@@ -1318,6 +1582,14 @@ async function harvestAndPurge() {
   }
   if (isImporting) {
     console.log(`⏳ [${logTimestamp()}] Import in progress — skipping harvest`);
+    return;
+  }
+
+  if (!sessionGateOpen()) {
+    if (Date.now() - lastSessionGateSkipLog > 10 * 60 * 1000) {
+      lastSessionGateSkipLog = Date.now();
+      console.log(`⏸️ [${logTimestamp()}] Cookie session dead (ytcookies state file) — skipping harvest round`);
+    }
     return;
   }
 
@@ -1495,6 +1767,7 @@ async function harvestAndPurge() {
                 title: item.title || 'Untitled',
                 author: currentChannel.title || 'Unknown Channel',
                 publishedAt,
+                duration: item.duration ? Number(item.duration) : undefined,
               };
 
               const activeItem = harvestStatus.activeItems.find(i => i.channelId === currentChannel.channelId);
@@ -1621,7 +1894,21 @@ async function harvestAndPurge() {
 // ====================== API ROUTES ======================
 
 // === HARVEST STATUS ===
-app.get('/api/harvest-status', (_, res) => res.json(harvestStatus));
+app.get('/api/harvest-status', (_, res) => {
+  let session = { state: 'unknown', ts: null as number | null, fresh: false };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSION_STATE_FILE, 'utf-8'));
+    const ts: number | null = typeof parsed?.ts === 'number' ? parsed.ts : null;
+    session = {
+      state: typeof parsed?.state === 'string' ? parsed.state : 'unknown',
+      ts,
+      fresh: ts !== null && Date.now() - ts * 1000 <= SESSION_STATE_MAX_AGE_MS,
+    };
+  } catch {
+    // no state file (ytcookies down): report unknown, don't fail the request
+  }
+  res.json({ ...harvestStatus, session });
+});
 
 app.get('/api/config', async (_, res) => {
   const maxHarvestDays = await getConfig('maxHarvestDays', '7');
@@ -1649,6 +1936,7 @@ app.get('/api/config', async (_, res) => {
   // NEW: GrabbyTube shufflebag mix
   const grabbyMixEnabled = await getConfig('grabbyMixEnabled', 'true');
   const grabbyMixRatio = await getConfig('grabbyMixRatio', '3');
+  const grabbyClusterMaxSize = await getConfig('grabbyClusterMaxSize', '0');
 
   res.json({
     maxHarvestDays: parseInt(maxHarvestDays),
@@ -1671,7 +1959,8 @@ app.get('/api/config', async (_, res) => {
     maxDurationMinutes: parseInt(maxDurationMinutes),
     // NEW GrabbyTube shufflebag mix
     grabbyMixEnabled: grabbyMixEnabled === 'true',
-    grabbyMixRatio: parseInt(grabbyMixRatio)
+    grabbyMixRatio: parseInt(grabbyMixRatio),
+    grabbyClusterMaxSize: parseInt(grabbyClusterMaxSize)
   });
 });
 
@@ -1682,7 +1971,7 @@ app.post('/api/config', async (req, res) => {
     // NEW duration filter
     durationFilterEnabled, minDurationMinutes, maxDurationMinutes,
     // NEW GrabbyTube shufflebag mix
-    grabbyMixEnabled, grabbyMixRatio } = req.body;
+    grabbyMixEnabled, grabbyMixRatio, grabbyClusterMaxSize } = req.body;
 
   if (maxHarvestDays !== undefined) await setConfig('maxHarvestDays', String(maxHarvestDays));
   if (preferredBitrate !== undefined) await setConfig('preferredBitrate', String(preferredBitrate));
@@ -1708,6 +1997,7 @@ app.post('/api/config', async (req, res) => {
   // NEW GrabbyTube shufflebag mix config
   if (grabbyMixEnabled !== undefined) await setConfig('grabbyMixEnabled', String(grabbyMixEnabled));
   if (grabbyMixRatio !== undefined) await setConfig('grabbyMixRatio', String(grabbyMixRatio));
+  if (grabbyClusterMaxSize !== undefined) await setConfig('grabbyClusterMaxSize', String(grabbyClusterMaxSize));
 
   res.json({ success: true });
 });

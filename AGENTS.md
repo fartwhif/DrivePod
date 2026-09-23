@@ -11,6 +11,17 @@
 ## Workflow Reminders
 - Use `Task`/`explore` agents for complex searches.
 - Run full consistency cleanup + build after changes.
+- **Post-transcode MP3 validation is mandatory** (`validateMp3File` in
+  `downloadAndProcessVideo`): zero-hole scan, head check, Xing header,
+  duration check, size-vs-Xing-header claim (`readMp3HeaderClaim`) —
+  re-transcode once, then discard. `cleanupCorruptedFolders()` re-checks
+  head + size claim on every published file each harvest and quarantines
+  failures: the 9p-mounted Windows cache path corrupts files
+  **after** publication (zero-holes and cross-file byte-merges under
+  concurrent write load observed 2026-09-20; no sync software involved —
+  suspected 9p/drvfs I/O layer). See ARCHITECTURE.md §5.5/§6.
+- Frontend caps repeated load failures per track (`MAX_TRACK_PLAY_FAILURES`)
+  and skips unplayable-but-present tracks instead of reloading forever.
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 
 ## Project Roots
@@ -19,4 +30,4 @@
 - Harvest runs on cron + manual.
 
 Update this file with new patterns after each task.
-Last updated: 2026-08-30 (added ARCHITECTURE.md pointer; docs audited)
+Last updated: 2026-09-21 (MP3 size/head integrity gate + post-publish sweep in `cleanupCorruptedFolders`)
