@@ -3,8 +3,7 @@ dotenv.config({ path: '/app/.env' });
 
 import express from 'express';
 import cors from 'cors';
-import { PrismaClient } from '@prisma/client';
-import { Video } from '@prisma/client';
+import { Prisma, PrismaClient, Video } from '@prisma/client';
 import Parser from 'rss-parser';
 import cron from 'node-cron';
 import bodyParser from 'body-parser';
@@ -347,6 +346,87 @@ interface ShuffleBagEntry {
 }
 
 /**
+ * GrabbyTube tracks are grouped under per-artist placeholder channels:
+ * channelId = 'UCGrabbyTube' + base64url(artist), title = artist. The SPA /
+ * car head unit already display "channel name = artist", so grabby tracks
+ * show their real artist with zero re-encoding and zero file re-tagging.
+ * The bare GRABBY_CHANNEL_ID stays as fallback for items without an author.
+ */
+function grabbyChannelIdForArtist(artist: string): string {
+  return GRABBY_CHANNEL_ID + Buffer.from(artist, 'utf-8').toString('base64url');
+}
+
+function grabbyAuthor(meta: unknown): string {
+  if (!meta || typeof meta !== 'object' || !('author' in meta)) return '';
+  const author = meta.author;
+  return typeof author === 'string' ? author.trim() : '';
+}
+
+const ensuredGrabbyArtistChannels = new Set<string>();
+
+/**
+ * Upsert the per-artist placeholder channel (inactive, order 999999 — never
+ * harvested, hidden from Settings, undeletable via the UCGrabbyTube* guard).
+ */
+async function ensureGrabbyArtistChannel(artist: string): Promise<string> {
+  const channelId = grabbyChannelIdForArtist(artist);
+  if (!ensuredGrabbyArtistChannels.has(channelId)) {
+    ensuredGrabbyArtistChannels.add(channelId);
+    try {
+      await prisma.channel.upsert({
+        where: { channelId },
+        update: { title: artist },
+        create: { channelId, title: artist, order: 999999, active: false }
+      });
+    } catch (e) {
+      // A concurrent startup path (backfill + first harvest) may have created
+      // the same channel between our read and write — that's fine.
+      const exists = await prisma.channel.findUnique({ where: { channelId } });
+      if (!exists) throw e;
+    }
+  }
+  return channelId;
+}
+
+/**
+ * Startup backfill: re-point existing grabby rows at per-artist channels
+ * using authors from grabby-index.json (rows created before per-artist
+ * channels existed). Idempotent; no-op once everything is re-pointed.
+ */
+async function backfillGrabbyArtistChannels(): Promise<void> {
+  const grabbyMap = loadGrabbyIndex();
+  if (grabbyMap.size === 0) return;
+  const rows = await prisma.video.findMany({
+    where: { isGrabby: true },
+    select: { id: true, videoId: true, channelId: true }
+  });
+  const byArtist = new Map<string, { channelId: string; ids: string[] }>();
+  for (const row of rows) {
+    const author = grabbyAuthor(grabbyMap.get(row.videoId));
+    if (!author) continue;
+    const channelId = grabbyChannelIdForArtist(author);
+    if (channelId === row.channelId) continue;
+    let entry = byArtist.get(author);
+    if (!entry) { entry = { channelId, ids: [] }; byArtist.set(author, entry); }
+    entry.ids.push(row.id);
+  }
+  let moved = 0;
+  for (const [artist, { channelId, ids }] of byArtist) {
+    await ensureGrabbyArtistChannel(artist);
+    const res = await prisma.video.updateMany({ where: { id: { in: ids } }, data: { channelId } });
+    moved += res.count;
+  }
+  if (moved > 0) {
+    console.log(`🎨 [GrabbyArtists] Re-pointed ${moved} grabby rows across ${byArtist.size} artist channels`);
+    // Regenerate so the SPA/headunit shows the new artist immediately instead
+    // of waiting for the next 5-minute harvest to rewrite index.json.
+    await updateIndexFile();
+  } else {
+    console.log(`🎨 [GrabbyArtists] All grabby rows already point at artist channels`);
+  }
+}
+
+/**
  * Load grabby-index.json, filter defunct items (MP3 missing),
  * Fisher-Yates shuffle, and persist to shufflebag.json.
  */
@@ -588,25 +668,29 @@ async function distributeGrabbyItems(): Promise<void> {
       // Recondition the existing row: refresh its timestamp to cluster near the
       // newest normal content and reset its playback state, so it re-enters the
       // mix window instead of being skipped.
-      await prisma.video.update({
-        where: { id: existing.id },
-        data: {
-          publishedAt: clusterTimestamp(newestNormal.publishedAt),
-          duration,
-          title: meta.title || existing.title,
-          thumbnailPath: meta.thumbnailPath ? `/cache/${meta.thumbnailPath}` : existing.thumbnailPath,
-          audioPath: mp3Path,
-          isGrabby: true,
-          watched: false,
-          progress: 0
-        }
-      });
+      const data: Prisma.VideoUpdateInput = {
+        publishedAt: clusterTimestamp(newestNormal.publishedAt),
+        duration,
+        title: meta.title || existing.title,
+        thumbnailPath: meta.thumbnailPath ? `/cache/${meta.thumbnailPath}` : existing.thumbnailPath,
+        audioPath: mp3Path,
+        isGrabby: true,
+        watched: false,
+        progress: 0
+      };
+      const author = grabbyAuthor(meta);
+      if (author) {
+        const artistChannelId = await ensureGrabbyArtistChannel(author);
+        if (artistChannelId !== existing.channelId) data.channel = { connect: { channelId: artistChannelId } };
+      }
+      await prisma.video.update({ where: { id: existing.id }, data });
       reusedCount++;
       console.log(`   ♻️ [ShuffleBag] Reconditioned existing: ${entry.videoId}`);
     } else {
+      const author = grabbyAuthor(meta);
       toInsert.push({
         videoId: entry.videoId,
-        channelId: GRABBY_CHANNEL_ID,
+        channelId: author ? await ensureGrabbyArtistChannel(author) : GRABBY_CHANNEL_ID,
         title: meta.title || 'GrabbyTube Track',
         publishedAt: clusterTimestamp(newestNormal.publishedAt),
         thumbnailPath: meta.thumbnailPath ? `/cache/${meta.thumbnailPath}` : null,
@@ -2110,8 +2194,8 @@ app.delete('/api/channels/:channelId', async (req, res) => {
   const channelId = req.params.channelId;
   console.log(`🗑️ Deleting channel: ${channelId}`);
 
-  // Protect the GrabbyTube placeholder channel from deletion
-  if (channelId === GRABBY_CHANNEL_ID) {
+  // Protect the GrabbyTube placeholder channels (base + per-artist) from deletion
+  if (channelId.startsWith(GRABBY_CHANNEL_ID)) {
     console.log(`🛡️ Refusing to delete GrabbyTube placeholder channel`);
     return res.status(403).json({ error: 'Cannot delete GrabbyTube channel' });
   }
@@ -2839,6 +2923,10 @@ app.get('/api/stream/:videoId', async (req, res) => {
 // === START ===
 initShuffleBag().then(() => {
   console.log(`🎵 [ShuffleBag] Startup init complete`);
+});
+
+backfillGrabbyArtistChannels().catch((err: unknown) => {
+  console.error(`❌ [GrabbyArtists] Startup backfill failed:`, err instanceof Error ? err.message : err);
 });
 
 cron.schedule('*/5 * * * *', harvestAndPurge);

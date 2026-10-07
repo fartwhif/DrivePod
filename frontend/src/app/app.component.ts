@@ -19,6 +19,18 @@ interface Video {
   isGrabby: boolean;
 }
 
+interface Channel {
+  id: string;
+  channelId: string;
+  title: string;
+  order: number;
+  ignoreScrapeDone: boolean;
+  active: boolean;
+  minDuration: number | null;
+  maxDuration: number | null;
+  createdAt: string;
+}
+
 interface Config {
   maxHarvestDays: number;
   preferredBitrate: number;
@@ -1139,7 +1151,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   loadChannels() {
-    this.http.get(`${this.apiUrl}/channels`).subscribe(data => this.channels.set(data as any[]));
+    this.http.get<Channel[]>(`${this.apiUrl}/channels`).subscribe(data => {
+      const list: Channel[] = Array.isArray(data) ? data : [];
+      // GrabbyTube per-artist placeholder channels (UCGrabbyTube*) are not
+      // harvest channels — hide them from Settings.
+      this.channels.set(list.filter(c => !c.channelId.startsWith('UCGrabbyTube')));
+    });
   }
 
   private refreshConfig() {
