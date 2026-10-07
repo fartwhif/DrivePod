@@ -2,6 +2,20 @@ server {
     listen 80;
     server_name _;
 
+    # Gzip text-ish responses. The http-level nginx.conf has `gzip on` but
+    # the default gzip_types is text/html only, so the up-to-1MB index.json
+    # and the 350KB main-*.js bundle went out raw on every poll. Level 5
+    # takes index.json from ~1.06MB to ~180KB on the wire; gzip_proxied
+    # covers the /api/ JSON the frontend also fetches.
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_types text/plain text/css application/json application/javascript
+        text/xml application/xml application/xml+rss text/javascript
+        image/svg+xml;
+
     # SPA shell. The HTML must revalidate on every load (no-cache) or
     # browsers serve the previous deploy's index.html from heuristic
     # cache and never pick up the new hashed bundle.
@@ -25,15 +39,19 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
-    # Live playlist index — regenerated on every state change. MUST never be
-    # cached (browser or proxy) or the queue shows a stale/inconsistent mix.
-    # Exact-match wins over the /cache/ prefix block below; MP3s + thumbnails
-    # keep their normal (cacheable) treatment.
-    location = /cache/index.json {
-        alias /home/lab/projects/DrivePod/cache/index.json;
-        add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
-        add_header Pragma "no-cache" always;
-        add_header Expires "0" always;
+    # Live playlist index (index.json) + live progress overlay
+    # (progress.json) — both regenerated on state changes. Never serve them
+    # stale, but make unchanged polls free: no max-age, so the browser
+    # revalidates on every request, and nginx's per-file ETag
+    # (inode/mtime/size) yields a 304 when the file was not regenerated.
+    # A regenerated file gets a new ETag, so the new version is always
+    # downloaded. The backend skips no-op rewrites to keep the ETag stable
+    # across unchanged harvest cycles. Regex wins over the /cache/ prefix
+    # block below; MP3s + thumbnails keep their normal (cacheable) treatment.
+    location ~ ^/cache/(index|progress)\.json$ {
+        root /home/lab/projects/DrivePod;
+        etag on;
+        add_header Cache-Control "no-cache" always;
         add_header Cross-Origin-Resource-Policy "cross-origin" always;
         add_header Access-Control-Allow-Origin "*" always;
         add_header X-Content-Type-Options "nosniff" always;
