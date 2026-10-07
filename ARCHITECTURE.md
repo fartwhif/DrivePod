@@ -169,7 +169,7 @@ Indexes: `[order]`.
 |---------------|-------------|---------------------------------------------------------|
 | `id`          | String (cuid) | PK                                                    |
 | `videoId`     | String @unique | YouTube ID (11 chars) or GrabbyTube track ID         |
-| `channelId`   | String (FK→Channel.channelId) | `UCGrabbyTube` for grabby items   |
+| `channelId`   | String (FK→Channel.channelId) | grabby items point at a **per-artist placeholder**: `UCGrabbyTube` + base64url(author), whose `title` = the artist (bare `UCGrabbyTube` when no author) |
 | `title`       | String      |                                                        |
 | `description` | String?     | (set from metadata JSON if present)                    |
 | `publishedAt` | DateTime    | **Grabby items carry a *clustered* timestamp** (±30 min around newest normal content), not the real upload date |
@@ -511,13 +511,22 @@ a duration ratio, so the player is never silent.
 - `grabby-index.json` — written by GrabbyTube (single writer):
   `{videoId, channelId, title, author, publishedAt: "YYYYMMDD", thumbnailPath, audioPath, duration, createdAt}`.
 - `shufflebag.json` — this app's FIFO state: `[{videoId, used}]`.
-- Placeholder channel `UCGrabbyTube` (inactive, `order 999999`, undeletable —
-  `DELETE /api/channels/UCGrabbyTube` → 403).
+- **Per-artist placeholder channels** `UCGrabbyTube<base64url(author)>`
+  (title = the artist, inactive, `order 999999`). The SPA / car head unit
+  render `channel.title` as the artist (media-session metadata, queue rows,
+  page title), so grabby tracks show their real artist with **no MP3
+  re-tagging or re-encoding**. Bare `UCGrabbyTube` is the fallback for items
+  without an author. `DELETE` of any `UCGrabbyTube*` → 403, and the Settings
+  tab hides all `UCGrabbyTube*` channels (frontend filter in `loadChannels`).
 
 **Lifecycle**:
 
 - **Init** (boot): upsert the placeholder channel; load grabby-index, drop
-  defunct items (mp3 missing on disk), Fisher–Yates shuffle, persist.
+  defunct items (mp3 missing on disk), Fisher–Yates shuffle, persist. In
+  parallel, `backfillGrabbyArtistChannels()` re-points any grabby row still
+  on a stale channel (e.g. pre-migration rows on bare `UCGrabbyTube`) to its
+  per-artist channel using the index's `author`, and regenerates
+  `index.json` if anything moved. Idempotent.
 - **Pull** (`pullFromShuffleBag(n)`): take n `used:false` entries in bag order
   (shuffled order = pseudo-random draw), mark used, persist. On exhaustion,
   reinitialize **once** (reusing items is allowed — grabby tracks re-enter the
@@ -542,8 +551,11 @@ a duration ratio, so the player is never silent.
      - **already in DB → "recondition"**: update row with clustered
        `publishedAt` (±30 min of newest normal content via
        `clusterTimestamp`), fresh title/thumb/duration, `watched:false,
-       progress:0` — the track cycles back into the mix window;
-     - **not in DB → insert** with `isGrabby:true, protected:false`.
+       progress:0`, and re-point to the per-artist channel if `author`
+       changed — the track cycles back into the mix window;
+     - **not in DB → insert** with `isGrabby:true, protected:false`,
+       `channelId` = the per-artist placeholder channel derived from the
+       index `author` (bare `UCGrabbyTube` when absent).
   6. Final pre-insert recheck for mp3s deleted mid-harvest (a concurrent
      grabby delete), then `createMany` + `updateIndexFile()`.
 
@@ -658,7 +670,7 @@ referenced in older docs does not exist.
 | PATCH | `/api/channels/:channelId/duration` | `{minDuration?,maxDuration?}` (null clears) |
 | POST | `/api/channels/reorder` | `{channelIds:[…]} → order = array index` |
 | POST | `/api/channels/import` | legacy: `{channelIds:[…]}` (RSS title fetch, 800 ms pacing) |
-| DELETE | `/api/channels/:channelId` | refuses `UCGrabbyTube` (403); deletes channel's non-grabby videos (folders + rows), RSS cache, clears `currentVideoId` if affected, regenerates index |
+| DELETE | `/api/channels/:channelId` | refuses any `UCGrabbyTube*` placeholder (403); deletes channel's non-grabby videos (folders + rows), RSS cache, clears `currentVideoId` if affected, regenerates index |
 
 ### Import (mixed)
 
