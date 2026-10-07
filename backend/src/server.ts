@@ -44,6 +44,8 @@ function effectiveCookiesFile(): string | null {
 }
 const INDEX_JSON_PATH = path.join(CACHE_DIR, 'index.json');
 const INDEX_TEMP_PATH = path.join(CACHE_DIR, 'index.tmp.json');
+const PROGRESS_JSON_PATH = path.join(CACHE_DIR, 'progress.json');
+const PROGRESS_TEMP_PATH = path.join(CACHE_DIR, 'progress.tmp.json');
 const GRABBY_INDEX_PATH = path.join(CACHE_DIR, 'grabby-index.json');
 const SHUFFLEBAG_JSON_PATH = path.join(CACHE_DIR, 'shufflebag.json');
 const GRABBY_CHANNEL_ID = 'UCGrabbyTube';
@@ -57,7 +59,7 @@ const parser = new Parser({
   }
 });
 
-if (!fs.existsSync(INDEX_JSON_PATH)) {
+if (!fs.existsSync(INDEX_JSON_PATH) || !fs.existsSync(PROGRESS_JSON_PATH)) {
   updateIndexFile();
 }
 
@@ -1370,6 +1372,15 @@ async function validateMp3File(filePath: string, expectedDuration: number | null
   }
 }
 
+/** The subset of index fields the progress overlay cares about. */
+interface IndexEntry {
+  videoId: string;
+  watched: boolean;
+  ignored: boolean;
+  progress: number;
+  duration: number | null;
+}
+
 async function updateIndexFile() {
   try {
     console.log(`📋 Updating ${INDEX_JSON_PATH} (atomic write)`);
@@ -1432,13 +1443,43 @@ async function updateIndexFile() {
       playlist.push(meta);
     }
 
-    // Atomic write
-    fs.writeFileSync(INDEX_TEMP_PATH, JSON.stringify(playlist, null, 2), 'utf-8');
-    fs.renameSync(INDEX_TEMP_PATH, INDEX_JSON_PATH);
-    console.log(`✅ playlist.json updated (${playlist.length} items)`);
+    // ── progress.json: the only file that churns during playback ──
+    // In-queue items (matches the frontend's getQueueVideos: !watched &&
+    // !ignored) with partial progress — usually 0–3 items, a few hundred
+    // bytes. Duration unknown → can't judge "max", so include it.
+    const progressList = playlist
+      .filter((m: IndexEntry) => !m.watched && !m.ignored && (m.progress || 0) > 0 &&
+        (m.duration == null || m.duration <= 0 || m.progress < m.duration))
+      .map((m: IndexEntry) => ({ videoId: m.videoId, progress: m.progress }));
+
+    // ── index.json: zero the progress ──
+    // Live progress lives in progress.json, so index.json stays byte-stable
+    // between real state changes and 304s while a track plays.
+    for (const m of playlist) m.progress = 0;
+
+    writeIfChanged(INDEX_JSON_PATH, INDEX_TEMP_PATH,
+      JSON.stringify(playlist, null, 2), `index.json (${playlist.length} items)`);
+    writeIfChanged(PROGRESS_JSON_PATH, PROGRESS_TEMP_PATH,
+      JSON.stringify(progressList, null, 2), `progress.json (${progressList.length} items)`);
   } catch (err: any) {
     console.error(`❌ Failed to update playlist.json:`, err.message);
   }
+}
+
+/**
+ * Atomically write `content` to `destPath` via `tempPath`, skipping when the
+ * existing file is byte-identical. A no-op rewrite would still bump
+ * inode/mtime and change nginx's ETag, turning every unchanged regeneration
+ * into a full 200 re-download instead of a free 304 revalidation.
+ */
+function writeIfChanged(destPath: string, tempPath: string, content: string, label: string): void {
+  if (fs.existsSync(destPath) && fs.readFileSync(destPath, 'utf-8') === content) {
+    console.log(`📋 ${label} unchanged — skipping write`);
+    return;
+  }
+  fs.writeFileSync(tempPath, content, 'utf-8');
+  fs.renameSync(tempPath, destPath);
+  console.log(`✅ ${label} updated`);
 }
 
 async function isFilteredOutByPubDate(item: any): Promise<boolean> {
