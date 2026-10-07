@@ -420,7 +420,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   // === Index-based client-side paging ===
 
-  /** Fetch the full index.json from nginx and derive all playlist signals. */
+  /** Fetch the index + progress overlay from nginx and derive all playlist signals. */
   private loadIndex(): void {
     // If backend is unreachable, defer the fetch until connectivity returns
     if (!this.backendOnline) {
@@ -428,14 +428,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    const headers: Record<string, string> = {};
-    // Cache-bust: timestamp query param + no-store prevents browser from serving stale cached index
-    const url = `/cache/index.json?_t=${Date.now()}`;
-    fetch(url, { headers, cache: 'no-store' })
-      .then(res => {
-        if (!res.ok) throw new Error(`index.json ${res.status}`);
-        return res.json();
-      })
+    this.fetchIndexWithProgress()
       .then((data: Video[]) => {
         this.backendOnline = true;
         this.indexFetchPending = false;
@@ -460,6 +453,47 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   /**
+   * Fetch the playlist index and the small live-progress overlay in parallel.
+   *
+   * index.json is the authoritative track list with `progress` zeroed, so it
+   * stays byte-stable and 304s while a track plays; progress.json carries
+   * only the in-queue items with 0 < progress < duration (a few hundred
+   * bytes). Both use stable URL + no-cache (revalidate): nginx sends an ETag
+   * per file state, so an unchanged file is a free 304 (~0 bytes) and any
+   * regenerated file changes the ETag so the new version is always
+   * downloaded. A 304 revalidation surfaces to fetch() as a 200 with the
+   * cached body.
+   *
+   * progress.json is best-effort: a 404 (first boot) or a failed fetch just
+   * means resume positions read 0 until the next poll.
+   */
+  private fetchIndexWithProgress(): Promise<Video[]> {
+    return Promise.all([
+      fetch(`/cache/index.json`, { cache: 'no-cache' })
+        .then(res => {
+          if (!res.ok) throw new Error(`index.json ${res.status}`);
+          return res.json() as Promise<Video[]>;
+        }),
+      fetch(`/cache/progress.json`, { cache: 'no-cache' })
+        .then(res =>
+          res.ok
+            ? (res.json() as Promise<{ videoId: string; progress: number }[]>)
+            : Promise.resolve([] as { videoId: string; progress: number }[]))
+        .catch(() => [] as { videoId: string; progress: number }[])
+    ]).then(([data, progress]) => {
+      if (progress.length) {
+        const byId: Record<string, number> = {};
+        for (const p of progress) byId[p.videoId] = p.progress;
+        for (const v of data) {
+          const p = byId[v.videoId];
+          if (p != null) v.progress = p;
+        }
+      }
+      return data;
+    });
+  }
+
+  /**
    * Merge locally-known state into a freshly fetched index.
    *
    * Watched: the server index is authoritative, EXCEPT for videos we just marked
@@ -467,9 +501,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    * Without the _localWatched guard, a refresh between the local mark and the
    * persisted server write re-surfaces the video in the queue.
    *
-   * Progress: local wins only when the server copy is 0 — the index itself
-   * carries progress from the periodic saves, so any non-zero server value is
-   * at least as fresh as our local one.
+   * Progress: local (the last known position on this device) wins when
+   * non-zero — for the track playing here the live audio position is the
+   * freshest; otherwise the server value (index + progress.json overlay)
+   * applies.
    */
   private mergeIndexWithLocal(data: Video[]): Video[] {
     const oldQueue = this.playlist();
@@ -1469,13 +1504,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    const headers: Record<string, string> = {};
-
-    fetch(`/cache/index.json?_t=${Date.now()}`, { headers, cache: 'no-store' })
-      .then(res => {
-        if (!res.ok) throw new Error(`index.json ${res.status}`);
-        return res.json();
-      })
+    this.fetchIndexWithProgress()
       .then((data: Video[]) => {
         this.backendOnline = true;
         this.indexFetchPending = false;
