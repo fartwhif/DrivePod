@@ -65,12 +65,15 @@ if (!fs.existsSync(INDEX_JSON_PATH) || !fs.existsSync(PROGRESS_JSON_PATH)) {
 const upload = multer({ storage: multer.memoryStorage() });
 
 // === SAFE EXEC WITH FULL ERROR LOGGING ===
-async function safeExec(cmd: string, context: string): Promise<{ stdout: string; stderr: string }> {
+async function safeExec(cmd: string, context: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string }> {
   try {
-    const result = await execPromise(cmd, { maxBuffer: 50 * 1024 * 1024 });
+    const opts: { maxBuffer: number; timeout?: number } = { maxBuffer: 50 * 1024 * 1024 };
+    if (timeoutMs) opts.timeout = timeoutMs;
+    const result = await execPromise(cmd, opts);
     return { stdout: result.stdout || '', stderr: result.stderr || '' };
   } catch (err: any) {
-    console.error(`❌ [${context}] Command failed`);
+    const timedOut = err.killed && timeoutMs ? ` (killed after ${Math.round(timeoutMs / 1000)}s)` : '';
+    console.error(`❌ [${context}] Command failed${timedOut}`);
     console.error(`   Command: ${cmd}`);
     if (err.stdout) console.error(`   stdout: ${err.stdout}`);
     if (err.stderr) console.error(`   stderr: ${err.stderr}`);
@@ -324,6 +327,29 @@ async function cleanupCorruptedFolders() {
     }
   }
 
+
+  // Self-heal stale audioPath: a cache-dir relocation (different host path)
+  // leaves rows pointing at the old absolute path while the file lives at the
+  // canonical {id}/{id}.mp3 — /api/stream would 404 and the frontend would
+  // skip the track as defunct. Repair in place; the index always rewrites
+  // audioPath, so only the DB row (the /api/stream source) matters.
+  let repairedPaths = 0;
+  const stalePathRows = await prisma.video.findMany({
+    where: { ignored: false },
+    select: { videoId: true, audioPath: true }
+  });
+  for (const row of stalePathRows) {
+    if (fs.existsSync(row.audioPath)) continue;
+    const canonical = path.join(CACHE_DIR, row.videoId, `${row.videoId}.mp3`);
+    if (fs.existsSync(canonical)) {
+      await prisma.video.updateMany({ where: { videoId: row.videoId }, data: { audioPath: canonical } });
+      repairedPaths++;
+    }
+  }
+  if (repairedPaths > 0) {
+    console.log(`🔧 Repaired stale audioPath on ${repairedPaths} row(s) → canonical layout`);
+    await updateIndexFile();
+  }
   console.log(`🧹 Full consistency cleanup finished\n`);
 }
 
@@ -352,7 +378,7 @@ interface ShuffleBagEntry {
  * show their real artist with zero re-encoding and zero file re-tagging.
  * The bare GRABBY_CHANNEL_ID stays as fallback for items without an author.
  */
-function grabbyChannelIdForArtist(artist: string): string {
+export function grabbyChannelIdForArtist(artist: string): string {
   return GRABBY_CHANNEL_ID + Buffer.from(artist, 'utf-8').toString('base64url');
 }
 
@@ -453,7 +479,7 @@ async function initShuffleBag(): Promise<void> {
   // distributeGrabbyItems reconditions existing rows instead of skipping them.
   const valid: ShuffleBagEntry[] = [];
   for (const item of grabbyIndex) {
-    const mp3Path = path.join(CACHE_DIR, item.audioPath);
+    const mp3Path = resolveGrabbyAudioPath(item.videoId, item.audioPath);
     if (fs.existsSync(mp3Path)) {
       valid.push({ videoId: item.videoId, used: false });
     } else {
@@ -517,6 +543,19 @@ function loadGrabbyIndex(): Map<string, any> {
     map.set(item.videoId, item);
   }
   return map;
+}
+
+/**
+ * Resolve a grabby-index audioPath against CACHE_DIR. grabby-index.json is
+ * produced by GrabbyTube with paths relative to its cache, but entries written
+ * on other hosts carry stale absolute paths. Prefer the literal path when it
+ * exists, then fall back to the canonical {videoId}/{videoId}.mp3 layout.
+ */
+export function resolveGrabbyAudioPath(videoId: string, audioPath: string): string {
+  const literal = path.isAbsolute(audioPath) ? audioPath : path.join(CACHE_DIR, audioPath);
+  if (fs.existsSync(literal)) return literal;
+  const canonical = path.join(CACHE_DIR, videoId, `${videoId}.mp3`);
+  return fs.existsSync(canonical) ? canonical : literal;
 }
 
 /**
@@ -659,7 +698,7 @@ async function distributeGrabbyItems(): Promise<void> {
     if (duration <= 0) continue;
 
     // Check MP3 exists
-    const mp3Path = path.join(CACHE_DIR, meta.audioPath);
+    const mp3Path = resolveGrabbyAudioPath(entry.videoId, meta.audioPath);
     if (!fs.existsSync(mp3Path)) continue;
 
     // Check if already in DB
@@ -717,7 +756,7 @@ async function distributeGrabbyItems(): Promise<void> {
     // Last-moment recheck: a concurrent grabby delete may have removed an MP3
     // after the per-item check above. Don't insert DB rows for missing files
     // (updateIndexFile's defunct filter is the backstop if one slips through).
-    const live = toInsert.filter(i => fs.existsSync(path.join(CACHE_DIR, i.videoId, `${i.videoId}.mp3`)));
+      const live = toInsert.filter(i => fs.existsSync(i.audioPath));
     if (live.length < toInsert.length) {
       console.log(`⏭️ [ShuffleBag] Skipping ${toInsert.length - live.length} items deleted mid-harvest`);
     }
@@ -734,7 +773,7 @@ async function distributeGrabbyItems(): Promise<void> {
  * Cluster a grabby item's timestamp near the newest normal content.
  * Places it within ±30 minutes of the reference time.
  */
-function clusterTimestamp(reference: Date): Date {
+export function clusterTimestamp(reference: Date): Date {
   const offsetMs = (Math.random() - 0.5) * 60 * 60 * 1000; // ±30 min
   return new Date(reference.getTime() + offsetMs);
 }
@@ -868,7 +907,7 @@ async function getRssFeedWithCache(channelId: string): Promise<{ items: any[], c
   return { items: [], channelTitle: 'Unknown Channel' };
 }
 
-function cleanRssItems(items: any[]): any[] {
+export function cleanRssItems(items: any[]): any[] {
   return items.map(item => {
     let videoId = item.videoId || item['yt:videoId'] || '';
     if (!videoId && item.id && typeof item.id === 'string') {
@@ -890,7 +929,7 @@ function cleanRssItems(items: any[]): any[] {
   }).filter(item => item.videoId);
 }
 
-function parseYtDlpDuration(json: any): number | undefined {
+export function parseYtDlpDuration(json: any): number | undefined {
   // 1. Prefer direct numeric duration (seconds, may be float like 7208.0)
   if (typeof json.duration === 'number' && !isNaN(json.duration) && json.duration > 0) {
     return Math.round(json.duration);
@@ -914,7 +953,7 @@ function parseYtDlpDuration(json: any): number | undefined {
   return undefined;
 }
 
-function applyTodayMidnightRule(date: Date): Date {
+export function applyTodayMidnightRule(date: Date): Date {
   const now = new Date();
   const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
@@ -924,7 +963,7 @@ function applyTodayMidnightRule(date: Date): Date {
   return date;
 }
 
-function parseYtDlpPubDate(json: any): Date | undefined {
+export function parseYtDlpPubDate(json: any): Date | undefined {
   // 1. Prefer timestamp (Unix timestamp in seconds) — now with midnight rule
   if (typeof json?.timestamp === 'number' && json.timestamp > 0) {
     const date = new Date(json.timestamp * 1000);
@@ -961,7 +1000,7 @@ async function scrapeTab(channelId: string, tab: string, maxDays: number, scrape
       `--break-on-reject --extractor-args "youtubetab:approximate_date" ` +
       `--dump-json --flat-playlist --dateafter ${dateStr} --ignore-errors "${url}"`;
 
-    const { stdout } = await safeExec(cmd, `scrapeTab ${tab} for ${channelId}`);
+    const { stdout } = await safeExec(cmd, `scrapeTab ${tab} for ${channelId}`, 120_000);
     return stdout.trim().split('\n')
       .filter(l => l.trim())
       .map(line => {
@@ -1077,7 +1116,7 @@ export async function fillMissingMetadata(item: any): Promise<any> {
       console.log(`fetching metadata for ${item.videoId}`);
       const cmd = (await getBaseYtDlpCommand()) +
         `--no-warnings --print '%(timestamp)s|%(duration_string)s|%(live_status)s' "${item.link}"`;
-      const { stdout } = await safeExec(cmd, `fetch metadata for ${item.videoId}`);
+      const { stdout } = await safeExec(cmd, `fetch metadata for ${item.videoId}`, 120_000);
       const [rawTs, dur, liveStatusRaw] = stdout.trim().split('|');
       const result = {
         timestamp: parseInt(rawTs, 10) || undefined,
@@ -1314,7 +1353,7 @@ async function getAudioDuration(filePath: string): Promise<number | null> {
  * means the file was truncated or had foreign bytes spliced in. Returns
  * null when the header can't be read (then the size check is skipped).
  */
-function readMp3HeaderClaim(filePath: string): { claimedSize: number } | null {
+export function readMp3HeaderClaim(filePath: string): { claimedSize: number } | null {
   try {
     const fd = fs.openSync(filePath, 'r');
     try {
@@ -1509,10 +1548,14 @@ async function updateIndexFile() {
         }
       }
 
-      // For grabby items, preserve the DB's clustered timestamp (file has original YouTube date)
-      if (v.isGrabby) {
-        meta.publishedAt = v.publishedAt;
-      }
+      // publishedAt is DB-authoritative for ALL items: it is this index's sort
+      // key and the input to backend logic (auto-purge, grabby clustering).
+      // The per-item JSON can carry a diverged time (e.g. a re-import that
+      // wrote a fresh timestamp into the file while the DB kept the original) —
+      // letting it override here makes the displayed order violate the file
+      // order. (Grabby files carry the original YouTube date; the DB holds
+      // the cluster time — covered by the same pin.)
+      meta.publishedAt = v.publishedAt;
 
       // Paths are relative to CACHE_DIR — keep /cache/ prefix for nginx
       if (meta.thumbnailPath && !meta.thumbnailPath.startsWith('http')) {
@@ -1556,7 +1599,7 @@ async function updateIndexFile() {
  * inode/mtime and change nginx's ETag, turning every unchanged regeneration
  * into a full 200 re-download instead of a free 304 revalidation.
  */
-function writeIfChanged(destPath: string, tempPath: string, content: string, label: string): void {
+export function writeIfChanged(destPath: string, tempPath: string, content: string, label: string): void {
   if (fs.existsSync(destPath) && fs.readFileSync(destPath, 'utf-8') === content) {
     console.log(`📋 ${label} unchanged — skipping write`);
     return;
@@ -1566,7 +1609,7 @@ function writeIfChanged(destPath: string, tempPath: string, content: string, lab
   console.log(`✅ ${label} updated`);
 }
 
-async function isFilteredOutByPubDate(item: any): Promise<boolean> {
+export async function isFilteredOutByPubDate(item: any): Promise<boolean> {
   if (item.pubDate) {
     const maxDays = parseInt(await getConfig('maxHarvestDays', '7'));
     let publishedAt = new Date(item.pubDate);
@@ -1576,7 +1619,7 @@ async function isFilteredOutByPubDate(item: any): Promise<boolean> {
   }
   return false;
 }
-async function isFilteredOutByDuration(item: any, channel?: any): Promise<boolean> {
+export async function isFilteredOutByDuration(item: any, channel?: any): Promise<boolean> {
   if (item.duration) {
     const durationFilterEnabled = (await getConfig('durationFilterEnabled', 'false')) === 'true';
     const globalMin = parseInt(await getConfig('minDurationMinutes', '0'));
@@ -1874,13 +1917,24 @@ async function harvestAndPurge() {
                 const errorMsg = String(meta.err?.message ?? meta.err ?? '').toLowerCase();
                 if (errorMsg.includes('members-only content')) {
                   await ignoreVideo(item2);
+                } else if (!errorMsg) {
+                  // Command succeeded but metadata is incomplete (e.g. empty
+                  // timestamp) — without this line the item would be retried
+                  // every cycle with zero logging (the "missed content" blind spot).
+                  console.log(`⏭️ [${item.videoId}] Incomplete metadata (duration=${item.duration ?? '—'}, pubDate=${item.pubDate ?? '—'}) — will retry next cycle`);
                 }
                 continue;
               }
-              if (item.VODFuture) continue;
+              if (item.VODFuture) {
+                // upcoming / live / still-processing streams can't be
+                // downloaded yet; the item stays in the feed and is retried
+                // every cycle until it becomes a VOD.
+                console.log(`⏭️ [${item.videoId}] ${item.liveStatus} — not downloadable yet, will retry next cycle`);
+                continue;
+              }
 
               if (await isFilteredOutByPubDate(item) || await isFilteredOutByDuration(item, currentChannel)) {
-                await ignoreVideo(item2);
+                await ignoreVideo({ ...item2, duration: item.duration || 0 });
                 continue;
               }
 
@@ -2533,10 +2587,12 @@ async function importSingleVideo(
     update: updateData
   });
 
-  // Write metadata JSON
+  // Write metadata JSON from the PERSISTED record (updateData), not dbVideo:
+  // on re-import of an existing video the DB keeps originalPublishedAt while
+  // dbVideo carries the re-import time — writing dbVideo diverges file from DB.
   const jsonPath = path.join(videoDir, `${videoId}.json`);
   try {
-    fs.writeFileSync(jsonPath, JSON.stringify(dbVideo, null, 2), 'utf-8');
+    fs.writeFileSync(jsonPath, JSON.stringify(updateData, null, 2), 'utf-8');
   } catch { }
 
   await updateIndexFile();
