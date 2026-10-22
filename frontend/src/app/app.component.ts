@@ -1009,12 +1009,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     localStorage.setItem('drivepod-autoplayMode', mode);
   }
 
-  private getCandidate(playlist: Video[], mode: 'newer' | 'older', finishedTime: number): Video | undefined {
+  /**
+   * Pick the next track for 'older'/'newer' autoplay. The finished track is
+   * still in the list (rawIndex only changes on the next index load), so it
+   * is excluded by videoId — which also allows <=/>= so same-timestamp
+   * siblings (batched imports, grabby cluster bands) are not silently
+   * skipped: with strict </> they could never be picked by autoplay.
+   */
+  private getCandidate(playlist: Video[], mode: 'newer' | 'older', finishedTime: number, finishedId: string): Video | undefined {
     if (mode === 'older') {
-      return playlist.find(v => new Date(v.publishedAt).getTime() < finishedTime);
+      return playlist.find(v => v.videoId !== finishedId && new Date(v.publishedAt).getTime() <= finishedTime);
     }
     if (mode === 'newer') {
-      const newerOnes = playlist.filter(v => new Date(v.publishedAt).getTime() > finishedTime);
+      const newerOnes = playlist.filter(v => v.videoId !== finishedId && new Date(v.publishedAt).getTime() >= finishedTime);
       if (newerOnes.length > 0) return newerOnes[newerOnes.length - 1];
     }
     return undefined;
@@ -1082,7 +1089,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         candidate = queue[queue.length - 1];
       }
     } else {
-      candidate = this.getCandidate(queue, mode, finishedPublishedAt);
+      candidate = this.getCandidate(queue, mode, finishedPublishedAt, finishedVideoId);
     }
 
     if (candidate) {
