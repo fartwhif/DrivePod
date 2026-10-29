@@ -1129,7 +1129,13 @@ export async function fillMissingMetadata(item: any): Promise<any> {
       item.liveStatus = result.live_status;
       item.liveStatuses = 'not_live|is_live|is_upcoming|was_live|post_live';
       item.VODNow = (item.liveStatus == 'not_live' || item.liveStatus == 'was_live');
-      item.VODFuture = (item.liveStatus == 'is_live' || item.liveStatus == 'is_upcoming' || item.liveStatus == 'post_live');
+      // Only streams that are genuinely not downloadable yet are hard-blocked.
+      // `post_live` is deliberately NOT blocked: YouTube frequently leaves an
+      // ended stream flagged `post_live` long after its VOD is already served
+      // (stale state), which would otherwise strand finished streams forever.
+      // `post_live` items fall through to the download attempt below — the real
+      // availability check — and are retried next cycle if the VOD isn't ready.
+      item.VODFuture = (item.liveStatus == 'is_live' || item.liveStatus == 'is_upcoming');
 
       return { res: !!(item.duration && item.pubDate && item.liveStatus), err: '' }
     }
@@ -1926,9 +1932,11 @@ async function harvestAndPurge() {
                 continue;
               }
               if (item.VODFuture) {
-                // upcoming / live / still-processing streams can't be
-                // downloaded yet; the item stays in the feed and is retried
-                // every cycle until it becomes a VOD.
+                // Live / upcoming streams only — genuinely not downloadable.
+                // `post_live` is intentionally NOT blocked here (see the
+                // VODFuture assignment in fillMissingMetadata); it falls
+                // through to the download attempt, which is the real
+                // availability check and retries next cycle if not ready.
                 console.log(`⏭️ [${item.videoId}] ${item.liveStatus} — not downloadable yet, will retry next cycle`);
                 continue;
               }

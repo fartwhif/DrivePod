@@ -120,6 +120,16 @@
   line. The post-metadata filter passes the resolved `duration` into
   `ignoreVideo()` (ignored rows were stored NULL duration — unauditable).
 
+- **`post_live` streams are NOT hard-blocked** (2026-10-29): the `VODFuture`
+  gate only blocks `is_live`/`is_upcoming`. YouTube keeps ended streams
+  flagged `post_live` long after the VOD is already served (stale
+  `live_status`), so blocking `post_live` strands finished streams forever
+  (was `⏭️ … post_live — not downloadable yet` every cycle). `post_live`
+  items fall through to `downloadAndProcessVideo()` (the download's
+  `--match-filter` already allows it); if the VOD isn't ready yet the yt-dlp
+  call fails cleanly (no row written, incomplete folder removed) and the
+  item retries next cycle. See ARCHITECTURE.md §7.3.
+
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 
 ## Project Roots
@@ -128,4 +138,4 @@
 - Harvest runs on cron + manual.
 
 Update this file with new patterns after each task.
-Last updated: 2026-10-16 (content-miss test suite T1/T2/T3 + fixes: publishedAt DB pin, stale audioPath self-heal, grabby path resolver, safeExec timeouts, skip-path logging)
+Last updated: 2026-10-29 (post_live no longer hard-blocked: VODFuture now is_live/is_upcoming only, so ended streams with a stale `post_live` status download instead of being retried forever — verified end-to-end with eNxGSQwmk7Q)
