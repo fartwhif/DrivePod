@@ -439,6 +439,9 @@ Runs every 5 minutes and once at boot. Full sequence:
        RSS lacked them; members-only → `ignoreVideo()`; `VODFuture`
        (live/upcoming) → skip this cycle and retry next (not recorded — a
        scheduled stream becomes downloadable once its VOD is processed);
+       `post_live` is NOT skipped — it falls through to the download attempt
+       (ended streams are often still flagged `post_live` after the VOD is
+       already served);
      - re-check filters (metadata may have changed duration/date), passing
        the resolved `duration` into `ignoreVideo()` (ignored rows were
        previously stored with NULL duration — now the ignore reason is
@@ -505,10 +508,15 @@ silently (an unauditable "miss"):
 
 - empty `%(timestamp)s` → `res: false` →
   "Incomplete metadata — will retry next cycle";
-- `live_status` ∈ `is_live` / `is_upcoming` / `post_live` → **`VODFuture`**
-  → "not downloadable yet, will retry next cycle" (the item re-appears in
-  the same state next cycle until the VOD is processed, at which point
-  yt-dlp reports `was_live` → `VODNow` and the normal download proceeds);
+- `live_status` ∈ `is_live` / `is_upcoming` → **`VODFuture`** →
+  "not downloadable yet, will retry next cycle" (genuinely not downloadable
+  — a scheduled stream becomes downloadable once its VOD is processed, at
+  which point yt-dlp reports `was_live` → `VODNow` and the download proceeds);
+- `live_status` = `post_live` → **not blocked** — YouTube frequently leaves an
+  ended stream flagged `post_live` long after its VOD is already served (stale
+  state), so it falls through to `downloadAndProcessVideo()`, which is the real
+  availability check: if the VOD is ready it downloads, if not the yt-dlp call
+  fails cleanly (no row written) and the item is retried next cycle;
 - success logs nothing by design.
 
 ### 7.4 Ignore semantics
