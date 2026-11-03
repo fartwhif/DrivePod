@@ -72,6 +72,22 @@
   (avoids container recreation while a harvest is in flight); the repo
   file is only baked into the image on the next `--build`.
 
+- **Node backend is supervisor-looped in the entrypoint** (2026-11-03): an
+  unhandled Prisma P1008 (SQLite socket timeout) crashed `dist/server.js`
+  2026-11-03 01:00 UTC and the entrypoint's bare `npm start &` never
+  respawned it — container stayed "Up" (nginx serves statics → 200/304)
+  while `/api/*` 502'd via the dead upstream for hours. The entrypoint now
+  runs `npm start` in a background `( set +e; while true; do npm start; …done ) &`
+  loop: restart with 5s→300s exponential backoff, reset after a ≥5 min
+  healthy run, exit on SIGINT/SIGTERM (130/143). `set +e` is MANDATORY in
+  the subshell — the entrypoint's top-level `set -e` otherwise kills the
+  supervisor the moment `npm start` exits non-zero (verified: first
+  iteration of the loop died silently). Kill-test: `docker exec drivepod
+  pkill -9 -x node` (the `-f "node dist/server.js"` pattern also matches
+  the `sh -c` pkill wrapper and kills itself, exit 137) — expect
+  `⚠️ Node backend exited after Ns (code 137) — restarting in 5s` in the
+  logs and `/api/config` back to 200 within ~10 s.
+
 - **index.json / progress.json caching** (2026-10-06/07): the frontend
   fetches both files with STABLE URLs + `cache: 'no-cache'` (via the
   `fetchIndexWithProgress()` helper, which merges progress into the index
@@ -138,4 +154,4 @@
 - Harvest runs on cron + manual.
 
 Update this file with new patterns after each task.
-Last updated: 2026-10-29 (post_live no longer hard-blocked: VODFuture now is_live/is_upcoming only, so ended streams with a stale `post_live` status download instead of being retried forever — verified end-to-end with eNxGSQwmk7Q)
+Last updated: 2026-11-03 (Node backend supervisor loop in entrypoint — P1008 crash 2026-11-03 left /api 502 for ~7 h behind a still-healthy static nginx; respawn loop with 5s→300s backoff + kill-test verified, `set +e` mandatory in the subshell)
