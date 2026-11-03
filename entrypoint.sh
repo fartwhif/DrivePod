@@ -44,8 +44,24 @@ cd /app/backend
 echo "→ Running Prisma DB push..."
 npx prisma db push --accept-data-loss
 
-echo "→ Starting Node backend (production build)..."
-npm start &
+echo "→ Starting Node backend (production build, supervised)..."
+(
+  set +e   # entrypoint runs set -e; a failed npm start must hit the loop, not kill it
+  backoff=5
+  while true; do
+    start=$(date +%s)
+    npm start
+    code=$?
+    # Graceful stop signals (SIGINT/SIGTERM, e.g. docker stop) — don't respawn
+    [ "$code" -eq 130 -o "$code" -eq 143 ] && break
+    run=$(( $(date +%s) - start ))
+    # Healthy long run resets backoff; crash-loop backs off 5s → 300s
+    [ "$run" -ge 300 ] && backoff=5
+    echo "⚠️  Node backend exited after ${run}s (code $code) — restarting in ${backoff}s"
+    sleep "$backoff"
+    backoff=$(( backoff * 2 > 300 ? 300 : backoff * 2 ))
+  done
+) &
 
 echo "→ Starting Nginx..."
 nginx -g 'daemon off;'
