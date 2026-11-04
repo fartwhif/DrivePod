@@ -427,9 +427,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   consumeGrabbyTrack(videoId: string) {
     this.http.delete(`${this.apiUrl}/video/${videoId}/grabby`).subscribe({
       next: () => {
-        // DB record already deleted server-side; advance like track completion.
-        // (The fire-and-forget POST /watched inside is a harmless no-op on the
-        // deleted record — it returns 200 and triggers no retry loop.)
+        // DB record already deleted server-side. Drop it from rawIndex FIRST so every
+        // tab reflects the deletion locally (no re-fetch), then advance like a normal
+        // completion. markAsWatchedAndPlayNext()'s own queue-filter becomes a no-op since
+        // the item is already gone, and its candidate pick correctly skips the deleted id.
+        this.removeLocalVideo(videoId);
         this.markAsWatchedAndPlayNext();
       },
       error: (err: any) => {
@@ -576,6 +578,35 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     const watchedVids = this.getWatchedVideos();
     this.watchedPlaylist.set(watchedVids);
+  }
+
+  /** Update a single item's fields inside rawIndex (the one source every tab derives
+   *  from), then rebuild all tab lists locally. No network — works on throttled links.
+   *  The 2-minute poll reconciles against the server later as a safety net. */
+  private applyLocalVideoChange(videoId: string, patch: Partial<Video>): void {
+    let changed = false;
+    this.rawIndex.update(items => items.map(v => {
+      if (v.videoId !== videoId) return v;
+      changed = true;
+      return { ...v, ...patch };
+    }));
+    if (!changed) return;
+    if (this.currentVideo()?.videoId === videoId) {
+      this.currentVideo.set({ ...this.currentVideo()!, ...patch });
+    }
+    this.derivePlaylists();
+  }
+
+  /** Remove an item from rawIndex and rebuild every tab locally (no network). Used when
+   *  a track is deleted or permanently consumed. */
+  private removeLocalVideo(videoId: string): void {
+    const before = this.rawIndex().length;
+    this.rawIndex.update(items => items.filter(v => v.videoId !== videoId));
+    if (this.rawIndex().length === before) return; // nothing removed
+    this._trackPlayFailures.delete(videoId);
+    this._localWatched.delete(videoId);
+    if (this.currentVideo()?.videoId === videoId) this.currentVideo.set(null);
+    this.derivePlaylists();
   }
 
   /** Paginate a full list into a page. */
@@ -1619,12 +1650,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   toggleWatched(videoId: string, watched: boolean) {
     this.http.patch(`${this.apiUrl}/video/${videoId}/watched`, { watched }).subscribe({
       next: () => {
-        // Server persisted the change (and regenerated index.json) — the index
-        // is authoritative again; drop any pending local-watched hold.
+        // Server persisted the change (and regenerated index.json). Reflect it in ALL
+        // tabs locally without re-fetching — cheap even on throttled connections.
+        // Unwatching clears progress so the track resumes from the start when replayed.
         this._localWatched.delete(videoId);
-        if (!watched) {
-          this.watchedPlaylist.update(current => current.filter(v => v.videoId !== videoId));
-        }
+        this.applyLocalVideoChange(videoId, watched ? { watched: true } : { watched: false, progress: 0 });
       },
       error: (err) => console.error('Failed to toggle watched', err)
     });
@@ -1756,32 +1786,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   toggleProtect(videoId: string, isProtected: boolean) {
     this.http.patch(`${this.apiUrl}/video/${videoId}/protect`, { protected: isProtected }).subscribe({
       next: () => {
-        const playlist = [...this.playlist()];
-        const idx = playlist.findIndex(v => v.videoId === videoId);
-        if (idx !== -1) {
-          playlist[idx] = { ...playlist[idx], protected: isProtected };
-          this.playlist.set(playlist);
-        }
-        if (this.currentVideo()?.videoId === videoId) {
-          this.currentVideo.set({ ...this.currentVideo()!, protected: isProtected });
-        }
-        if (isProtected) {
-          const protectedList = [...this.protectedPlaylist()];
-          const pIdx = protectedList.findIndex(v => v.videoId === videoId);
-          if (pIdx !== -1) {
-            protectedList[pIdx] = { ...protectedList[pIdx], protected: true };
-            this.protectedPlaylist.set(protectedList);
-          }
-        } else {
-          this.protectedPlaylist.set(this.protectedPlaylist().filter(v => v.videoId !== videoId));
-        }
-        const watchedList = [...this.watchedPlaylist()];
-        const wIdx = watchedList.findIndex(v => v.videoId === videoId);
-        if (wIdx !== -1) {
-          watchedList[wIdx] = { ...watchedList[wIdx], protected: isProtected };
-          this.watchedPlaylist.set(watchedList);
-        }
-      }
+        // Server persisted the lock state. Reflect it in ALL tabs locally without a
+        // re-fetch: locking adds the item to the Protected tab, unlocking removes it,
+        // and the queue/watched flags update too. No network cost for throttled links.
+        this.applyLocalVideoChange(videoId, { protected: isProtected });
+      },
+      error: () => {}
     });
   }
 
