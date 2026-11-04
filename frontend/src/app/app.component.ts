@@ -95,6 +95,8 @@ interface HarvestStatus {
 export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   /** Global hotkey that consumes the current GrabbyTube track (see consumeGrabbyTrack). */
   static readonly GRABBY_DELETE_KEY = 'Delete';
+  /** Global hotkey that locks/unlocks the currently playing item (see toggleProtect). */
+  static readonly LOCK_KEY = 'l';
 
   apiUrl = '/api';
   channels = signal<any[]>([]);
@@ -409,6 +411,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       if (v && v.isGrabby) {
         event.preventDefault();
         this.consumeGrabbyTrack(v.videoId);
+      }
+    } else if (event.key.toLowerCase() === AppComponent.LOCK_KEY) {
+      const v = this.currentVideo();
+      if (v) {
+        event.preventDefault();
+        this.toggleProtect(v.videoId, !v.protected);
       }
     }
   }
