@@ -169,7 +169,7 @@
                [class.text-zinc-500]="!v.protected"
                [class.hover:text-amber-300]="v.protected"
                [class.hover:text-amber-200]="!v.protected"
-               title="{{ v.protected ? 'Protected - will not be auto-purged' : 'Not protected' }}">{{ v.protected ? '🔒' : '🔓' }}</button>
+               title="{{ v.protected ? 'Protected - will not be auto-purged (key: L)' : 'Not protected (key: L to lock current track)' }}">{{ v.protected ? '🔒' : '🔓' }}</button>
              <a [href]="'https://www.youtube.com/watch?v=' + v.videoId"
                target="_blank"
                rel="noopener noreferrer"
