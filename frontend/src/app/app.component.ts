@@ -1079,8 +1079,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     // (clear currentVideo AFTER we know the next track, see below)
     this.updatePageTitle(null);
 
-    // Remove finished video from playlist locally
-    this.playlist.update(current => current.filter(v => v.videoId !== finishedVideoId));
+    // Mark the finished track watched in rawIndex and re-derive ALL tabs locally (no
+    // refetch): it leaves the Queue AND appears in the Watched tab instantly instead of
+    // waiting for the periodic poll / page refresh. derivePlaylists() clears it out of
+    // the paged queue too, so the old single-list filter is subsumed.
+    this.applyLocalVideoChange(finishedVideoId, { watched: true });
 
     // Queue the watched mark for retry if needed
     this.queueOperation({ videoId: finishedVideoId, type: 'watched' });
