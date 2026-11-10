@@ -206,6 +206,312 @@ console.log('\n== T2 Pure pipeline logic (real compiled code) ==\n');
     path.join(CACHE_DIR, 'missing999999', 'missing999999.mp3'));
 }
 
+// ── 11. measurePartBytesRecursive — the watchdog's growth gauge ──
+{
+  const probeDir = path.join(CACHE_DIR, 'stallprobe');
+  fs.mkdirSync(path.join(probeDir, 'nested'), { recursive: true });
+  fs.writeFileSync(path.join(probeDir, 'a.m4a.part'), Buffer.alloc(1000));
+  fs.writeFileSync(path.join(probeDir, 'notpart.bin'), Buffer.alloc(9999));
+  fs.writeFileSync(path.join(probeDir, 'nested/b.webm.part'), Buffer.alloc(500));
+  t('measurePartBytesRecursive sums .part files across nested dirs',
+    server.measurePartBytesRecursive(probeDir) === 1500,
+    `got ${server.measurePartBytesRecursive(probeDir)}`);
+  // The exact bug the recursive scan fixes: with only a NESTED .part (yt-dlp's
+  // {id}/ layout), a top-level readdir+statSync scan reads 0 and would wrongly
+  // flag a healthy download as stalled.
+  const nestedOnly = path.join(CACHE_DIR, 'stallnestedonly');
+  fs.mkdirSync(path.join(nestedOnly, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(nestedOnly, 'sub', 'x.m4a.part'), Buffer.alloc(100));
+  const topLevelScan = fs.readdirSync(nestedOnly)
+    .reduce((s, f) => { const p = path.join(nestedOnly, f); return f.endsWith('.part') ? s + fs.statSync(p).size : s; }, 0);
+  t('nested-only .part is seen recursively but missed by a top-level scan',
+    server.measurePartBytesRecursive(nestedOnly) === 100 && topLevelScan === 0,
+    `recursive=${server.measurePartBytesRecursive(nestedOnly)} topLevel=${topLevelScan}`);
+  t('measurePartBytesRecursive returns 0 for a missing dir',
+    server.measurePartBytesRecursive('/nonexistent/nope') === 0);
+  fs.rmSync(probeDir, { recursive: true, force: true });
+  fs.rmSync(nestedOnly, { recursive: true, force: true });
+}
+
+// ── 12. safeExecWithStallWatchdog — kill/retry/ban-signal via a fake yt-dlp ──
+{
+  const shimDir = path.join(CACHE_DIR, 'stallshim');
+  fs.mkdirSync(shimDir, { recursive: true });
+  const shimBin = path.join(shimDir, 'yt-dlp');
+  // SCENARIO/recover: 1st invocation starts a .part then wedges; 2nd finishes.
+  // SCENARIO/freeze: every invocation wedges (kill+retry+kill+throw).
+  // SCENARIO/plainfail: no .part, non-zero exit — the watchdog must NOT treat
+  // an ordinary command failure as a stall, and must never set stalledTwice.
+  fs.writeFileSync(shimBin, `#!/bin/sh
+N=$(cat "$COUNTER" 2>/dev/null || echo 0); N=$((N + 1)); echo $N > "$COUNTER"
+DIR=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "--output" ]; then DIR="$a"; break; fi
+  prev="$a"
+done
+DIR=$(dirname "$DIR"); mkdir -p "$DIR"
+case "$SCENARIO" in
+  recover)
+    if [ "$N" = "1" ]; then head -c 8000 /dev/zero > "$DIR/stage1.part"; exec sleep 3600; fi
+    head -c 16000 /dev/zero > "$DIR/stage1.part"; exit 0 ;;
+  freeze)
+    head -c $(( N == 1 ? 8000 : 16000 )) /dev/zero > "$DIR/stage1.part"; exec sleep 3600 ;;
+  plainfail) exit 1 ;;
+esac
+`);
+  fs.chmodSync(shimBin, 0o755);
+  const win = 600, poll = 250; // SIGKILL after ~600 ms of zero .part growth
+  // 20 s ceiling: a stalled child is `sleep 3600`, so returning inside the
+  // ceiling proves the watchdog actually SIGKILLed it (no hang).
+  const timed = (p, ms = 20000) => new Promise((res, rej) => {
+    const h = setTimeout(() => rej(new Error('watchdog test hung — child was not killed')), ms);
+    p.then(v => { clearTimeout(h); res(v); }, e => { clearTimeout(h); rej(e); });
+  });
+  const withShim = async (scenario, counterFile, fn) => {
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath}`;
+    process.env.SCENARIO = scenario;
+    process.env.COUNTER = counterFile;
+    fs.writeFileSync(counterFile, '0');
+    try { return await fn(); } finally {
+      process.env.PATH = oldPath;
+      delete process.env.SCENARIO;
+      delete process.env.COUNTER;
+    }
+  };
+  const invocations = f => parseInt(fs.readFileSync(f, 'utf-8').trim(), 10);
+  const cmd = (id, dir) => `yt-dlp --output "${dir}/%(id)s.%(ext)s" "https://www.youtube.com/watch?v=${id}"`;
+
+  // (a) clean exit — watchdog passes stdout through untouched
+  const okRes = await timed(server.safeExecWithStallWatchdog(
+    'echo done', 't-normal', shimDir, { stallWindowMs: win, pollMs: poll }));
+  t('watchdog returns stdout on a clean exit', okRes.stdout.trim() === 'done');
+
+  // (b) an unrelated non-zero exit must throw WITHOUT stalledTwice (no ban)
+  const stubDir = path.join(CACHE_DIR, 'stall-stub');
+  let plainErr = null;
+  try {
+    await withShim('plainfail', path.join(shimDir, 'pf.txt'), () =>
+      timed(server.safeExecWithStallWatchdog(cmd('stub', stubDir), 't-plain', stubDir, { stallWindowMs: win, pollMs: poll })));
+  } catch (e) { plainErr = e; }
+  t('an unrelated command failure never carries stalledTwice',
+    !!plainErr && plainErr.stalledTwice === undefined, `err=${plainErr ? plainErr.message : 'no throw'}`);
+
+  // (c) ONE freeze → kill → retry succeeds ⇒ 2 invocations, no throw, no ban
+  const recovDir = path.join(CACHE_DIR, 'stall-recover');
+  const recovCounter = path.join(shimDir, 'recov.txt');
+  let recovErr = null;
+  await withShim('recover', recovCounter, () =>
+    timed(server.safeExecWithStallWatchdog(cmd('recov', recovDir), 't-recover', recovDir, { stallWindowMs: win, pollMs: poll }))
+      .catch(e => { recovErr = e; }));
+  t('a single freeze is rescued by the retry (2 invocations, no throw)',
+    recovErr === null && invocations(recovCounter) === 2,
+    `invocations=${invocations(recovCounter)} err=${recovErr ? recovErr.message : 'none'}`);
+
+  // (d) freeze twice → kill twice → throw tagged stalledTwice (the ban trigger)
+  const frzDir = path.join(CACHE_DIR, 'stall-freeze');
+  const frzCounter = path.join(shimDir, 'frz.txt');
+  let frzErr = null;
+  await withShim('freeze', frzCounter, () =>
+    timed(server.safeExecWithStallWatchdog(cmd('frz', frzDir), 't-freeze', frzDir, { stallWindowMs: win, pollMs: poll }))
+      .catch(e => { frzErr = e; }));
+  t('two freezes throw with stalledTwice set (the ban trigger)',
+    !!frzErr && frzErr.stalledTwice === true, `err=${frzErr ? frzErr.message : 'no throw'}`);
+  t('exactly two download attempts ran before the ban throw',
+    invocations(frzCounter) === 2, `invocations=${invocations(frzCounter)}`);
+
+  fs.rmSync(stubDir, { recursive: true, force: true });
+  fs.rmSync(recovDir, { recursive: true, force: true });
+  fs.rmSync(frzDir, { recursive: true, force: true });
+}
+
+// ── 13. twice-stalled item is BANNED durably (the frozen-queue fix) ──
+// Reproduces 2026-11-05 (eUAxo-AC5Rs froze harvest ~4 h): after the watchdog
+// exhausts its retry, downloadAndProcessVideo must mark the item ignored so
+// discovery's existingIds filter (server.ts: findMany by videoId, NO ignored
+// filter) can never re-queue it and re-freeze the harvest.
+{
+  const shimDir = path.join(CACHE_DIR, 'stallshim2');
+  fs.mkdirSync(shimDir, { recursive: true });
+  fs.writeFileSync(path.join(shimDir, 'yt-dlp'), `#!/bin/sh
+DIR=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "--output" ]; then DIR="$a"; break; fi
+  prev="$a"
+done
+DIR=$(dirname "$DIR"); mkdir -p "$DIR"
+head -c 8000 /dev/zero > "$DIR/stage1.part"
+exec sleep 3600
+`);
+  fs.chmodSync(path.join(shimDir, 'yt-dlp'), 0o755);
+
+  const banChan = 'UCStallBanChan', banVid = 'StallBanVid01';
+  await prisma.channel.upsert({
+    where: { channelId: banChan },
+    update: { title: 'Stall Test Channel' },
+    create: { channelId: banChan, title: 'Stall Test Channel' }
+  });
+  await prisma.video.delete({ where: { videoId: banVid } }).catch(() => {});
+  await setCfg('stallWindowMs', '600');   // real download path reads this hot
+  await setCfg('stallPollMs', '250');
+  fs.rmSync(path.join(CACHE_DIR, banVid), { recursive: true, force: true });
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${shimDir}:${oldPath}`;
+  let dlResult = null, dlErr = null;
+  try {
+    dlResult = await Promise.race([
+      server.downloadAndProcessVideo(
+        { videoId: banVid, title: 'Stalled Test Track', author: 'Tester', channelId: banChan, publishedAt: new Date(), duration: 120 },
+        `https://www.youtube.com/watch?v=${banVid}`, 128, false),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('download path hung — watchdog failed to kill its child')), 20000)),
+    ]);
+  } catch (e) { dlErr = e; } finally { process.env.PATH = oldPath; }
+
+  t('a twice-stalled download returns false instead of re-throwing',
+    dlErr === null && dlResult === false, `err=${dlErr ? dlErr.message : 'none'} result=${dlResult}`);
+  const row = await prisma.video.findUnique({ where: { videoId: banVid } });
+  t('the twice-stalled item is written as an ignored (banned) DB row',
+    !!row && row.ignored === true, `row=${row ? `ignored=${row.ignored}` : 'absent'}`);
+  // Discovery's exclusion is "row exists for this videoId, regardless of
+  // ignored" — mirror that predicate to prove the ban actually filters it out.
+  const existingIds = new Set((await prisma.video.findMany({
+    where: { videoId: { in: [banVid] } }, select: { videoId: true }
+  })).map(v => v.videoId));
+  t("a banned row satisfies discovery's existingIds exclusion", existingIds.has(banVid));
+  t('the stalled .part cache dir is purged by the ban',
+    !fs.existsSync(path.join(CACHE_DIR, banVid)), 'incomplete folder left behind');
+  // Re-run must stay inert: ignoreVideo() is idempotent and the ban never
+  // flips back to "downloadable".
+  await server.ignoreVideo({ videoId: banVid, channelId: banChan, title: 'Stalled Test Track' });
+  const row2 = await prisma.video.findUnique({ where: { videoId: banVid } });
+  t('re-ignoring an already-banned item keeps it ignored (idempotent)', !!row2 && row2.ignored === true);
+  await prisma.video.delete({ where: { videoId: banVid } }).catch(() => {});
+  await prisma.channel.delete({ where: { channelId: banChan } }).catch(() => {});
+  await setCfg('stallWindowMs', String(600 * 1000 * 10)).catch(() => {});
+}
+
+// ── 14. stall-ban CIRCUIT BREAKER (outage must not burn the queue) ──
+// A twice-stalled download is banned, but during an ISP/CDN outage EVERY
+// item's --continue retry freezes on the same dead link, so an unconditional
+// ban would silently ignore one item per ~20 min for the whole outage. The
+// breaker bans only the FIRST stall-item since the last SUCCESSFUL download;
+// later ones are collateral damage (skipped, NOT banned, retried next cycle).
+// A completed download clears the breaker, so the next real stall bans again.
+{
+  const win = '600', poll = '250';
+  const chan = 'UCStallBreakerChan', vid = 'StallBreaker';
+  await prisma.channel.upsert({
+    where: { channelId: chan },
+    update: { title: 'Breaker Test Channel' },
+    create: { channelId: chan, title: 'Breaker Test Channel' }
+  });
+  await setCfg('stallWindowMs', win);
+  await setCfg('stallPollMs', poll);
+  server.resetStallBanCounter();
+  t('breaker starts open (a stall may be banned)', server.getConsecutiveStallBans() === 0 && server.stallBanAllowed());
+
+  const mkShim = (dir, body) => {
+    fs.mkdirSync(dir, { recursive: true });
+    for (const name of ['yt-dlp', 'ffmpeg', 'ffprobe', 'vbrfix']) {
+      fs.writeFileSync(path.join(dir, name), `#!/bin/sh\n${body}\n`);
+      fs.chmodSync(path.join(dir, name), 0o755);
+    }
+  };
+  const parseDirId = `DIR=""; ID=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--output" ]; then DIR="$a"; fi
+  case "$a" in
+    http*) ID="\${a##*v=}" ;;
+  esac
+  prev="$a"
+done
+DIR=$(dirname "$DIR")
+mkdir -p "$DIR"
+`;
+  // --- fake "link dead" toolchain: every download freezes on a .part ---
+  const dirStall = path.join(CACHE_DIR, 'shim-stall');
+  mkShim(dirStall, parseDirId + `head -c 6000 /dev/zero > "$DIR/$ID.part"
+exec sleep 3600`);
+  // --- fake "link healthy" toolchain: download finishes, ffmpeg/vbrfix emit
+  //     a structurally-valid MP3 (ID3-free frame sync + Xing "bytes" header
+  //     claiming the exact file size) that the REAL validateMp3File accepts.
+  const dirOk = path.join(CACHE_DIR, 'shim-ok');
+  mkShim(dirOk, parseDirId + `head -c 5000 /dev/zero | tr "\\0" "\\001" > "$DIR/$ID.webm"
+exit 0`);
+  fs.writeFileSync(path.join(dirOk, 'ffmpeg'), `#!/bin/sh
+out=""
+for a in "$@"; do out="$a"; done
+case "$out" in
+  *.mp3) head -c 8176 /dev/zero | tr "\\0" "\\001" | { printf "\\377\\353\\000\\000Xing\\000\\000\\000\\002\\000\\000\\040\\000"; cat; } > "$out" ;;
+  *) head -c 64 /dev/urandom > "$out" ;;
+esac
+exit 0`);
+  fs.writeFileSync(path.join(dirOk, 'ffprobe'), `#!/bin/sh
+echo 119.7
+exit 0`);
+  fs.writeFileSync(path.join(dirOk, 'vbrfix'), `#!/bin/sh
+cat "$2" > "$3"
+exit 0`);
+  for (const f of ['ffmpeg', 'ffprobe', 'vbrfix']) fs.chmodSync(path.join(dirOk, f), 0o755);
+
+  const oldPath = process.env.PATH;
+  const runDl = async (id, shimDir) => {
+    process.env.PATH = `${shimDir}:${oldPath}`;
+    fs.rmSync(path.join(CACHE_DIR, id), { recursive: true, force: true });
+    let res = null, err = null;
+    try {
+      res = await Promise.race([
+        server.downloadAndProcessVideo(
+          { videoId: id, title: `Breaker ${id}`, author: 'Tester', channelId: chan, publishedAt: new Date(), duration: 120 },
+          `https://www.youtube.com/watch?v=${id}`, 128, false),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(`${id} hung — watchdog failed to kill its child`)), 15000)),
+      ]);
+    } catch (e) { err = e; } finally { process.env.PATH = oldPath; }
+    if (err) throw err;
+    return res;
+  };
+  const rowFor = async (id) => prisma.video.findUnique({ where: { videoId: id } });
+  const gone = (id) => !fs.existsSync(path.join(CACHE_DIR, id));
+
+  // 1) first twice-stalled item of the day → BANNED (queue must keep moving)
+  const r1 = await runDl(`${vid}_A`, dirStall);
+  const rowA = await rowFor(`${vid}_A`);
+  t('the first twice-stalled item is banned (ignored row)', r1 === false && !!rowA && rowA.ignored === true, `result=${r1} row=${rowA ? rowA.ignored : 'absent'}`);
+  t('banning closes the breaker', server.getConsecutiveStallBans() === 1 && !server.stallBanAllowed());
+  t('banned item cache dir purged', gone(`${vid}_A`));
+
+  // 2/3) two MORE twice-stalled items while the breaker is closed (the outage)
+  const r2 = await runDl(`${vid}_B`, dirStall);
+  const r3 = await runDl(`${vid}_C`, dirStall);
+  t('outage items return false without crashing', r2 === false && r3 === false, `B=${r2} C=${r3}`);
+  const rowB = await rowFor(`${vid}_B`), rowC = await rowFor(`${vid}_C`);
+  t('collateral-damage items are NOT banned (no ignored row)', !rowB && !rowC,
+    `B=${rowB ? `ignored=${rowB.ignored}` : 'absent'} C=${rowC ? `ignored=${rowC.ignored}` : 'absent'}`);
+  t('suppressed items have their .part cache purged (retryable next cycle)', gone(`${vid}_B`) && gone(`${vid}_C`));
+  t('suppression does not add extra bans (exactly one item lost to the outage)',
+    server.getConsecutiveStallBans() === 1);
+
+  // 4) a SUCCESSFUL download (real validateMp3File on the canned Xing MP3)
+  //    must re-open the breaker so a later genuinely-dead item can be banned.
+  const r4 = await runDl(`${vid}_D`, dirOk);
+  t('the healthy-toolchain download succeeds', r4 === true, `result=${r4}`);
+  t('a successful download clears the breaker', server.getConsecutiveStallBans() === 0 && server.stallBanAllowed());
+  fs.rmSync(path.join(CACHE_DIR, `${vid}_D`), { recursive: true, force: true });
+
+  // 5) breaker open again → the NEXT twice-stalled item is banned for real
+  const r5 = await runDl(`${vid}_E`, dirStall);
+  const rowE = await rowFor(`${vid}_E`);
+  t('after a success, the next twice-stalled item is banned again', r5 === false && !!rowE && rowE.ignored === true, `result=${r5} row=${rowE ? rowE.ignored : 'absent'}`);
+
+  await prisma.video.delete({ where: { videoId: `${vid}_A` } }).catch(() => {});
+  await prisma.video.delete({ where: { videoId: `${vid}_E` } }).catch(() => {});
+  await prisma.channel.delete({ where: { channelId: chan } }).catch(() => {});
+  server.resetStallBanCounter();
+  await setCfg('stallWindowMs', String(600 * 1000 * 10)).catch(() => {});
+}
+
 await prisma.$disconnect();
 console.log(fail === 0 ? `\nT2 PASS — ${pass} assertions\n` : `\nT2 FAIL — ${fail}/${pass + fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);
