@@ -49,7 +49,7 @@ server {
     # across unchanged harvest cycles. Regex wins over the /cache/ prefix
     # block below; MP3s + thumbnails keep their normal (cacheable) treatment.
     location ~ ^/cache/(index|progress)\.json$ {
-        root /home/user/projects/DrivePod;
+        alias /cache/$1.json;
         etag on;
         add_header Cache-Control "no-cache" always;
         add_header Cross-Origin-Resource-Policy "cross-origin" always;
@@ -59,7 +59,7 @@ server {
     }
 
     location /cache/ {
-        alias /home/user/projects/DrivePod/cache/;
+        alias /cache/;
         add_header Cross-Origin-Resource-Policy "cross-origin" always;
         add_header Access-Control-Allow-Origin "*" always;
         add_header X-Content-Type-Options "nosniff" always;
