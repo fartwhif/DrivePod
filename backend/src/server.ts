@@ -10,7 +10,7 @@ import bodyParser from 'body-parser';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import https from 'https';
 import compression from 'compression';
@@ -74,6 +74,120 @@ async function safeExec(cmd: string, context: string, timeoutMs?: number): Promi
   } catch (err: any) {
     const timedOut = err.killed && timeoutMs ? ` (killed after ${Math.round(timeoutMs / 1000)}s)` : '';
     console.error(`❌ [${context}] Command failed${timedOut}`);
+    console.error(`   Command: ${cmd}`);
+    if (err.stdout) console.error(`   stdout: ${err.stdout}`);
+    if (err.stderr) console.error(`   stderr: ${err.stderr}`);
+    console.error(`   Error: ${err.message}`);
+    throw err;
+  }
+}
+
+// === DOWNLOAD STALL WATCHDOG ===
+// yt-dlp can wedge forever when the network connection dies mid-transfer
+// (observed 2026-11-05: eUAxo-AC5Rs stuck ~4 h at 643 KB with zero progress —
+// every 5-min cron harvest skipped as "already running", queue frozen). A
+// wall-clock cap is NOT the right guard: large downloads over a slow link are
+// legitimate and must run indefinitely. Instead we watch the .part file(s):
+// NO GROWTH for STALL_WINDOW → kill + one retry (--continue resumes the .part,
+// so a transient stall costs nothing). Any growth resets the window, so a
+// download that slowly keeps moving never times out regardless of total size.
+const STALL_WINDOW_MS = 10 * 60 * 1000; // no data movement for 10 min → dead
+const POLL_INTERVAL_MS = 30_000;
+// Process-local circuit breaker for the stall BAN (item-level ban is
+// collateral damage during an ISP/CDN outage): a twice-stalled item may only
+// be IGNORED while no ban has fired since the last SUCCESSFUL download. Any
+// successful download proves the link is healthy, so the next item to stall
+// twice is genuinely dead and gets banned; once one ban has landed during an
+// uninterrupted streak of failures, every further stall-ban is SUPPRESSED
+// (item survives, its .part gets purged, it retries next cycle) — an outage
+// costs at most ONE wrongly-ignored item instead of burning the whole queue.
+// A container restart resets this to 0 mid-outage (worst case: one extra
+// collateral ban). The .part file itself cannot carry this signal: the
+// failed-download finally block always rmSync's the video dir, so a stalled
+// .part never survives into the next cycle anyway.
+let consecutiveStallBans = 0;
+/** True while a stall-ban may be applied (no un-cleared ban on record). */
+export function stallBanAllowed() { return consecutiveStallBans === 0; }
+/** Snapshot for tests/ops: bans since the last successful download. */
+export function getConsecutiveStallBans() { return consecutiveStallBans; }
+/** Clears the breaker — same effect as a completed successful download. */
+export function resetStallBanCounter() { consecutiveStallBans = 0; }
+
+/**
+ * Total size of every `.part` file under `dir`, including nested subdirs
+ * (yt-dlp creates `{id}/` for its `-o` targets and downloads inside it, so a
+ * top-level-only scan would report 0 and mis-flag a healthy download as stalled).
+ */
+export function measurePartBytesRecursive(dir: string): number {
+  let total = 0;
+  let entries: string[];
+  try { entries = fs.readdirSync(dir); } catch { return 0; } // dir not ready yet
+  for (const name of entries) {
+    const p = path.join(dir, name);
+    let st;
+    try { st = fs.statSync(p); } catch { continue; } // vanished between readdir/stat
+    if (st.isDirectory()) total += measurePartBytesRecursive(p);
+    else if (name.endsWith('.part')) total += st.size;
+  }
+  return total;
+}
+/**
+ * Run a command under a file-growth watchdog. While the child runs, polls the
+ * total size of every `.part` file under `watchDir` (recursive — yt-dlp nests
+ * them in `{id}/`), killing the child and re-running once when they do not grow
+ * within STALL_WINDOW_MS (yt-dlp --continue resumes from the .part). Returns normally on success; throws the
+ * first error on non-timeout failure or a second stall/timeout.
+ */
+export async function safeExecWithStallWatchdog(
+  cmd: string,
+  context: string,
+  watchDir: string,
+  // Tunable (defaults to the production constants) so tests can exercise the
+  // kill-and-retry-then-ban path in seconds instead of the 20-min default.
+  opts: { stallWindowMs?: number; pollMs?: number } = {}
+): Promise<{ stdout: string; stderr: string }> {
+  const stallWindowMs = opts.stallWindowMs ?? STALL_WINDOW_MS;
+  const pollMs = opts.pollMs ?? POLL_INTERVAL_MS;
+  // NOTE: a stall *inside one invocation* (kill + --continue retry + kill) is
+  // NOT proof the item is dead — during an ISP/CDN outage every item's retry
+  // freezes on the same dead link. The ban therefore goes through the
+  // consecutiveStallBans circuit breaker in downloadAndProcessVideo's catch,
+  // not from this wrapper.
+  const runOnce = () => new Promise<{ stdout: string; stderr: string; stalled: boolean }>((resolve, reject) => {
+    const child = spawn('/bin/sh', ['-c', cmd]);
+    let stdout = '';
+    let stderr = '';
+    let lastSize = -1;
+    let lastGrowth = Date.now();
+    const timer = setInterval(() => {
+      const total = measurePartBytesRecursive(watchDir);
+      if (total > lastSize) { lastSize = total; lastGrowth = Date.now(); }
+      else if (lastSize > 0 && Date.now() - lastGrowth >= stallWindowMs) {
+        clearInterval(timer);
+        child.kill('SIGKILL');
+        resolve({ stdout, stderr, stalled: true });
+      }
+    }, pollMs);
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('error', err => { clearInterval(timer); reject(err); });
+    child.on('close', code => {
+      clearInterval(timer);
+      if (code === 0) resolve({ stdout, stderr, stalled: false });
+      else reject(Object.assign(new Error(`exit code ${code}`), { stdout, stderr, code, signal: null, killed: false }));
+    });
+  });
+
+  try {
+    const r = await runOnce();
+    if (!r.stalled) return r;
+    console.warn(`⏱️ [${context}] No download progress for ${stallWindowMs} ms — killing and retrying once (--continue will resume)`);
+    const r2 = await runOnce();
+    if (!r2.stalled) return r2;
+    console.error(`❌ [${context}] Retry also stalled for ${stallWindowMs} ms — giving up on this video`);
+    throw Object.assign(new Error(`download stalled twice (${context})`), { stdout: r2.stdout, stderr: r2.stderr, code: null, signal: null, killed: false, stalledTwice: true });
+  } catch (err: any) {
+    console.error(`❌ [${context}] Command failed`);
     console.error(`   Command: ${cmd}`);
     if (err.stdout) console.error(`   stdout: ${err.stdout}`);
     if (err.stderr) console.error(`   stderr: ${err.stderr}`);
@@ -1170,7 +1284,7 @@ async function getBaseYtDlpCommand(): Promise<string> {
 }
 
 // === DOWNLOAD + TRANSCODE ===
-async function downloadAndProcessVideo(
+export async function downloadAndProcessVideo(
   videoInfo: any,
   videoUrl: string,
   preferredBitrate: number,
@@ -1195,7 +1309,11 @@ async function downloadAndProcessVideo(
       `--match-filter "live_status != is_live & live_status != is_upcoming" ` +
       `--output "${videoDir}/%(id)s.%(ext)s" "${videoUrl}"`;
 
-    await safeExec(downloadCmd, `yt-dlp download ${videoId}`);
+    // Stall budget is hot-configurable (default 10 min) so it can be tuned
+    // without a rebuild — and driven to sub-second values in the scratch tests.
+    const dlStallWindowMs = Math.max(1, parseInt(await getConfig('stallWindowMs', String(STALL_WINDOW_MS)), 10) || STALL_WINDOW_MS);
+    const dlPollMs = Math.max(250, parseInt(await getConfig('stallPollMs', String(POLL_INTERVAL_MS)), 10) || POLL_INTERVAL_MS);
+    await safeExecWithStallWatchdog(downloadCmd, `yt-dlp download ${videoId}`, videoDir, { stallWindowMs: dlStallWindowMs, pollMs: dlPollMs });
 
     let raw = path.join(videoDir, `${videoId}.webm`);
     const alt = path.join(videoDir, `${videoId}.m4a`);
@@ -1294,11 +1412,40 @@ comment=${JSON.stringify(commentData)}
     if (fs.existsSync(raw)) fs.unlinkSync(raw);
 
     success = true;
+    consecutiveStallBans = 0;   // a completed download proves the link is alive
     return true;
   } catch (err: any) {
     console.error(`❌ Download / FFmpeg failed for ${videoId}`);
     const errorMsg = (err.stderr || err.message || '').toLowerCase();
 
+    // Two watchdog interventions on the SAME item (kill + --continue retry +
+    // kill) mean this item refuses to transfer. Ban it via ignoreVideo():
+    // discovery's existingIds filter skips ANY row (ignored or not), so it is
+    // never re-queued and can never re-freeze the serialized harvest.
+    // BUT during an ISP/CDN outage EVERY item's retry freezes on the same dead
+    // link, so an unconditional ban would silently ignore the whole queue, one
+    // item per ~20 min. Circuit breaker: ban only the FIRST twice-stalled item
+    // since the last successful download — that one really is dead. While a
+    // ban is already on record with no success since, later stalls are
+    // collateral damage: skip WITHOUT banning so the item retries post-outage.
+    // (A restart mid-outage resets the counter: at worst one extra collateral
+    // ban. Un-ban any item via import/un-ignore.)
+    if (err && err.stalledTwice) {
+      if (consecutiveStallBans === 0) {
+        consecutiveStallBans = 1;
+        console.error(`⛔ [${videoId}] Download stalled twice — permanently ignoring this item to keep the queue moving`);
+        await ignoreVideo({
+          videoId,
+          channelId: videoInfo.channelId || 'unknown',
+          title: videoTitle,
+          pubDate: publishedAt,
+          duration: typeof videoInfo.duration === 'number' ? videoInfo.duration : undefined
+        });
+      } else {
+        console.warn(`⛔→🚧 [${videoId}] stalled twice but a stall-ban is already on record with no successful download since — link/CDN outage: skipped WITHOUT banning, retries next cycle`);
+      }
+      return false;
+    }
     if (errorMsg.includes('cookies are no longer valid') ||
       errorMsg.includes('invalid cookies') ||
       (errorMsg.includes('cookie') && errorMsg.includes('expired'))) {
@@ -1648,7 +1795,7 @@ export async function isFilteredOutByDuration(item: any, channel?: any): Promise
 }
 
 
-async function ignoreVideo(videoInfo: {
+export async function ignoreVideo(videoInfo: {
   videoId: string;
   channelId: string;
   title?: string;
