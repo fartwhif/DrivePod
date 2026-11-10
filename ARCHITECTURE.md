@@ -99,12 +99,20 @@ exposes **24320** on all interfaces (access actually arrives via WireGuard).
 
 ### 3.2 Volumes (live deployment)
 
-| Host path                              | Container path                | Purpose                                    |
-|----------------------------------------|-------------------------------|--------------------------------------------|
-| `/home/user/projects/DrivePod/data`        | same                          | SQLite DB + temp `cookies.txt`             |
-| `/home/user/projects/DrivePod/cache`       | same                          | MP3s, thumbnails, index.json, rss/ cache   |
-| `/home/user/projects/ytcookies/data`       | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape)    |
-| `/lib/modules`                         | same (ro)                     | WireGuard kernel modules                   |
+Host sides are repo-relative so the repo carries no machine-specific paths;
+container sides are the neutral constants that `.env` (`CACHE_DIR`, `DATA_DIR`,
+`DATABASE_URL`) and `drivepod-ngnix` refer to.
+
+| Host path (compose)  | Container path                   | Purpose                                    |
+|----------------------|----------------------------------|--------------------------------------------|
+| `./data`             | `/data` (`DATA_DIR`)             | SQLite DB + temp `cookies.txt`             |
+| `./cache`            | `/cache` (`CACHE_DIR`)           | MP3s, thumbnails, index.json, rss/ cache   |
+| `../ytcookies/data`  | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape)      |
+| `/lib/modules`       | same (ro)                        | WireGuard kernel modules                   |
+
+Stale absolute `audioPath` DB rows from an earlier host layout are repaired on
+startup by the self-heal pass (§5) to the canonical `{CACHE_DIR}/{videoId}/`
+layout, so a relocation needs no manual DB surgery.
 
 The shared cache dir is **shared with GrabbyTube** — both projects write
 per-video folders under `cache/`. DrivePod's cleanup routines must therefore

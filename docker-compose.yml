@@ -21,7 +21,7 @@ services:
       # DATABASE_URL and drivepod-ngnix all refer to.
       - ./data:/data
       - ./cache:/cache
-      - ../../ytcookies/data:/shared-cookies
+      - ../ytcookies/data:/shared-cookies
       - /lib/modules:/lib/modules:ro
     env_file:
       - .env
