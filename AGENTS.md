@@ -127,6 +127,48 @@
   distribute (pull + recondition) and the pre-insert recheck. NEVER rewrite
   `grabby-index.json` — GrabbyTube owns it; its `audioPath` values go stale
   when its cache moves, which is why we resolve at read time.
+- **Downloads run under a STALL watchdog, never a wall-clock cap**
+  (2026-11-05): `downloadAndProcessVideo` uses
+  `safeExecWithStallWatchdog(cmd, context, videoDir, opts)`. While the child
+  runs it sums EVERY `.part` under `videoDir` **recursively**
+  (`measurePartBytesRecursive`) every `POLL_INTERVAL_MS` (30 s) — recursive
+  matters: a top-level-only scan reads 0 for yt-dlp's nested `{id}/ layout and
+  mis-flags a healthy download as stalled (now a T2 assertion).
+  NO GROWTH for `STALL_WINDOW_MS` (10 min) → SIGKILL the child + ONE retry
+  (yt-dlp `--continue` resumes the `.part`, so a transient stall costs
+  nothing). Any growth resets the window, so a large-but-slow download over a
+  bad link NEVER times out regardless of total size. Rationale: a fixed
+  `timeoutMs` would kill legitimate slow big downloads.
+  **A SECOND consecutive stall throws `stalledTwice: true` — and the BAN that
+  follows is gated by a CIRCUIT BREAKER (`consecutiveStallBans`).** Two stalls
+  inside ONE invocation prove the item won't transfer, but NOT that the item is
+  at fault: during an ISP/CDN outage every item's `--continue` retry freezes on
+  the same dead link, so an unconditional `ignoreVideo()` would silently
+  discard one item per ~20 min for the whole outage. The rule in
+  `downloadAndProcessVideo`'s catch: ban only the FIRST twice-stalled item
+  since the last *successful* download (that one really is dead — the
+  successes prove the link works); while a ban is already on record with no
+  success since, later stalls log `⛔→🚧 … skipped WITHOUT banning` and the
+  item retries next cycle. Net effect: a 4-hour outage costs exactly ONE
+  wrongly-ignored item instead of the whole queue. The counter is reset on
+  every successful download (and by `resetStallBanCounter()`; it is process-
+  local, so a mid-outage restart costs at most one extra collateral ban).
+  `existingIds` discovery (server.ts ~L1985) has NO `ignored` filter, which is
+  exactly why a banned row is permanent: it is never re-discovered and can never
+  re-freeze the serialized harvest. Un-ban needs an explicit un-ignore/re-import.
+  Note the `finally` block always rmSync's an incomplete video dir, so a stalled
+  `.part` NEVER survives into the next cycle — the cross-cycle signal lives in
+  this counter, not in leftover files. The stall budget is **hot-tunable** via
+  `Config.stallWindowMs` / `Config.stallPollMs` (defaults to the constants) — no
+  rebuild, and it lets T2 drive kill→retry→ban→suppress→reset→ban in ~1 s
+  (section 14 uses fake yt-dlp/ffmpeg/ffprobe/vbrfix on PATH plus a canned
+  8192-byte file whose Xing header claims its own exact size, so the REAL
+  `validateMp3File` accepts it and the success path really clears the breaker).
+  CAUTION: `spawn('/bin/sh','-c',cmd)` must stay INSIDE `runOnce` — hoisting it
+  makes the "retry" reuse a dead child (invocations=1) and the ban never fires.
+  Never reintroduce an unbounded download exec. Note the image's Node 20.20.2
+  is a stripped build WITHOUT `Promise.withResolvers` — use the plain
+  `new Promise(executor)` form there.
 - **Discovery calls are time-bounded; skip paths are logged**
   (2026-10-16): `safeExec(cmd, context, timeoutMs?)` kills hung yt-dlp
   (120 s on `scrapeTab` + `fillMissingMetadata`). The harvest loop logs
@@ -146,6 +188,20 @@
   call fails cleanly (no row written, incomplete folder removed) and the
   item retries next cycle. See ARCHITECTURE.md §7.3.
 
+- **Cross-tab state changes derive LOCALLY, no index re-fetch** (2026-11-04):
+  `rawIndex` is the single source every tab derives from via `derivePlaylists()`
+  (queue / protected / watched). When a user action MOVES an item between tabs —
+  unwatch (`toggleWatched`), lock/unlock (`toggleProtect`, also the `L` hotkey), or
+  grabby delete (`consumeGrabbyTrack`) — call `applyLocalVideoChange(videoId, patch)`
+  or `removeLocalVideo(videoId)`, which mutate that one item in `rawIndex` and
+  re-derive all three lists client-side. This is MANDATORY over re-fetching
+  `index.json`: the connections are highly throttled (~180 KB gzipped index) so a
+  full fetch per toggle is wasteful. The 2-min poll (`playlistRefreshInterval`)
+  reconciles externally-driven changes (harvest, other clients) as the safety net.
+  Unwatch zeroes `progress` so replay starts fresh. CAUTION: `derivePlaylists()`
+  resets queue paging to page 1, so these toggles jump deep-scrolled Queue views to
+  the top (pre-existing semantics — preserve scroll position first if you care).
+
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 
 ## Project Roots
@@ -154,4 +210,4 @@
 - Harvest runs on cron + manual.
 
 Update this file with new patterns after each task.
-Last updated: 2026-11-03 (Node backend supervisor loop in entrypoint — P1008 crash 2026-11-03 left /api 502 for ~7 h behind a still-healthy static nginx; respawn loop with 5s→300s backoff + kill-test verified, `set +e` mandatory in the subshell)
+Last updated: 2026-11-05 (STALL watchdog now BANs a persistently-dead item: the 2nd consecutive no-`.part`-growth window throws an error tagged `stalledTwice:true`, and `downloadAndProcessVideo`'s catch turns that into `ignoreVideo()` — a durable `ignored=true` row that discovery's `existingIds` filter (no `ignored` clause) skips forever, so the twice-frozen item can never re-freeze the serialized harvest. The `.part` scan is now recursive (`measurePartBytesRecursive`) so yt-dlp's nested `{id}/` layout can't be misread as a stall, and the budget is hot-tunable via `Config.stallWindowMs`/`stallPollMs` (T2 drives the whole kill→retry→ban path in ~1 s; 61 assertions). Replaces the old unbounded download exec that wedged `eUAxo-AC5Rs` for ~4h.)
