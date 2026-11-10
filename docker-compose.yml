@@ -16,9 +16,12 @@ services:
     ports:
         - "${VPS_IP:-0.0.0.0}:${NGINX_PORT:-24320}:80"
     volumes:
-      - /home/user/projects/DrivePod/data:/home/user/projects/DrivePod/data
-      - /home/user/projects/DrivePod/cache:/home/user/projects/DrivePod/cache
-      - /home/user/projects/ytcookies/data:/shared-cookies
+      # Host side is repo-relative (no machine identity in the path); the
+      # container side is a neutral constant that .env's DATA_DIR/CACHE_DIR/
+      # DATABASE_URL and drivepod-ngnix all refer to.
+      - ./data:/data
+      - ./cache:/cache
+      - ../../ytcookies/data:/shared-cookies
       - /lib/modules:/lib/modules:ro
     env_file:
       - .env
