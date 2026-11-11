@@ -56,6 +56,7 @@ the ID is the key to wiring up your DrivePod.  The manual way to obtain someone'
 - **Data Throttling** — Optimized for low-bandwidth environments (56K modem friendly) with compression and caching
 - **Smart Autoplay** — 5-way autoplay modes: newest, newer, older, oldest, and off
 - **Offline Resilience** — Operation queue with exponential-backoff retry, always-on connectivity probe, and audio recovery after network loss
+- **Stall Watchdog** — playback silence for 20 s is detected even when the connection dies without an error, shows a `⏳` badge, and re-opens the stream from where you stopped (3 tries, then the track is skipped)
 - **Authentication** — Removed: open access with no login required. Access control is the network/WireGuard perimeter (see `ARCHITECTURE.md` §14)
 
 ### Frontend (Angular)

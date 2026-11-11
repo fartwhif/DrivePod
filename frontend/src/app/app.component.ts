@@ -2,6 +2,15 @@ import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild,
 import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import {
+  evaluateStall,
+  MAX_STALL_RECOVERIES,
+  PlaybackPhase,
+  RESUME_DETECT_MS,
+  STALL_DETECT_MS,
+  STALL_PHASE_LABEL,
+  stallResumeTarget
+} from './stall-guard';
 import { Title } from '@angular/platform-browser';
 
 interface Video {
@@ -143,7 +152,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    // SKIP MARKS WATCHED: treat skip-next as if the track finished playing
    skipMarksWatched = signal(false);
 
-  private readonly APP_VERSION = '1.9.0';
+  private readonly APP_VERSION = '1.10.0';   // ← bumped for the playback stall watchdog
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched'>('queue');
   protectedPlaylist = signal<Video[]>([]);
@@ -231,6 +240,37 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private _dropInProgress = false;
   private _wasPlayingBeforeDrop = false;
   private initialAutoplayAttempted = false;
+
+  // === Playback liveness watchdog (see stall-guard.ts for the decision) ===
+  // `timeupdate` is the liveness heartbeat: a playing MP3 advances
+  // `currentTime` ~4x/s, so `lastProgressAt` is wall-clock time of the last
+  // audible advance. Arming also happens on every fresh load, so a load that
+  // produces no progress is judged by the same budget as a stream that went
+  // silent — which is what makes each attempt self-serialized (no separate
+  // per-attempt clock is needed).
+  private lastProgressAt = Date.now();
+  private _stallRecoveries = 0;
+  // True from `loadAndSeekVideo` until this track's metadata is back: the
+  // heartbeat cannot restart before a load lands, so silence is not yet a
+  // failed attempt.
+  private _freshLoad = false;
+  // Fresh load issued by the watchdog (not the normal play path): only those
+  // may be retried again, so a playback blocked by the autoplay policy is
+  // never reloaded forever.
+  private _stallLoadOutstanding = false;
+  // `navigator.mediaSession.playbackState === 'playing'` as last reported:
+  // the only trustworthy progress signal while the page is hidden.
+  private mediaSessionPlaying = false;
+  // Shortened detect budget granted after a frozen tab comes back, and when
+  // it expires. The tab's clock is stale by construction, so its own `resume`
+  // event owns the decision; this only bounds the grace it is given.
+  private resumeGraceUntil = 0;
+  // Play intent captured when the page went hidden. A suspended tab can have
+  // its media pipeline discarded at any moment, so the decision on return has
+  // to come from before the suspension, not from the (paused) element after.
+  private _wasPlayingAtSuspend = false;
+  /** Watchdog status for the badge; `idle` renders nothing. */
+  playbackPhase = signal<PlaybackPhase>('idle');
 
   // videoIds we marked watched client-side but whose POST may still be queued
   // for retry (network blackholes). Index refetches must keep these out of the
@@ -339,6 +379,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.currentTime.set(this.audio.currentTime);
       this.throttledSaveProgress();
       this.throttledUpdateMediaPosition();
+      // Liveness heartbeat: audible progress. `timeupdate` fires even while
+      // the page is hidden or the screen is off, so it is the one progress
+      // signal a frozen/suspended tab cannot fake.
+      if (!this.audio.paused) this._noteAudibleProgress();
     };
 
     this.setupProgressListeners();
@@ -380,6 +424,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.pendingVideoOps = [];
     this._dropInProgress = false;
     this._wasPlayingBeforeDrop = false;
+    this._stallLoadOutstanding = false;
+    this.resumeGraceUntil = 0;
+    this.playbackPhase.set('idle');
 
     // Remove event listeners
     window.removeEventListener('beforeunload', this.handleBeforeUnload.bind(this));
@@ -739,7 +786,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }, this.PROBE_INTERVAL);
   }
 
-  /** Always-on connectivity probe for playback recovery (runs every 5s). */
+  /** Always-on connectivity probe + playback stall watchdog (every 5s). */
   private startAlwaysOnProbe(): void {
     if (this.alwaysOnProbeTimer) return;
     this.alwaysOnProbeTimer = setInterval(() => {
@@ -759,6 +806,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this._dropInProgress = true;
     // audio.error !== null means the element was mid-playback and got
     // interrupted by the drop (a paused element never enters an error state).
+    // The stall watchdog hands this track to the outage machinery while
+    // `_dropInProgress` is set, so a capture taken from a frozen/suspended
+    // tab has to be re-armed by that tab's own `resume` event: record the
+    // trust verdict at capture time instead of re-deriving it later.
     this._wasPlayingBeforeDrop = !!this.currentVideo() && (!this.audio.paused || this.audio.error !== null);
   }
 
@@ -792,6 +843,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           this._consecutiveProbeFails++;
           if (this._consecutiveProbeFails === 3) this._snapshotPlaybackStateOnDrop();
         }
+        // Watchdog tick, after the verdict: a HEAD failure is what
+        // hands recovery to the outage machinery, so it must be known
+        // before the tick decides whether a reload is due.
+        this._runStallCheck();
       })
       .catch(() => {
         this._consecutiveProbeFails++;
@@ -799,6 +854,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           console.warn('Backend unreachable (3 consecutive probe failures)');
           this._snapshotPlaybackStateOnDrop();
         }
+        this._runStallCheck();
       });
   }
 
@@ -871,8 +927,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const video = this.currentVideo();
     if (!video) return;
 
-    // If audio is not in an error-like state (playing or fine), nothing to recover
-    if (!this.audio.paused && this.audio.readyState >= 2) {
+    // A fresh load is already in flight (the watchdog's or this one) and it
+    // is young: nothing to redo. The old gate (`!paused && readyState >= 2`)
+    // was always true for the starved element this recovery exists for —
+    // `readyState` 2 IS starvation — so it vetoled the reload that a
+    // connection which went silent (or a discarded media pipeline) needed.
+    if (!this._freshLoad && Date.now() - this.lastProgressAt < STALL_DETECT_MS) {
       return;
     }
 
@@ -910,9 +970,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       }
     };
 
+    // Silent starvation: a connection that dies without an RST (dead Wi-Fi,
+    // NAT drop, phone out of coverage) never fires `error`, it just stops
+    // delivering bytes. These events mark the attempt settled so the watchdog
+    // judges it on the next tick instead of waiting behind `loadInFlight`;
+    // neither one triggers a reload by itself (a buffer refill mid-song fires
+    // `stalled` routinely).
+    this.audio.onwaiting = () => {
+      this._freshLoad = false;
+    };
+    this.audio.onstalled = () => {
+      this._freshLoad = false;
+    };
+
     this.audio.onseeked = () => {
       this.isScrubbing.set(false);
-      if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
+      clearTimeout(this.saveDebounceTimer);
 
       this.saveDebounceTimer = setTimeout(() => {
         this.saveProgress(this.audio.currentTime);
@@ -920,6 +993,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       }, 300);
     };
 
+    // `onplay` is fired by the element itself when the OS resumes it, so it
+    // is also the signal that a lockscreen / head-unit resume worked.
     this.audio.onplay = () => this.setMediaPlaybackState('playing');
 
     // Successful playback clears any recorded failures for this track.
@@ -930,6 +1005,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     window.addEventListener('beforeunload', this.handleBeforeUnload.bind(this));
     window.addEventListener('online', this.handleOnline.bind(this));
+    // A frozen/suspended tab (screen off, tab backgrounded on Android) stops
+    // firing `timeupdate` and, after a few seconds, discards its media
+    // pipeline while the audio keeps "playing" to the OS. Only the tab's own
+    // `resume`/visibility events can tell "was playing all along" from
+    // "pipeline gone", and only a fresh HTTP load brings back a discarded
+    // one — a reload of the same buffer is a no-op.
+    document.addEventListener('visibilitychange', this.handleVisibilityChange.bind(this));
+    window.addEventListener('resume', this.handleResume.bind(this));
   }
 
   private handleBeforeUnload(): void {
@@ -1019,16 +1102,47 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this._tryPlay(video);
   }
 
-  private loadAndSeekVideo(video: Video) {
+  /**
+   * Load `video` and resume it, and (re-)arm the liveness watchdog.
+   *
+   * A same-track load — the watchdog's recovery, a play() that rejected, an
+   * error reload, a play-retry — resumes at the ELEMENT's own position, NOT
+   * at `video.progress`: that field is what the index carried when it was
+   * last fetched, and a recovery deliberately never re-fetches the index.
+   * Seeking to it threw a listener whose connection died back to where the
+   * item STARTED — in the e2e reproduction of the reported freeze the old
+   * behaviour resumed at 0 s after 29 s had already been heard, and the
+   * progress PATCHes restarted 8 → 18 → 28 → 0 → 10 → 20, which is the user
+   * hearing the beginning of an item they were three minutes into.
+   * `currentTime` IS where the listener stopped being heard: the element
+   * keeps its playback position when its pipeline is discarded or its
+   * connection dies, and the fresh request refills the buffer from there.
+   * A different track (row click, autoplay, boot) has no live position of
+   * its own, so its saved progress from the index still wins.
+   */
+  private loadAndSeekVideo(video: Video): void {
+    // A DIFFERENT track gets a fresh attempt budget; re-loading the same one
+    // keeps it, which is what bounds the watchdog's retries.
+    const previous = this.currentVideo();
+    const sameTrack = !!previous && previous.videoId === video.videoId;
+    if (!sameTrack) this._stallRecoveries = 0;
     this.currentVideo.set(video);
     this.updatePageTitle(video);
+    // The resume target is computed BEFORE `src` is re-assigned: the load
+    // algorithm wipes the playback position the moment a new source is set.
+    const targetProgress = stallResumeTarget({
+      currentTime: sameTrack ? this.audio.currentTime : 0,
+      readyState: this.audio.readyState,
+      savedProgress: video.progress || 0
+    });
 
     const monoStr = this.preferredMono() ? '-mono' : '';
     this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
 
-    const targetProgress = video.progress || 0;
-
     this.audio.onloadedmetadata = () => {
+      // The response landed: the load is no longer outstanding, so any
+      // silence from here on is judged by the watchdog.
+      this._freshLoad = false;
       if (targetProgress > 0) {
         if (targetProgress < (this.audio.duration || Infinity) * 0.98) {
           this.audio.currentTime = targetProgress;
@@ -1040,7 +1154,35 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       this.audio.onloadedmetadata = null;
     };
 
+    // Assigning `src` restarts the media pipeline (verified in the e2e
+    // harness: every same-track reload emitted its own ranged request), and
+    // `load()` guarantees the fetch starts even when play() below is refused
+    // by the autoplay policy — a blocked play must not defer the download.
     this.audio.load();
+
+    // A fresh HTTP load re-arms the watchdog: silence AFTER this point is a
+    // failed attempt, silence before it is the load still fetching.
+    this._stallLoadOutstanding = false;
+    this._freshLoad = true;
+    this._armStallHeartbeat();
+  }
+
+  /** Audible progress: the element demonstrably played, so BOTH the
+   *  watchdog clock and its attempt budget restart. */
+  private _noteAudibleProgress(): void {
+    this._freshLoad = false;
+    this._stallLoadOutstanding = false;
+    this._stallRecoveries = 0;
+    this._armStallHeartbeat();
+  }
+
+  /** Arm the liveness heartbeat: `staleMs` restarts from now. The attempt
+   *  budget is deliberately NOT part of arming — a fresh load that produces
+   *  no progress must still be judged as the attempt it was, or a genuinely
+   *  dead track would be reloaded forever. */
+  private _armStallHeartbeat(): void {
+    this.lastProgressAt = Date.now();
+    this.playbackPhase.set('idle');
   }
 
   setAutoplayMode(mode: 'newest' | 'newer' | 'older' | 'oldest' | 'off') {
@@ -1294,9 +1436,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   private setMediaPlaybackState(state: 'playing' | 'paused' | 'none' = 'none'): void {
     if (!('mediaSession' in navigator)) return;
+    // What the OS thinks our audio is doing: the watchdog's only progress
+    // signal while the page is hidden (lockscreen / car head-unit).
+    this.mediaSessionPlaying = state === 'playing';
     try {
       navigator.mediaSession.playbackState = state;
     } catch (e) {}
+  }
+
+  /** Badge text for the watchdog phase ('' when healthy). */
+  get stallPhaseLabel(): string {
+    const phase = this.playbackPhase();
+    return phase === 'idle' ? '' : STALL_PHASE_LABEL[phase];
   }
 
 
@@ -1324,33 +1475,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       video = queue[0];
     }
 
-    // Set up the video in the audio element
-    this.currentVideo.set(video);
-    this.updatePageTitle(video);
-    this.saveCurrentVideo(video.videoId);
-
-    const monoStr = this.preferredMono() ? '-mono' : '';
-    this.audio.src = `/api/stream/${video.videoId}?bitrate=${this.preferredBitrate()}${monoStr}`;
-
-    const targetProgress = video.progress || 0;
-    this.audio.onloadedmetadata = () => {
-      if (targetProgress > 0 && targetProgress < (this.audio.duration || Infinity) * 0.98) {
-        this.audio.currentTime = targetProgress;
-      }
-      this.updateMediaPositionState();
-      this.setMediaPlaybackState('playing');
-      this.audio.onloadedmetadata = null;
-    };
-    this.audio.load();
-
-    // Attempt play — may be blocked by autoplay policy, which is fine
-    const playPromise = this.audio.play();
-    if (playPromise !== undefined) {
-      playPromise.catch(err => {
-        console.log('Autoplay blocked by browser policy — ready for user gesture', err.name);
-        this.setMediaPlaybackState('paused');
-      });
-    }
+    // The one load path: it sets the source, arms the liveness watchdog and
+    // resumes at `video.progress` (fresh track: no live position to keep).
+    this._loadAndPlay(video);
   }
 
   // === Playback retry: HEAD probe before play ===
@@ -1561,6 +1688,141 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this._tryPlay(video);
       }
     }
+  }
+
+  // === Playback liveness watchdog ===
+
+  /**
+   * Trust verdict for this tick: TRUE while the page is rendered OR the OS
+   * media session still reports our audio as playing (lockscreen, car
+   * head-unit) — in both cases a real stream keeps firing `timeupdate`, so
+   * silence means something is wrong. FALSE while the tab is
+   * frozen/suspended: its timers run at ~1/min so a stale heartbeat proves
+   * nothing, and the audio may genuinely still be playing. Those cases are
+   * decided by the tab's own `resume` event (`handleResume`).
+   */
+  private computeClockTrust(): boolean {
+    return (typeof document === 'undefined' || document.visibilityState === 'visible')
+      || this.mediaSessionPlaying;
+  }
+
+  /** One watchdog tick, run after every connectivity probe verdict. */
+  private _runStallCheck(): void {
+    const video = this.currentVideo();
+    const now = Date.now();
+    // A resumed tab runs the shortened budget (its clock is stale by
+    // construction) until that grace expires; everything else the full one.
+    const budget = now < this.resumeGraceUntil ? RESUME_DETECT_MS : STALL_DETECT_MS;
+    const staleMs = now - this.lastProgressAt;
+
+    const decision = evaluateStall({
+      hasTrack: !!video,
+      paused: this.audio.paused,
+      scrubbing: this.isScrubbing(),
+      staleMs,
+      readyState: this.audio.readyState,
+      loadInFlight: this._freshLoad,
+      retryPending: !!this._playRetryTimer,
+      networkDown: !this.backendOnline || this._dropInProgress,
+      clockTrust: this.computeClockTrust(),
+      recoveries: this._stallRecoveries,
+      detectMs: budget
+    });
+
+    if (this.playbackPhase() !== decision.phase) this.playbackPhase.set(decision.phase);
+    this._stallRecoveries = decision.nextRecoveries;
+    this._freshLoad = decision.nextLoadInFlight;
+
+    if (decision.recover) {
+      console.warn(`Playback stalled on ${video?.videoId} (${Math.round((now - this.lastProgressAt) / 1000)}s silent, backend reachable) -- reloading`);
+      this._recoverFromStall();
+    } else if (decision.giveUp) {
+      console.warn(`Playback never resumed on ${video?.videoId} after ${MAX_STALL_RECOVERIES} reloads -- skipping`);
+      this._skipDefunctTrack(video!.videoId);
+    }
+  }
+
+  /**
+   * Recovery reload: same track, same playback position, but a NEW HTTP request
+   * (a reload of the same buffer is a no-op for a dead connection or a
+   * discarded pipeline). Uses the plain load path, NOT `_tryPlay`: the play
+   * retry loop owns the not-reachable case and would take over the track.
+   */
+  private _recoverFromStall(): void {
+    this._reloadCurrentTrack('Playback stalled (backend reachable, no progress)');
+  }
+
+  /**
+   * Reload the current track where it stopped with a NEW HTTP request
+   * (reusing the buffer is a no-op for a connection that went silent or for a
+   * discarded media pipeline). Uses the plain load path, NOT `_tryPlay`: the
+   * play-retry loop owns the not-reachable case and would take the track over.
+   */
+  private _reloadCurrentTrack(reason: string): void {
+    const video = this.currentVideo();
+    if (!video) return;
+    console.warn(`${reason} -- reloading ${video.videoId}`);
+    this.loadAndSeekVideo(video);
+    // This particular load is watchdog-owned: only those may be retried on a
+    // later tick, so a play blocked by the autoplay policy is not reloaded
+    // forever.
+    this._stallLoadOutstanding = true;
+    this.audio.play().catch(() => {
+      // Autoplay policy can block an unprompted resume: the track is loaded
+      // and the user can hit play.
+    });
+  }
+
+  /** Page hidden/visible. Hidden: capture play intent (this tab's media
+  *   pipeline can be discarded at any moment while suspended, and the
+  *   element may then pause itself without any event reaching us), arm the
+  *   heartbeat so the hidden period is not read as a stall, and drop the
+  *   badge because this tab's clock is no longer trustworthy. */
+  private handleVisibilityChange(): void {
+    if (document.visibilityState !== 'visible') {
+      this._wasPlayingAtSuspend = !!this.currentVideo() && (!this.audio.paused || this.audio.error !== null);
+      this._armStallHeartbeat();
+      return;
+    }
+    this._handleResume();
+  }
+
+  /** Tab frozen → running again (`resume`, which Chrome fires when it
+  *   re-activates a suspended tab) or lockscreen unlock. */
+  private handleResume(): void {
+    this._handleResume();
+  }
+
+  private _handleResume(): void {
+    if (!this.currentVideo()) return;
+
+    if (!this.audio.paused) {
+      // Audio survived the whole hidden period via the OS audio service
+      // (screen off, tab still audible): the element is live and the heartbeat
+      // was armed on hide, so there is nothing to recover — and the attempt
+      // budget must NOT be spent, which is what would otherwise skip a track
+      // part-way through on every screen timeout.
+      this._wasPlayingAtSuspend = false;
+      this.resumeGraceUntil = 0;
+      this._noteAudibleProgress();
+      return;
+    }
+
+    if (this._wasPlayingAtSuspend) {
+      this._wasPlayingAtSuspend = false;
+      // The user wanted this playing and the element stopped while we were
+      // away: the pipeline was discarded while suspended, and only a fresh
+      // HTTP load revives it (a reload of the same buffer is a no-op). A
+      // play-retry loop or an outage snapshot owns the track instead.
+      if (!this._playRetryTimer && !this._dropInProgress) {
+        this._reloadCurrentTrack('Tab resumed with audio paused');
+      }
+    }
+
+    // Grant the shortened detect budget while this grace runs: this tab's
+    // clock is stale by construction, so the normal budget would forgive a
+    // discarded pipeline for as long as the tab had been frozen.
+    this.resumeGraceUntil = Date.now() + RESUME_DETECT_MS;
   }
 
   /** Reload index and automatically play the first available track when ready. */
