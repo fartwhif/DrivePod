@@ -23,7 +23,22 @@ const require = createRequire(import.meta.url);
 const { PrismaClient } = require(path.join(ROOT, 'backend/node_modules/@prisma/client/index.js'));
 
 const CACHE_DIR = path.join(ROOT, 'cache');
-const DB_URL = `file:${path.join(ROOT, 'data', 'database.db')}`;
+const DATA_DIR = path.join(ROOT, 'data');
+const DB_URL = `file:${path.join(DATA_DIR, 'database.db')}`;
+
+/**
+ * Stored paths (Video.audioPath) use the NEUTRAL container roots (/cache,
+ * /data — see ARCHITECTURE §2/§3.2: compose mounts ./cache:/cache, ./data:/data),
+ * so the host-side audit must translate them back onto this checkout. Any other
+ * absolute path is taken literally.
+ */
+const hostPath = (p) => {
+  if (!path.isAbsolute(p)) return path.join(CACHE_DIR, p);
+  const seg = p.split('/');
+  if (seg[1] === 'cache') return path.join(CACHE_DIR, ...seg.slice(2));
+  if (seg[1] === 'data') return path.join(DATA_DIR, ...seg.slice(2));
+  return p;
+};
 
 const prisma = new PrismaClient({ datasources: { db: { url: DB_URL } } });
 
@@ -159,7 +174,7 @@ console.log(`DB videos: ${videos.length} (non-ignored ${dbNonIgnored.size}) | in
   const missingDbPath = [], missingIndexPath = [];
   for (const v of videos) {
     if (!v.isGrabby) continue;
-    if (!fs.existsSync(v.audioPath)) missingDbPath.push(v.videoId);
+    if (!fs.existsSync(hostPath(v.audioPath))) missingDbPath.push(v.videoId);
     if (!fs.existsSync(path.join(CACHE_DIR, v.videoId, `${v.videoId}.mp3`))) missingIndexPath.push(v.videoId);
   }
   // Resolver semantics (resolveGrabbyAudioPath): a stale absolute audioPath
@@ -167,7 +182,7 @@ console.log(`DB videos: ${videos.length} (non-ignored ${dbNonIgnored.size}) | in
   // {id}/{id}.mp3 exists — the backend falls back to it at read time.
   const brokenSet = new Set();
   for (const g of grabbyIndex) {
-    const literal = path.isAbsolute(g.audioPath) ? g.audioPath : path.join(CACHE_DIR, g.audioPath);
+    const literal = hostPath(g.audioPath);
     const canonical = path.join(CACHE_DIR, g.videoId, `${g.videoId}.mp3`);
     if (!fs.existsSync(literal) && !fs.existsSync(canonical)) brokenSet.add(g.videoId);
   }
@@ -190,14 +205,14 @@ console.log(`DB videos: ${videos.length} (non-ignored ${dbNonIgnored.size}) | in
   const staleBag = bag.filter(e => !grabbySet.has(e.videoId) && !dbSet.has(e.videoId)).map(e => e.videoId);
   if (staleBag.length) fail('A9', `${staleBag.length} stale shufflebag entries (in bag, in neither DB nor grabby-index — wasted pulls): ${staleBag.slice(0, 8).join(', ')}`);
   else ok('A9', 'no stale shufflebag entries');
-  const resolvable = g => { const lit = path.isAbsolute(g.audioPath) ? g.audioPath : path.join(CACHE_DIR, g.audioPath); return fs.existsSync(lit) || fs.existsSync(path.join(CACHE_DIR, g.videoId, `${g.videoId}.mp3`)); };
+  const resolvable = g => { const lit = hostPath(g.audioPath); return fs.existsSync(lit) || fs.existsSync(path.join(CACHE_DIR, g.videoId, `${g.videoId}.mp3`)); };
   const unreachable = grabbyIndex.filter(g => !dbSet.has(g.videoId) && !bag.some(e => e.videoId === g.videoId) && resolvable(g)).length;
   info('A9b', `${unreachable} grabby-index tracks currently reachable only after bag re-init (ratio may already be satisfied — informational)`);
 }
 
 // ── A11: every non-ignored DB row's audioPath (the real /api/stream target) exists ──
 {
-  const missing = videos.filter(v => !v.ignored && !fs.existsSync(v.audioPath)).map(v => v.videoId);
+  const missing = videos.filter(v => !v.ignored && !fs.existsSync(hostPath(v.audioPath))).map(v => v.videoId);
   if (missing.length) fail('A11', `${missing.length} non-ignored DB rows whose audioPath does not exist (/api/stream 404s): ${missing.slice(0, 8).join(', ')}`);
   else ok('A11', 'all non-ignored DB audioPaths exist');
 }

@@ -56,14 +56,14 @@ drivepod/
 ├── .env / .env.example        # deployment env (not committed; .env has real keys)
 ├── AGENTS.md / INTELLIGENCE.md / ARCHITECTURE.md / README.md
 ├── backend/
-│   ├── src/server.ts          # ALL of the backend (2,519 lines, single file)
+│   ├── src/server.ts          # ALL of the backend (3,149 lines, single file)
 │   ├── prisma/schema.prisma   # 3 models: Channel, Video, Config
 │   └── package.json           # express, prisma, rss-parser, node-cron, multer, ...
 ├── frontend/src/app/
-│   ├── app.component.ts       # ALL of the UI logic (1,814 lines, one component)
-│   ├── app.component.html     # 807-line template, 6 tabs, Tailwind
+│   ├── app.component.ts       # ALL of the UI logic (2,202 lines, one component)
+│   ├── stall-guard.ts         # pure playback-liveness decision (see §12.3)
 │   ├── app.routes.ts          # single route '' → AppComponent (no auth routes)
-│   ├── app.config.ts          # provideRouter + provideHttpClient (no interceptors)
+│   ├── app.component.html     # 836-line template, 6 tabs, Tailwind
 │   └── root.component.ts      # <router-outlet />
 ├── cache/                     # mounted volume — see §8 (videos, index.json, rss/)
 ├── data/                      # mounted volume — database.db, cookies.txt (temp)
@@ -80,7 +80,7 @@ Key structural facts:
   components; tabs are `@if (activeTab() === …)` blocks in a single template.
   **There is no login page, no auth guard, no HTTP interceptor** — the router
   has exactly one route (`''` → AppComponent, wildcard redirects to it).
-- **Frontend app version constant**: `1.9.0` (`APP_VERSION` in app.component.ts).
+- **Frontend app version constant**: `1.10.0` (`APP_VERSION` in app.component.ts).
 
 ---
 
@@ -824,8 +824,8 @@ current position, progress time labels.
 `playVideo(v)` → `_tryPlay`:
 
 1. **HEAD probe** `/api/stream/<id>` before touching the `<audio>` element:
-   - 200 → `_loadAndPlay` (set src, seek to saved progress if <98% of
-     duration, `play()`);
+   - 200 → `_loadAndPlay` (set src, seek to the `stallResumeTarget` position
+     if <98% of duration, `play()` — see the watchdog below);
    - 404 → **defunct**: `_skipDefunctTrack` (local-watched hold, remove from
      playlist, POST watched, advance);
    - unreachable/other → `_probeAndPlay`: exponential backoff
@@ -856,6 +856,54 @@ replays from 0 (and re-arms the playing-before-drop flag).
 **Hide ⇒ stop invariant**: every path that sets `currentVideo` to null also
 does `audio.pause(); audio.src=''; setMediaPlaybackState('none')` (enforced by
 an `effect()` in the constructor) — a hidden player must not keep playing.
+
+**Playback liveness watchdog — silent starvation** (`frontend/src/app/stall-guard.ts`
+holds the pure decision; `_runStallCheck()` in `app.component.ts` executes it
+after every connectivity-probe verdict, so it needs no timer of its own):
+
+- Liveness heartbeat = `timeupdate` (~4 Hz on a playing MP3): `lastProgressAt`
+  is the wall clock of the last audible advance. It is re-armed on every fresh
+  load, which self-serializes the attempts — no separate per-attempt clock.
+- Silence past `STALL_DETECT_MS` (20 s = 5 × the heartbeat cadence) while the
+  element claims to play → phase `stalling` → **recovery reload**: the same
+  track via a **NEW HTTP request**. Re-assuming the buffer is a no-op —
+  `load()` aborts the outstanding fetch but Chromium keeps the buffered
+  ranges, so playback resumes from the retained window and re-stalls at its
+  edge, forever. Only setting `src` opens a new connection.
+- `readyState` NEVER suppresses a recovery: a half-open media socket keeps a
+  full buffer (`readyState 4`), which the old gate (`!paused && readyState >= 2`)
+  read as perfectly healthy. The 2026-11-11 incident proved the wedge:
+  `HEAD /api/config` and `PATCH /api/video/:id/progress` kept answering 200 for
+  40 minutes while the one media socket egressed and received nothing — so
+  `backendOnline` never flipped, the outage machinery never ran, no badge
+  appeared, and `audio.onerror` never fired (a stalled socket raises no error).
+  A half-open pipe is therefore detected by **absence of progress**, and the
+  watchdog's fresh request is what actually repairs it.
+- Give-up: `MAX_STALL_RECOVERIES` (3) fresh loads per track, then
+  `_skipDefunctTrack()`. Any audible progress clears the count, so only a track
+  that never plays again is abandoned; a flaky link that keeps recovering is not.
+- **Resume target** (`stallResumeTarget`): the element's own `currentTime` once
+  metadata has landed (`readyState >= HAVE_POSITION_READY_STATE` = 1) — the
+  listener is ~10 s ahead of the 10 s-throttled `progress` the index knows —
+  else the index copy (the element has no position before metadata, and
+  `currentTime` is 0 there). Computed BEFORE `src` is re-assigned: the load
+  algorithm wipes the playback position the moment a new source is set. A resume
+  at 0 with a 28 MB retained buffer replays ~6 min at 64 kbps mono.
+- Clock trust: a frozen/suspended tab runs its timers ~1/min, so a stale
+  heartbeat proves nothing there; `visibilitychange` / `resume` own that
+  decision and are granted a shortened budget (`RESUME_DETECT_MS` 6 s).
+  `navigator.mediaSession.playbackState === 'playing'` keeps the clock trusted
+  while the page is hidden but audible (lockscreen, car head-unit).
+- Only watchdog-issued loads (`_stallLoadOutstanding`) may be retried, so a
+  playback blocked by the autoplay policy is never reloaded forever.
+- UI: the `playbackPhase` signal drives a `role="status" aria-live="polite"`
+  badge — `⏳ Buffering…` / `⏳ Reconnecting…` — the only visible sign any of
+  this happened (`idle` renders nothing; silent starvation used to render nothing
+  at all, which is why "the app just stopped and nothing said why").
+- Test: `node tests/stall-guard.test.mjs` (45 assertions, no browser and no
+  network: the pure decision plus both resume clocks, driven on simulated ticks
+  — including the `readyState 4` stale buffer, a load that never answers, the
+  give-up cadence, and scrubbing/paused/frozen-tab immunity).
 
 ### 12.4 Progress persistence
 
@@ -996,6 +1044,7 @@ Repo is normalized to **LF** (commit `c6a99e9`; `.gitattributes`
 | Grabby items wiped by a purge | any new delete path missing `isGrabby:false` (skill's safety rule) |
 | SQLite 2570 disk I/O error | Windows process holding `data/database.db` open (drvfs); recover via `.dump` → restore → `PRAGMA integrity_check` (skill `sqlite-corruption-recovery`) |
 | Watched tracks flicker back in | the `_localWatched` guard in `mergeIndexWithLocal` was dropped |
+| Playback dies mid-item: no badge, no error, only a new tab fixes it | half-open media socket — the backend answers every NEW request (`HEAD /api/config` → 200) so `backendOnline` never flips and no outage path runs, while the one `/api/stream` connection keeps delivering nothing. Caught since 2026-11-11 by the §12.3 liveness watchdog (badge + new-request reload + resume where the listener stopped); a track that never plays again is skipped after 3 loads |
 
 ---
 

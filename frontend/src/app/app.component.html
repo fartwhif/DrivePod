@@ -70,6 +70,17 @@
         </div>
       </div>
 
+      <!-- Watchdog status. Silent starvation (a connection that stops
+           delivering bytes, or a media pipeline the OS discarded while this
+           tab was backgrounded) fires no error and moves nothing on screen —
+           this is the only visual sign it happened. -->
+      @if (stallPhaseLabel) {
+        <div class="mt-2 flex items-center justify-center gap-2 text-xs font-semibold text-amber-400"
+             role="status" aria-live="polite">
+          <span class="animate-pulse">⏳</span>{{ stallPhaseLabel }}
+        </div>
+      }
+
       <!-- LAST ROW: Title + author (full width of card) -->
       <div class="mt-2">
         <div class="font-semibold text-xl leading-tight line-clamp-2">{{ video.title }}</div>

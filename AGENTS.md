@@ -15,6 +15,11 @@
   for every non-ignored row, dead grabby-index refs (INFO only when the DB
   row is ignored — the resolver/init exclude those by design). Run before
   AND after a deploy; it is the "is content being missed" gate.
+  CAUTION (2026-11-11): stored `Video.audioPath` values are the NEUTRAL container
+  paths (`/cache/<id>/<id>.mp3`); the host-side audit maps them back onto this
+  checkout via `hostPath()` — never compare a stored path to `ROOT/cache`
+  literally again (a false "1673 non-ignored rows missing audioPath" batch of
+  failures was exactly that).
 - **T2 — pure logic (scratch container)**: `bash tests/run-scratch.sh`
   (~1 min). Builds the REAL `backend/dist/server.js` and drives its
   exported seams (`cleanRssItems`, `parseYtDlpDuration`,
@@ -36,6 +41,13 @@
   before/after, and unwatch test-consumed rows with a direct SQLite
   `UPDATE Video SET watched=0, progress=0` (the index self-heals on the
   next harvest, seconds later).
+- **T4 — frontend liveness logic (pure, no browser, no network)**:
+  `node tests/stall-guard.test.mjs` (~1 s). Compiles `frontend/src/app/stall-guard.ts`
+  and drives the watchdog decision on simulated ticks: the `readyState 4`
+  stale-buffer case (the real freeze), a load that never answers, scrubbing /
+  paused / frozen-tab immunity, the 3-reload give-up cadence, and both resume
+  clocks (`stallResumeTarget`: element `currentTime` vs the laggy index copy).
+  No live system, no DB, no build.
 
 ## Workflow Reminders
 - Use `Task`/`explore` agents for complex searches.
@@ -202,6 +214,30 @@
   resets queue paging to page 1, so these toggles jump deep-scrolled Queue views to
   the top (pre-existing semantics — preserve scroll position first if you care).
 
+- **Playback liveness watchdog (frontend) is the fix for "the app froze and
+  nothing said why"** (2026-11-11, see ARCHITECTURE.md §12.3): a half-open
+  `/api/stream` socket is INVISIBLE to the outage machinery — the backend keeps
+  answering every NEW request (`HEAD /api/config` 200 for 40 min in the logged
+  incident), so `backendOnline` never flips, no badge appears, and
+  `audio.onerror` never fires. Detection is therefore **absence of `timeupdate`
+  progress** (`lastProgressAt` vs `STALL_DETECT_MS`), and the repair MUST be a
+  NEW HTTP request: re-issuing the same `src`/`load()` reuses Chromium's
+  retained byte ranges, so playback resumes at the buffer edge and re-stalls
+  there forever (that is exactly why only a fresh tab ever "fixed" it).
+  Invariants: `readyState` NEVER gates a recovery (a stale full buffer reads as
+  `4` and vetoed the old `!paused && readyState >= 2` check); only
+  watchdog-issued loads (`_stallLoadOutstanding`) may be retried (autoplay-policy
+  blocks must not reload forever); audible progress clears `_stallRecoveries`, so
+  a flaky-but-recovering track is never skipped; a frozen/suspended tab's clock
+  is untrusted and `resume`/`visibilitychange` own that decision.
+  The resume point comes from `stallResumeTarget()` — the element's own
+  `currentTime` once metadata has landed, else the (10 s-laggy) index copy —
+  computed BEFORE `src` is re-assigned, because the load algorithm wipes the
+  position; resuming at 0 with a 28 MB retained buffer replays ~6 min of a
+  64 kbps mono track. NOTE: this is the *playback* watchdog; the similarly named
+  `Config.stallWindowMs` mechanism above is the *download* watchdog — different
+  problem, different file.
+
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 
 ## Project Roots
@@ -210,4 +246,4 @@
 - Harvest runs on cron + manual.
 
 Update this file with new patterns after each task.
-Last updated: 2026-11-05 (STALL watchdog now BANs a persistently-dead item: the 2nd consecutive no-`.part`-growth window throws an error tagged `stalledTwice:true`, and `downloadAndProcessVideo`'s catch turns that into `ignoreVideo()` — a durable `ignored=true` row that discovery's `existingIds` filter (no `ignored` clause) skips forever, so the twice-frozen item can never re-freeze the serialized harvest. The `.part` scan is now recursive (`measurePartBytesRecursive`) so yt-dlp's nested `{id}/` layout can't be misread as a stall, and the budget is hot-tunable via `Config.stallWindowMs`/`stallPollMs` (T2 drives the whole kill→retry→ban path in ~1 s; 61 assertions). Replaces the old unbounded download exec that wedged `eUAxo-AC5Rs` for ~4h.)
+Last updated: 2026-11-11 (frontend playback liveness watchdog: `frontend/src/app/stall-guard.ts` + `_runStallCheck()` catch silent starvation — 20 s of no `timeupdate` progress on a "playing" element — with a `⏳ Buffering…/Reconnecting…` badge, a NEW-request reload resumed at `stallResumeTarget()`, and skip-after-3-attempts; T4 = `node tests/stall-guard.test.mjs`, 45 assertions. E2E-proven against a real wedged media socket: old bundle froze at 29.4 s with zero requests and no badge, new bundle recovered in ~12 s and continued from 29.4 s with no replay. T1's `hostPath()` translation of stored `/cache/...` audioPaths fixed 3 false-failure groups.)
