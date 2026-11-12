@@ -180,7 +180,7 @@ Indexes: `[order]`.
 | `channelId`   | String (FK→Channel.channelId) | grabby items point at a **per-artist placeholder**: `UCGrabbyTube` + base64url(author), whose `title` = the artist (bare `UCGrabbyTube` when no author) |
 | `title`       | String      |                                                        |
 | `description` | String?     | (set from metadata JSON if present)                    |
-| `publishedAt` | DateTime    | **Grabby items carry a *clustered* timestamp** (±30 min around newest normal content), not the real upload date |
+| `publishedAt` | DateTime    | **Grabby items carry a *clustered* timestamp** (uniform inside the 60-min band below the newest normal content, §9), not the real upload date |
 | `thumbnailPath` | String?   | `/cache/<id>/<id>-small.webp`                          |
 | `audioPath`   | String      | absolute path to `<id>.mp3`                            |
 | `subtitlePath`| String?     | unused in practice                                     |
@@ -594,35 +594,83 @@ a duration ratio, so the player is never silent.
   (shuffled order = pseudo-random draw), mark used, persist. On exhaustion,
   reinitialize **once** (reusing items is allowed — grabby tracks re-enter the
   mix; see below).
+- **Reconcile** (`reconcileShuffleBag(returnIds, indexIds)`), once per run:
+  - candidates the plan did NOT place are un-used and moved to the **tail** of
+    the bag. A head-insert would starve the bag (an item too long for the
+    current deficit would be pulled and returned every 5 min, blocking every
+    shorter item behind it); marking them used — the old behavior — burns them
+    out of the rotation for a whole bag cycle, because `used` only resets on
+    re-initialization (1,985 entries).
+  - entries grabby-index.json no longer lists are **pruned**, `used` or not: a
+    `used` one is never pulled again, so without this it stays in the file
+    forever (the T1 A9 "stale bag entry" failure mode). Two guards: an empty
+    index set (missing/unreadable index) prunes nothing, and a **mass absence**
+    (> 10 % of the bag — smells like a partial index rewrite, not real
+    deletions) is logged but not pruned, since a pruned entry only rejoins
+    after a full ~23 h pass.
 - **Distribute** (after harvest, before auto-purge; skipped when
   `grabbyMixEnabled=false` — **it is currently ON in the live deployment**,
-  ratio 3, cluster cap 3):
-  1. Measure normal vs grabby **duration in the past hour** (anchored at the
-     newest normal video).
-  2. `targetGrabby = normalDuration / ratio`; if satisfied, stop.
-  3. Floor: `needed = max(deficit, 5 min if ratio ≤ 5 else 15 min)` —
-     keeps music flowing in quiet hours without making a 10:1 ratio
-     meaningless (the old flat 60-min floor did).
-  4. Estimate count from the **real catalog average duration** (≈18 min) + 5
-     buffer, pull from the bag. If `grabbyClusterMaxSize > 0`, the whole
-     cluster band — past hour around the newest normal video, incl. the
-     ±30-min jitter (the same window the ratio measurement uses) — is capped
-     at that many items **across runs**: items already in the band count
-     against the cap, so a 5-min cron run pulls only the remaining headroom
-     and skips once the band is full; the duration target then takes several
-     runs as the band slides with new normal content.
-  5. For each pulled item (re-verifying the file via `resolveGrabbyAudioPath()`):
+  ratio 1, cluster cap 7):
+  1. **Repair stranded rows FIRST**: any unwatched, unignored grabby row
+     timestamped **above** the anchor is re-clustered into the band
+     (`clusterTimestamp`). Those timestamps were invented by us, so moving them
+     is safe — and the tally must run after it, or the repaired file is invisible
+     to both the ratio and the cluster cap (it would be double-counted by the
+     next run's placement). Logs `🔧 Re-clustered N grabby item(s) …`.
+  2. **Measure the band**: the 60 minutes of queue content ENDING at the newest
+     **normal** video (`ignored:false, watched:false` — the queue excludes
+     watched rows, and only grabby depends on this function for replenishment).
+     Normal and grabby are tallied over that **one** window, counting both
+     `count` and `durationSec`.
+  3. **Target** (`grabbyTargets`): duration parity `normalDur/ratio` AND count
+     parity `normalCount/ratio`, each floored for quiet hours by
+     `max(…, 5 min if ratio ≤ 5 else 15 min)` applied to the **TARGET** — a
+     band that already meets its target is left alone, so the 5-min cron cannot
+     top it up over and over (the old per-run floor of `max(deficit, …)`
+     re-injected 36–180× the target per hour).
+  4. **Pull candidates**: `max(count deficit, ceil(budget / longest catalog
+     track)) + 5` (the +5 absorbs unusable entries). If
+     `grabbyClusterMaxSize > 0`, items already in the band count against the cap
+     **across runs**, so a run pulls only the remaining headroom and stops once
+     the band is full.
+  5. **Plan** (`planGrabbyFill`, pure + exported, deterministic — a run is
+     reproducible from its log line): which candidates to place, converging on
+     **both** targets at once. Hard: the slot cap, and the duration budget
+     (overrun by at most `GRABBY_OVERSHOOT_RATIO = 15 %`, and only on the final
+     item or to fill an empty cluster). Soft: the count target, widened toward
+     the fewest items that can still reach the budget, or narrowed to the most
+     that can fit it. Selection is best-fit-to-the-remaining-share per slot
+     (`ideal = (budget − placed) / slotsLeft`), candidates sorted ascending by
+     duration with a `videoId` tie-break.
+     - **Why both targets**: duration parity alone is what made a cluster look
+       complete while the user saw one or two items — a single 80-minute
+       archive file satisfies a 45-minute budget outright, and the old loop
+       stopped the instant the duration was covered. Count parity is what forces
+       the same budget across several tracks.
+  6. Place the plan's picks (re-verifying each file via
+     `resolveGrabbyAudioPath()`):
      - **already in DB → "recondition"**: update row with clustered
-       `publishedAt` (±30 min of newest normal content via
-       `clusterTimestamp`), fresh title/thumb/duration, `watched:false,
-       progress:0`, the resolved `audioPath` (literal index path if its
-       file exists, else canonical), and re-point to the per-artist channel
-       if `author` changed — the track cycles back into the mix window;
+       `publishedAt` (`clusterTimestamp` = uniform inside the band, i.e. **at or
+       below** the newest normal video), fresh title/thumb/duration,
+       `watched:false, progress:0`, the resolved `audioPath` (literal index path
+       if its file exists, else canonical), and re-point to the per-artist
+       channel if `author` changed — the track cycles back into the mix window;
      - **not in DB → insert** with `isGrabby:true, protected:false`,
        `channelId` = the per-artist placeholder channel derived from the
        index `author` (bare `UCGrabbyTube` when absent).
-  6. Final pre-insert recheck for files deleted mid-harvest (a concurrent
+  7. Final pre-insert recheck for files deleted mid-harvest (a concurrent
      grabby delete), then `createMany` + `updateIndexFile()`.
+
+**The band window is the load-bearing invariant** (`GRABBY_BAND_LOOKBACK_MS`):
+measuring grabby up to `+30 min` **above** the anchor (the jitter ceiling the old
+code used, while normal was measured only up to the anchor) inflated grabby,
+because no normal video can exist above the anchor by definition. Live example
+captured 2026-11-12: band anchored at 07:37 with 1 normal item (2594 s) — the
+old windows read normal 2594 s vs grabby **4832 s** → "ratio satisfied", while
+that one 80-minute file sat at the very **top** of the queue, above all the
+newest normal content, and nothing was placed. The same band measured
+symmetrically reads grabby **0 s** → a 2594 s deficit → one best-fit track
+placed inside the band.
 
 **Guard rails** (the `isGrabby` safety rule):
 
@@ -677,8 +725,8 @@ reinit next harvest); grabby-index.json and the MP3s are untouched.
 | `minDurationMinutes` | 0 | **15** | global min |
 | `maxDurationMinutes` | 720 | 720 | global max |
 | `grabbyMixEnabled` | true | true | shufflebag on/off |
-| `grabbyMixRatio` | 3 | 3 | normal:grabby duration ratio (UI clamps 1–20) |
-| `grabbyClusterMaxSize` | 0 | **3** | max grabby items per cluster band, counted across runs (0 = unlimited) |
+| `grabbyMixRatio` | 3 | **1** | normal:grabby ratio — drives BOTH parity targets (duration AND item count) in the band (§9) |
+| `grabbyClusterMaxSize` | 0 | **7** | hard cap on grabby items in the 60-min band, counted across runs (0 = unlimited) |
 | `currentVideoId` | '' | w2drTBjfUk0 | last played video (resume target) |
 
 Per-channel overrides live on the Channel row (`minDuration`/`maxDuration`,
