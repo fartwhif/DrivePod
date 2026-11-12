@@ -20,7 +20,7 @@
   checkout via `hostPath()` — never compare a stored path to `ROOT/cache`
   literally again (a false "1673 non-ignored rows missing audioPath" batch of
   failures was exactly that).
-- **T2 — pure logic (scratch container)**: `bash tests/run-scratch.sh`
+- **T2 — pure logic + scratch-DB integration** (`bash tests/run-scratch.sh`)
   (~1 min). Builds the REAL `backend/dist/server.js` and drives its
   exported seams (`cleanRssItems`, `parseYtDlpDuration`,
   `applyTodayMidnightRule`, `isFilteredOutByDuration`, `readMp3HeaderClaim`,
@@ -139,6 +139,36 @@
   distribute (pull + recondition) and the pre-insert recheck. NEVER rewrite
   `grabby-index.json` — GrabbyTube owns it; its `audioPath` values go stale
   when its cache moves, which is why we resolve at read time.
+- **Grabby timestamps are OURS, and the band is measured symmetrically**
+  (2026-11-12): a grabby row's `publishedAt` is a `clusterTimestamp()` draw
+  **inside** the band — at or below the newest normal video — never a real upload
+  date, which is why `distributeGrabbyItems()` may rewrite it freely. Both sides
+  of the ratio are tallied over that ONE 60-min window (`bandWindow`, lte the
+  anchor). The old code measured grabby to a `+30 min` ceiling ABOVE the anchor
+  while normal stopped AT the anchor: that space can never fill with normal
+  content, so one 80-min archive file read as "grabby 4832 s vs normal 2594 s —
+  ratio satisfied" while it sat at the very **top** of the queue above everything
+  left to watch, and nothing was placed. Two consequences to preserve:
+  (a) the run first **re-clusters any grabby row found above the anchor**
+  (`🔧 Re-clustered N …`) and MUST do so *before* the tally, or that file is
+  invisible to the ratio and the cluster cap and gets double-counted;
+  (b) placement converges on COUNT parity too (`planGrabbyFill`), because
+  duration parity alone is satisfied outright by one long file. T2 section 15
+  drives the compiled `distributeGrabbyItems()` against a scratch DB and asserts
+  these queue-level invariants (every placed row inside the band, nothing above
+  the anchor, deficit log, tail-returns, index-wide bag prune, satisfied band
+  writes nothing) — the pure planner tests cannot see timestamps or bag state.
+- **`reconcileShuffleBag(returnIds, indexIds)` owns ALL bag bookkeeping**
+  (2026-11-12): unplaced pulls rotate back un-used at the TAIL (a head-insert
+  re-pulls them every 5 min and starves shorter items), and entries
+  grabby-index.json no longer lists are pruned index-wide — `used:true` ones
+  included, since `used` only resets on re-init (~23 h for 1,985 entries) and
+  T1 A9 catches exactly that stranding. Two guards, because a pruned entry
+  never rejoins until the next re-init: an empty `indexIds` prunes nothing, and
+  a MASS absence (> 10 % of the bag — a partial index rewrite, not real
+  deletions) is logged as `NOT pruned` and left alone. NEVER rewrite
+  `grabby-index.json` (GrabbyTube is its only writer) — read it, and prune OUR
+  bag against it.
 - **Downloads run under a STALL watchdog, never a wall-clock cap**
   (2026-11-05): `downloadAndProcessVideo` uses
   `safeExecWithStallWatchdog(cmd, context, videoDir, opts)`. While the child
@@ -246,4 +276,23 @@
 - Harvest runs on cron + manual.
 
 Update this file with new patterns after each task.
-Last updated: 2026-11-11 (frontend playback liveness watchdog: `frontend/src/app/stall-guard.ts` + `_runStallCheck()` catch silent starvation — 20 s of no `timeupdate` progress on a "playing" element — with a `⏳ Buffering…/Reconnecting…` badge, a NEW-request reload resumed at `stallResumeTarget()`, and skip-after-3-attempts; T4 = `node tests/stall-guard.test.mjs`, 45 assertions. E2E-proven against a real wedged media socket: old bundle froze at 29.4 s with zero requests and no badge, new bundle recovered in ~12 s and continued from 29.4 s with no replay. T1's `hostPath()` translation of stored `/cache/...` audioPaths fixed 3 false-failure groups.)
+Last updated: 2026-11-12 (grabby mix: the ratio band is measured symmetrically
+and a grabby row's `publishedAt` is OURS to rewrite, so a distribute run first
+re-clusters any grabby row parked ABOVE the anchor, *before* the tally, and
+placement converges on COUNT parity rather than duration alone (one 4,832 s
+archive file used to read as "ratio satisfied" while sitting at the top of the
+queue above everything left to watch). `reconcileShuffleBag(returnIds,
+indexIds)` owns all bag bookkeeping: unplaced pulls rotate back un-used at the
+tail, catalog-deleted entries are pruned index-wide (empty index set or >10 %
+absence → prune nothing, log only). T2 gained section 15 — the compiled
+`distributeGrabbyItems()` driven against a scratch DB, 122 assertions — because
+the pure planner tests cannot see timestamps or bag state. The frontend
+playback liveness watchdog (`stall-guard.ts` + `_runStallCheck()`, T4 =
+`node tests/stall-guard.test.mjs`, 45 assertions) is now in the DEPLOYED
+bundle: 20 s of no `timeupdate` progress on a "playing" element →
+`⏳ Buffering…/Reconnecting…` badge + same-track reload over a NEW request,
+resumed at `stallResumeTarget()`, skip after 3 attempts. E2E-proven against a
+real wedged media socket: old bundle froze at 29.4 s with zero requests and no
+badge, new bundle recovered in ~12 s and continued from 29.4 s with no replay.
+T1's `hostPath()` translation of stored `/cache/...` audioPaths fixed 3
+false-failure groups.)
