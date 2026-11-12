@@ -126,9 +126,172 @@ console.log('\n== T2 Pure pipeline logic (real compiled code) ==\n');
 // ── 6. clusterTimestamp ──
 {
   const ref = new Date('2026-10-16T00:00:00Z');
-  const c1 = server.clusterTimestamp(ref), c2 = server.clusterTimestamp(ref);
-  t('cluster: within ±30 min of reference', Math.abs(c1 - ref) <= 30 * 60000 && Math.abs(c2 - ref) <= 30 * 60000);
-  t('cluster: randomizes (two draws differ)', c1.getTime() !== c2.getTime());
+  const BAND = 60 * 60000;
+  const draws = Array.from({ length: 200 }, () => server.clusterTimestamp(ref));
+  t('cluster: NEVER lands above the newest normal video (would park music over the queue)',
+    draws.every(d => d <= ref), `max offset ${Math.max(...draws.map(d => d - ref))}`);
+  t('cluster: stays within the 60-min measured band',
+    draws.every(d => d >= ref.getTime() - BAND && d <= ref));
+  t('cluster: actually spreads over the band (uses >80% of it)',
+    Math.max(...draws.map(d => ref - d)) > BAND * 0.8);
+  t('cluster: randomizes (two draws differ)', server.clusterTimestamp(ref).getTime() !== server.clusterTimestamp(ref).getTime());
+}
+
+// ── 6b. grabbyTargets + planGrabbyFill — the mix planner ──
+{
+  const P = (o) => server.planGrabbyFill({ ratio: 1, clusterMaxSize: 0, minGrabbySec: 300, grabbyCount: 0, grabbyDurationSec: 0, ...o });
+  const eight900 = ['a','b','c','d','e','f','g','h'].map(id => ({ videoId: id, durationSec: 900 }));
+
+  // The user's complaint: 7 normal ~15-min items in the band, ratio 1:1, and
+  // duration parity alone would be "satisfied" by ONE 60-min archive file.
+  const parity = P({ normalCount: 7, normalDurationSec: 7 * 900,
+    candidates: [{ videoId: 'mega', durationSec: 3600 }, ...eight900], clusterMaxSize: 7 });
+  t('planner: count parity spreads the budget over 7 items (not one mega file)',
+    parity.take.length === 7 && !parity.take.includes('mega'), JSON.stringify(parity.take));
+  t('planner: that cluster hits its duration budget exactly',
+    parity.placedDurationSec === 6300 && parity.reason === 'fill', `placed=${parity.placedDurationSec}`);
+  t('planner: ascending sort + videoId tie-break make the pick reproducible',
+    parity.take.join(',') === 'a,b,c,d,e,f,g', parity.take.join(','));
+
+  // Count target 1 (single normal item): best fit to the remaining share —
+  // neither the shortest nor the longest.
+  const one = P({ normalCount: 1, normalDurationSec: 2700,
+    candidates: [{ videoId: 's', durationSec: 600 }, { videoId: 'm', durationSec: 2600 }, { videoId: 'l', durationSec: 5000 }] });
+  t('planner: a one-item budget takes the CLOSEST-fitting track',
+    one.take.join(',') === 'm' && one.placedDurationSec === 2600, JSON.stringify(one.take));
+
+  // Count target 1 but only short tracks exist: duration parity wins, so the
+  // band gets five 60s items rather than one.
+  const short = P({ normalCount: 1, normalDurationSec: 300,
+    candidates: ['s1','s2','s3','s4','s5','s6'].map(id => ({ videoId: id, durationSec: 60 })) });
+  t('planner: short tracks keep being taken until the duration target is met',
+    short.take.length === 5 && short.placedDurationSec === 300, `n=${short.take.length} placed=${short.placedDurationSec}`);
+
+  // Hard cap: slots, not the count target, bound the cluster.
+  const capped = P({ normalCount: 7, normalDurationSec: 7 * 900,
+    candidates: [{ videoId: 'mega', durationSec: 3600 }, ...eight900], clusterMaxSize: 3 });
+  t('planner: grabbyClusterMaxSize is a hard slot cap',
+    capped.take.length === 3, JSON.stringify(capped.take));
+  t('planner: a band already at the cap places nothing (cap-met)',
+    P({ normalCount: 7, normalDurationSec: 7 * 900, grabbyCount: 3, clusterMaxSize: 3, candidates: eight900 }).reason === 'cap-met');
+
+  // No churn: a band whose grabby duration already covers the target is left alone.
+  const sat = P({ normalCount: 1, normalDurationSec: 2700, grabbyCount: 1, grabbyDurationSec: 4800,
+    candidates: eight900 });
+  t('planner: an over-target band is satisfied — no re-shuffle churn',
+    sat.take.length === 0 && sat.reason === 'satisfied', sat.reason);
+  t('planner: budget exactly met is satisfied',
+    P({ normalCount: 1, normalDurationSec: 900, grabbyDurationSec: 900, candidates: eight900 }).reason === 'satisfied');
+
+  // Overshoot rule: an oversized candidate may fill an EMPTY cluster only.
+  const emptyBig = P({ normalCount: 1, normalDurationSec: 200, candidates: [{ videoId: 'big', durationSec: 1200 }] });
+  t('planner: an empty cluster still gets its one oversized item',
+    emptyBig.take.join(',') === 'big' && emptyBig.placedDurationSec === 1200, JSON.stringify(emptyBig.take));
+  const mixed = P({ normalCount: 2, normalDurationSec: 240,
+    candidates: [{ videoId: 'p', durationSec: 200 }, { videoId: 'q', durationSec: 1200 }] });
+  t('planner: never burns a 20-min file on a 5-min budget when a fitting one exists',
+    mixed.take.join(',') === 'p' && mixed.placedDurationSec === 200, JSON.stringify(mixed.take));
+  const tol = P({ normalCount: 2, normalDurationSec: 240,
+    candidates: [{ videoId: 'p', durationSec: 200 }, { videoId: 'q', durationSec: 140 }] });
+  t('planner: the final item may overrun only within the 15% tolerance',
+    tol.take.length === 2 && tol.placedDurationSec === 340 && tol.targets.budgetSec === 300,
+    `placed=${tol.placedDurationSec}`);
+
+  t('planner: no candidates → no-candidates',
+    P({ normalCount: 3, normalDurationSec: 2700, candidates: [] }).reason === 'no-candidates');
+  t('planner: a duplicated candidate id is taken once',
+    P({ normalCount: 2, normalDurationSec: 1800,
+      candidates: [{ videoId: 'x', durationSec: 900 }, { videoId: 'x', durationSec: 900 }, { videoId: 'y', durationSec: 900 }] })
+      .take.join(',') === 'x,y');
+
+  // Exact budget accounting for every plan above (placed − duration target).
+  // `capped` shows the count/slot cap doing its job: 3 slots can't hold the
+  // whole 6300 s budget, so it lands short rather than overrunning.
+  const overshoot = [['parity', parity, 0], ['capped', capped, -900], ['one', one, -100],
+    ['short', short, 0], ['mixed', mixed, -100], ['tol', tol, 40], ['emptyBig', emptyBig, 900]]
+    .filter(([n, p, exp]) => p.placedDurationSec - p.targets.budgetSec !== exp)
+    .map(([n, p, exp]) => `${n}: placed ${p.placedDurationSec} vs target ${p.targets.budgetSec} (expected off by ${exp})`);
+  t('planner: no plan overruns its duration budget beyond the documented 15%',
+    overshoot.length === 0, overshoot.join('; '));
+
+  // Purity: a run must be reproducible from the log line it printed, and the
+  // caller's list must survive the call (it is re-read for metadata after).
+  const inputCands = [{ videoId: 'z', durationSec: 1200 }, { videoId: 'y', durationSec: 300 }, { videoId: 'x', durationSec: 700 }];
+  const inputOrder = inputCands.map(c => c.videoId).join(',');
+  const mkRun = () => P({ normalCount: 3, normalDurationSec: 2100, candidates: inputCands });
+  t('planner: pure — identical inputs produce an identical plan',
+    mkRun().take.join(',') === mkRun().take.join(','));
+  t('planner: does not mutate the caller\'s candidate array',
+    inputCands.map(c => c.videoId).join(',') === inputOrder && inputCands[0].durationSec === 1200);
+
+  const tg = server.grabbyTargets(6, 5400, 3, 300);
+  t('targets: duration and count both scale with the ratio',
+    tg.targetDurationSec === 1800 && tg.targetCount === 2, JSON.stringify(tg));
+  t('targets: quiet band (no normal content) still gets the floor budget',
+    server.grabbyTargets(0, 0, 3, 300).budgetSec === 300 && server.grabbyTargets(0, 0, 3, 900).budgetSec === 900);
+  t('targets: a huge band is NOT floored upward (floor only lifts small bands)',
+    server.grabbyTargets(40, 40 * 900, 3, 300).budgetSec === 12000);
+}
+
+// ── 6c. reconcileShuffleBag — leftovers return, catalog-deleted entries prune ──
+{
+  const BAG = path.join(CACHE_DIR, 'shufflebag.json');
+  const seedBag = (entries) => fs.writeFileSync(BAG, JSON.stringify(entries));
+  const readBag = () => JSON.parse(fs.readFileSync(BAG, 'utf-8'));
+  const S = (...ids) => new Set(ids);
+
+  // The old behavior burned every unpulled candidate as `used` until the whole
+  // bag was re-initialized (1,985 entries ≈ 23 h), so length-rejected tracks
+  // vanished from the rotation for hours.
+  seedBag([{ videoId: 'p1', used: true }, { videoId: 'p2', used: true }, { videoId: 'k1', used: false }]);
+  let r = server.reconcileShuffleBag(['p2'], S('p1', 'p2', 'k1'));
+  let bag = readBag();
+  const idx = (id) => bag.findIndex(e => e.videoId === id);
+  t('bag: an unplaced candidate is un-used and rejoins the rotation',
+    r.returned === 1 && idx('p2') >= 0 && bag[idx('p2')].used === false, JSON.stringify(bag));
+  t('bag: a returned item lands at the TAIL (a head-insert starves shorter items)',
+    idx('p2') === bag.length - 1 && idx('p2') > idx('k1'), JSON.stringify(bag));
+
+  // Catalog-deleted entries leave the bag — `used` or not. A `used` one is the
+  // important case: it is never pulled again, so without the prune it would sit
+  // in the file forever (the A9 "stale bag entry" failure mode).
+  seedBag([
+    ...Array.from({ length: 20 }, (_, i) => ({ videoId: `g${i}`, used: false })),
+    { videoId: 'goneUsed', used: true }, { videoId: 'goneFresh', used: false },
+  ]);
+  r = server.reconcileShuffleBag([], S(...Array.from({ length: 20 }, (_, i) => `g${i}`)));
+  bag = readBag();
+  t('bag: catalog-deleted entries are pruned whether used or unused',
+    r.dropped === 2 && !bag.some(e => e.videoId.startsWith('gone')), JSON.stringify(bag.length));
+  t('bag: pruning does not disturb surviving entries',
+    bag.length === 20 && bag.every(e => e.videoId.startsWith('g') && e.used === false), JSON.stringify(bag.length));
+
+  // Mass absence = the index itself is suspect (partial rewrite), so NOTHING is
+  // pruned: a drained bag only refills after a full ~23 h pass.
+  seedBag(Array.from({ length: 20 }, (_, i) => ({ videoId: `m${i}`, used: false })));
+  const snapshot = fs.readFileSync(BAG, 'utf-8');
+  r = server.reconcileShuffleBag([], S('m0'));
+  t('bag: mass absence is REPORTED but not pruned (transient index failure)',
+    r.absent === 19 && r.dropped === 0 && fs.readFileSync(BAG, 'utf-8') === snapshot, JSON.stringify(r));
+
+  // Empty index set (missing grabby-index.json) prunes nothing for the same reason.
+  seedBag([{ videoId: 'a1', used: false }]);
+  const keep = fs.readFileSync(BAG, 'utf-8');
+  r = server.reconcileShuffleBag([], new Set());
+  t('bag: empty index set prunes nothing (missing index ≠ every item deleted)',
+    r.dropped === 0 && r.absent === 0 && fs.readFileSync(BAG, 'utf-8') === keep, JSON.stringify(r));
+
+  // A placed pull stays `used` (it is now a DB row) and the file is untouched.
+  seedBag([{ videoId: 'p1', used: true }, { videoId: 'k1', used: false }]);
+  const before = fs.readFileSync(BAG, 'utf-8');
+  r = server.reconcileShuffleBag([], S('p1', 'k1'));
+  t('bag: nothing to return/prune → no write, placed pulls stay used',
+    r.returned === 0 && r.dropped === 0 && fs.readFileSync(BAG, 'utf-8') === before && readBag()[0].used === true);
+
+  fs.rmSync(BAG);
+  r = server.reconcileShuffleBag(['ghost'], S('ghost'));
+  t('bag: missing shufflebag.json → no-op, no file created',
+    r.returned === 0 && r.dropped === 0 && !fs.existsSync(BAG));
 }
 
 // ── 7. grabbyChannelIdForArtist ──
@@ -510,6 +673,188 @@ exit 0`);
   await prisma.channel.delete({ where: { channelId: chan } }).catch(() => {});
   server.resetStallBanCounter();
   await setCfg('stallWindowMs', String(600 * 1000 * 10)).catch(() => {});
+}
+
+// ── 15. distributeGrabbyItems end-to-end — the real band, the real bag ──
+// The pure planner tests above cannot see the two things that actually broke
+// live: WHERE a placed item gets timestamped (the old ±30-min jitter parked one
+// grabby file ABOVE every remaining normal video, so that file "was" the
+// cluster and the ratio looked satisfied while the user saw one item), and what
+// the run does to shufflebag.json afterwards. This drives the compiled function
+// against the scratch DB and asserts queue-level invariants, not internals.
+{
+  const GIDX = path.join(CACHE_DIR, 'grabby-index.json');
+  const BAGF = path.join(CACHE_DIR, 'shufflebag.json');
+  const HOUR = 60 * 60 * 1000;
+
+  // Close the cookie-session gate: the 5-min cron `harvestAndPurge` must not
+  // fire mid-section. It bails at the gate BEFORE cleanupCorruptedFolders()
+  // (which would delete these scratch folders as orphans) and before its own
+  // distributeGrabbyItems() call. Belt-and-braces with `active: false` below.
+  try {
+    fs.mkdirSync('/shared-cookies', { recursive: true });
+    fs.writeFileSync('/shared-cookies/session-state.json',
+      JSON.stringify({ ts: Math.floor(Date.now() / 1000), state: 'down' }));
+  } catch { /* read-only mount: nothing depends on it */ }
+
+  // Own the video table: every earlier section is finished, but a stray row
+  // would become the band anchor and silently invalidate each expectation here.
+  await prisma.video.deleteMany({});
+
+  const chan = 'UIntegChan';
+  await prisma.channel.upsert({
+    where: { channelId: chan }, update: {},
+    create: { channelId: chan, title: 'Integ Channel', order: 1, active: false }
+  });
+  // 7 normal items, 15 min each, 8 min apart so all stay inside the 60-min band.
+  const anchor = new Date(Date.now() - 2 * HOUR);
+  for (let i = 0; i < 7; i++) {
+    await prisma.video.create({
+      data: {
+        videoId: `integN${i}`, channelId: chan, title: `Normal ${i}`,
+        publishedAt: new Date(anchor.getTime() - i * 8 * 60 * 1000),
+        audioPath: `/cache/integN${i}/integN${i}.mp3`, duration: 900
+      }
+    });
+  }
+  // Read the anchor back: assertions compare against the value the server uses.
+  const dbAnchor = (await prisma.video.findUnique({
+    where: { videoId: 'integN0' }, select: { publishedAt: true }
+  })).publishedAt;
+  const bandStartMs = dbAnchor.getTime() - HOUR;
+
+  // Catalog: 15 tracks of 900 s + one 3600 s archive file.
+  const mkTrack = (vid, dur) => {
+    const dir = path.join(CACHE_DIR, vid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${vid}.mp3`), Buffer.alloc(1024, 0x41));
+    return { videoId: vid, title: `Track ${vid}`, author: '', duration: dur, audioPath: `${vid}/${vid}.mp3` };
+  };
+  const catalog = [];
+  for (let i = 0; i < 15; i++) catalog.push(mkTrack(`integG${i}`, 900));
+  catalog.push(mkTrack('integMega', 3600));
+  fs.writeFileSync(GIDX, JSON.stringify(catalog, null, 2));
+  // `gone` = pulled once before GrabbyTube deleted it: no index record, still
+  // marked used, so under the old narrow prune it sat in the file forever.
+  const seedBag = () => fs.writeFileSync(BAGF, JSON.stringify(
+    [{ videoId: 'integGone', used: true },
+    ...catalog.map(c => ({ videoId: c.videoId, used: false }))], null, 2));
+  seedBag();
+  const readBag = () => JSON.parse(fs.readFileSync(BAGF, 'utf-8'));
+
+  for (const [k, v] of Object.entries({
+    grabbyMixEnabled: 'true', grabbyMixRatio: '1', grabbyClusterMaxSize: '7'
+  })) await setCfg(k, v);
+
+  const realLog = console.log;
+  const runOnce = async () => {
+    const lines = [];
+    console.log = (...a) => lines.push(a.join(' '));
+    try { await server.distributeGrabbyItems(); } finally { console.log = realLog; }
+    return lines;
+  };
+  const grabbyRows = () => prisma.video.findMany({
+    where: { isGrabby: true, ignored: false }, orderBy: { videoId: 'asc' }
+  });
+
+  // ── run 1: an empty band gets a cluster, placed INSIDE the band ──
+  const l1 = await runOnce();
+  const r1 = await grabbyRows();
+  t('distribute: count parity places 7 items, not the one 60-min archive file',
+    r1.length === 7 && r1.every(v => v.duration === 900), `rows=${r1.length} (${r1.map(v => v.videoId).join(',')})`);
+  t('distribute: every placed item is timestamped inside the measured band',
+    r1.every(v => v.publishedAt.getTime() <= dbAnchor.getTime() && v.publishedAt.getTime() >= bandStartMs),
+    r1.map(v => `${v.videoId}@${v.publishedAt.getTime() - dbAnchor.getTime()}ms`).join(' '));
+  t('distribute: the deficit log states the real 6300 s duration budget',
+    l1.some(l => l.includes('Grabby deficit: 6300s')), l1.filter(l => l.includes('deficit')).join(' | '));
+
+  const idx1 = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, 'index.json'), 'utf-8'));
+  t('distribute: index.json lists every placed item with a streamable path',
+    r1.every(v => idx1.some(m => m.videoId === v.videoId && m.audioPath === `/cache/${v.videoId}/${v.videoId}.mp3`)));
+  t('distribute: the newest queue entry is a NORMAL video, never a grabby file',
+    idx1[0].videoId === 'integN0' && idx1[0].isGrabby === false, `top=${idx1[0].videoId}`);
+
+  // Bag after run 1: pull takes the first 12 unused entries in bag order
+  // (G0..G11; the used `integGone` is skipped, G12..G14/Mega are never pulled).
+  // All are 900 s, so the planner's tie-break is the videoId STRING order —
+  // G0, G1, G10, G11, G2, G3, G4 — and those 7 stay `used`. The 5 it did not
+  // place (G5..G9) rotate back un-used AT THE TAIL (a head-insert re-pulls them
+  // every 5 min and starves shorter items); the catalog-deleted entry is pruned.
+  const PLACED1 = ['integG0', 'integG1', 'integG10', 'integG11', 'integG2', 'integG3', 'integG4'];
+  const BACK1 = ['integG5', 'integG6', 'integG7', 'integG8', 'integG9'];
+  const bag1 = readBag();
+  const pos = (id) => bag1.findIndex(e => e.videoId === id);
+  t('distribute: unplaced pulls are un-used again (not burned for a ~23 h cycle)',
+    BACK1.every(id => pos(id) >= 0 && bag1[pos(id)].used === false),
+    JSON.stringify(bag1.filter(e => e.used === false).map(e => e.videoId)));
+  t('distribute: returned items land at the TAIL, behind the untouched queue',
+    BACK1.every((id, i) => pos(id) === bag1.length - BACK1.length + i),
+    `bag=${bag1.length} positions=${BACK1.map(id => pos(id)).join(',')}`);
+  t('distribute: the 7 placed items stay used',
+    PLACED1.every(id => bag1[pos(id)].used === true),
+    PLACED1.map(id => `${id}=${bag1[pos(id)]?.used}`).join(','));
+  t('distribute: never-pulled entries are untouched and still unused',
+    ['integG12', 'integG13', 'integG14', 'integMega'].every(id => bag1[pos(id)].used === false),
+    ['integG12', 'integMega'].map(id => `${id}=${bag1[pos(id)]?.used}`).join(','));
+  t('distribute: a catalog-deleted entry is pruned even though it is used:true',
+    !bag1.some(e => e.videoId === 'integGone') && bag1.length === 16, `len=${bag1.length}`);
+
+  // ── run 2: the old jitter's stranded row is repaired BEFORE the tally ──
+  // Simulate the pre-fix state: one 3600 s grabby row timestamped 25 min ABOVE
+  // the anchor (space normal content can never fill), band otherwise empty.
+  await prisma.video.deleteMany({ where: { isGrabby: true } });
+  seedBag();
+  const strand = mkTrack('integStrand', 3600);
+  fs.writeFileSync(GIDX, JSON.stringify([...catalog, strand], null, 2));
+  await prisma.video.create({
+    data: {
+      videoId: 'integStrand', channelId: 'UCGrabbyTube', title: 'Stranded archive file',
+      publishedAt: new Date(dbAnchor.getTime() + 25 * 60 * 1000),
+      audioPath: `/cache/integStrand/integStrand.mp3`, duration: 3600, isGrabby: true
+    }
+  });
+  const l2 = await runOnce();
+  const r2 = await grabbyRows();
+  const strandRow = r2.find(v => v.videoId === 'integStrand');
+  t('distribute: a grabby row parked above the anchor is pulled back into the band',
+    !!strandRow && strandRow.publishedAt.getTime() <= dbAnchor.getTime() && strandRow.publishedAt.getTime() >= bandStartMs,
+    strandRow ? `+${strandRow.publishedAt.getTime() - dbAnchor.getTime()}ms` : 'row missing');
+  t('distribute: the repair is logged (an operator must be able to see it happen)',
+    l2.some(l => l.includes('Re-clustered 1 grabby item')), l2.filter(l => l.includes('Re-cluster')).join(' | '));
+  // The tally counted the repaired 3600 s: only the 2700 s shortfall remains.
+  // Had the repair run after the tally (or not at all), this run would have
+  // placed the full 7-item / 6300 s cluster on top of it.
+  t('distribute: the repaired file CREDITS against the budget (3 more items, not 7)',
+    r2.length === 4 && r2.filter(v => v.videoId !== 'integStrand').length === 3,
+    `rows=${r2.length} (${r2.map(v => v.videoId).join(',')})`);
+  t('distribute: deficit reflects the in-band grabby duration (6300 - 3600)',
+    l2.some(l => l.includes('Grabby deficit: 2700s')), l2.filter(l => l.includes('deficit')).join(' | '));
+  t('distribute: nothing remains timestamped above the anchor',
+    r2.every(v => v.publishedAt.getTime() <= dbAnchor.getTime()));
+  const idx2 = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, 'index.json'), 'utf-8'));
+  t('distribute: the repaired row is in index.json and still below the anchor',
+    idx2.some(m => m.videoId === 'integStrand' && new Date(m.publishedAt).getTime() <= dbAnchor.getTime()),
+    idx2.slice(0, 5).map(m => `${m.videoId}:${m.isGrabby ? 'G' : 'N'}`).join(','));
+  t('distribute: duration parity is met exactly (3600 repaired + 2700 new = 6300)',
+    r2.reduce((s, v) => s + v.duration, 0) === 6300, `sum=${r2.reduce((s, v) => s + v.duration, 0)}`);
+  t('distribute: the newest entry is still the normal anchor, not a grabby file',
+    idx2[0].videoId === 'integN0' && idx2[0].isGrabby === false, `top=${idx2[0].videoId}`);
+
+  // ── run 3: a band already at target is left completely alone ──
+  // The 5-min cron re-runs this constantly; a per-run floor made it re-inject
+  // 36-180x the target per hour. Nothing may be pulled, written or touched.
+  const bagBefore = fs.readFileSync(BAGF, 'utf-8');
+  const rowsBefore = await grabbyRows();
+  const l3 = await runOnce();
+  t('distribute: a satisfied band pulls nothing and places nothing',
+    fs.readFileSync(BAGF, 'utf-8') === bagBefore && (await grabbyRows()).length === rowsBefore.length,
+    `rows=${(await grabbyRows()).length} vs ${rowsBefore.length}`);
+  t('distribute: a satisfied band says so instead of re-shuffling',
+    l3.some(l => l.includes('Band satisfied') && l.includes('nothing to place')), l3.join(' | '));
+
+  await prisma.video.deleteMany({ where: { channelId: chan } });
+  await prisma.video.deleteMany({ where: { isGrabby: true } });
+  await prisma.channel.delete({ where: { channelId: chan } }).catch(() => {});
 }
 
 await prisma.$disconnect();

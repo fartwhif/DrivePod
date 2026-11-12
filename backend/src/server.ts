@@ -647,6 +647,54 @@ async function pullFromShuffleBag(count: number, reinitialized = false): Promise
 }
 
 /**
+ * Reconcile the bag with one distribution run.
+ *
+ * `returnIds` — candidates the plan did NOT place — are un-used and moved to
+ * the TAIL of the bag. Why a rotate and not a head-insert: an item too long for
+ * the CURRENT deficit would be pulled and returned on every 5-minute run,
+ * blocking every shorter item behind it forever. At the tail it rejoins the
+ * normal rotation (~23 h for a full pass at the usual cadence) and gets its
+ * chance when a bigger deficit comes along.
+ *
+ * Marking them `used` (the old behavior) was worse: `used` only resets when the
+ * bag is exhausted and re-initialized (1,985 entries), so a candidate the
+ * planner rejected for LENGTH reasons — not because it is bad — vanished from
+ * the rotation for hours.
+ *
+ * `indexIds` — every videoId grabby-index.json currently lists — prunes bag
+ * entries the catalog has since deleted (used or not): they can never be
+ * placed, and `initShuffleBag` filters them out at the next re-initialization
+ * anyway, so leaving them means an entry that was pulled once before the delete
+ * sits `used:true` in the bag forever. Two guards keep a transient index
+ * failure from draining the bag: an empty set (missing/unreadable index) prunes
+ * nothing, and a MASS absence (> 10 % of the bag — a partial rewrite, not real
+ * deletions) is reported but not pruned, because dropped entries only rejoin
+ * after a full ~23 h pass.
+ */
+export function reconcileShuffleBag(
+  returnIds: string[], indexIds: Set<string>
+): { returned: number; dropped: number; absent: number } {
+  const none = { returned: 0, dropped: 0, absent: 0 };
+  if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) return none;
+  const back = new Set(returnIds);
+  const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
+  const absent = indexIds.size > 0
+    ? bag.reduce((n, e) => (indexIds.has(e.videoId) ? n : n + 1), 0) : 0;
+  const pruning = absent > 0 && absent <= Math.max(1, Math.floor(bag.length * 0.1));
+  const kept: ShuffleBagEntry[] = [];
+  const revived: ShuffleBagEntry[] = [];
+  let dropped = 0;
+  for (const entry of bag) {
+    if (pruning && !indexIds.has(entry.videoId)) { dropped++; continue; }
+    if (back.has(entry.videoId)) revived.push({ videoId: entry.videoId, used: false });
+    else kept.push(entry);
+  }
+  if (revived.length === 0 && dropped === 0) return { ...none, absent };
+  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify([...kept, ...revived], null, 2));
+  return { returned: revived.length, dropped, absent };
+}
+
+/**
  * Load grabby-index.json and return it as a map videoId -> metadata.
  */
 function loadGrabbyIndex(): Map<string, any> {
@@ -673,14 +721,165 @@ export function resolveGrabbyAudioPath(videoId: string, audioPath: string): stri
 }
 
 /**
+ * The cluster band the mix is measured and placed over: the 60 minutes of
+ * queue content ENDING at the newest normal video. Both sides of the ratio use
+ * this one window. Measuring grabby up to `+30 min` above that anchor (the old
+ * jitter ceiling) inflated it, because a normal video can never exist above
+ * the anchor: a band could read "ratio satisfied" while nothing but one long
+ * file sat above all the newest normal content.
+ */
+export const GRABBY_BAND_LOOKBACK_MS = 60 * 60 * 1000;
+
+export interface GrabbyCandidate {
+  videoId: string;
+  durationSec: number;
+}
+
+export interface GrabbyTargets {
+  targetDurationSec: number;
+  targetCount: number;
+  budgetSec: number; // how much grabby duration the band is still short
+}
+
+/**
+ * The two parity targets the mix must converge on, from the band's normal
+ * side. `minGrabbySec` floors the TARGET (not each injection's shortfall), so
+ * quiet hours still get music but a band that is already full is not topped up
+ * again on the next 5-min cron run.
+ */
+export function grabbyTargets(
+  normalCount: number, normalDurationSec: number, ratio: number, minGrabbySec: number
+): GrabbyTargets {
+  const r = ratio > 0 ? ratio : 3;
+  return {
+    targetDurationSec: normalDurationSec / r,
+    targetCount: normalCount / r,
+    budgetSec: Math.max(normalDurationSec / r, minGrabbySec),
+  };
+}
+
+export interface GrabbyFillInput {
+  normalCount: number;
+  normalDurationSec: number;
+  grabbyCount: number;
+  grabbyDurationSec: number;
+  ratio: number;          // normal:grabby, > 0
+  clusterMaxSize: number; // 0 = unlimited
+  minGrabbySec: number;
+  candidates: GrabbyCandidate[];
+}
+
+export interface GrabbyFillPlan {
+  take: string[];
+  targets: GrabbyTargets;
+  placedDurationSec: number;
+  reason: 'fill' | 'satisfied' | 'cap-met' | 'no-candidates';
+}
+
+/** A cluster may overrun its duration budget by this much, and only on its last item. */
+const GRABBY_OVERSHOOT_RATIO = 0.15;
+
+/**
+ * Decide which grabby items to place, converging on BOTH parity targets at
+ * once: duration (normalDuration / ratio) and count (normalCount / ratio).
+ *
+ * Duration parity on its own is what made a cluster look complete while the
+ * user saw one or two items: a single 80-minute archive file satisfies a
+ * 45-minute grabby budget outright, and the old loop stopped the moment the
+ * duration was covered. Count parity is what forces the same budget across
+ * several tracks; best-fit-by-remaining-share then picks the tracks that size
+ * to it, so parity is met with items the user actually sees.
+ *
+ * Hard: the cluster cap, and the duration budget (±`GRABBY_OVERSHOOT_RATIO` on
+ * the final item). Soft: the count target, widened toward the fewest items
+ * that can still reach the budget, or narrowed to the most that can fit it.
+ */
+export function planGrabbyFill(input: GrabbyFillInput): GrabbyFillPlan {
+  const targets = grabbyTargets(input.normalCount, input.normalDurationSec, input.ratio, input.minGrabbySec);
+  const budgetSec = targets.budgetSec - input.grabbyDurationSec;
+  const empty = { take: [] as string[], targets, placedDurationSec: 0 };
+  if (budgetSec <= 0) return { ...empty, reason: 'satisfied' };
+
+  const slots = input.clusterMaxSize > 0
+    ? Math.max(0, input.clusterMaxSize - input.grabbyCount)
+    : Number.POSITIVE_INFINITY;
+  if (slots <= 0) return { ...empty, reason: 'cap-met' };
+
+  // Ascending, videoId tie-break: the whole plan is a pure function of its
+  // inputs, so a run can be reproduced from the log line it printed.
+  const cands = input.candidates
+    .filter(c => !!c.videoId && c.durationSec > 0)
+    .sort((a, b) => a.durationSec - b.durationSec || (a.videoId < b.videoId ? -1 : 1));
+  if (cands.length === 0) return { ...empty, reason: 'no-candidates' };
+
+  const ceilingSec = budgetSec * (1 + GRABBY_OVERSHOOT_RATIO);
+  // Most items that fit the budget: sum the shortest until they overrun it.
+  let fitCount = 0, fitSum = 0;
+  for (const c of cands) {
+    if (fitCount > 0 && fitSum + c.durationSec > ceilingSec) break;
+    fitCount++;
+    fitSum += c.durationSec;
+  }
+  // Fewest items that can reach the budget: the longest ones.
+  const reachCount = Math.ceil(budgetSec / cands[cands.length - 1].durationSec);
+  const wantCount = Math.max(1, Math.ceil(targets.targetCount - input.grabbyCount));
+  const aim = Math.max(1, Math.min(Math.max(wantCount, reachCount), slots, fitCount));
+
+  const take: GrabbyCandidate[] = [];
+  const taken = new Set<string>();
+  let placedSec = 0;
+  // The count target drives how many slots to fill; the duration budget is the
+  // ceiling, and it may only be overrun by GRABBY_OVERSHOOT_RATIO (when the
+  // shortest remaining track is the only thing left that fits at all).
+  while (take.length < aim && placedSec <= ceilingSec) {
+    const ideal = (budgetSec - placedSec) / (aim - take.length); // this item's share of what is left
+    let pick: GrabbyCandidate | null = null;
+    let bestDelta = Number.POSITIVE_INFINITY;
+    for (const c of cands) {
+      if (taken.has(c.videoId)) continue;
+      if (c.durationSec > budgetSec - placedSec) break; // ascending: nothing later fits either
+      const delta = Math.abs(c.durationSec - ideal);
+      if (delta < bestDelta || (delta === bestDelta && pick && c.durationSec < pick.durationSec)) {
+        pick = c;
+        bestDelta = delta;
+      }
+    }
+    if (!pick) {
+      // Nothing left fits what remains. Accept the shortest spare only to fill
+      // an empty cluster, or within tolerance of the total budget.
+      const spare = cands.find(c => !taken.has(c.videoId));
+      if (!spare) break;
+      if (take.length > 0 && spare.durationSec > (budgetSec - placedSec) + budgetSec * GRABBY_OVERSHOOT_RATIO) break;
+      pick = spare;
+    }
+    take.push(pick);
+    taken.add(pick.videoId);
+    placedSec += pick.durationSec;
+  }
+
+  return {
+    ...empty,
+    take: take.map(c => c.videoId),
+    placedDurationSec: placedSec,
+    reason: 'fill',
+  };
+}
+
+/**
  * Distribute GrabbyTube items after harvest completes.
  *
- * Evaluates normal:grabby duration ratio in the past hour of content.
- * Target ratio is configurable (default 3:1).
- * Pulls grabby items from shufflebag and inserts them as DB records
- * with isGrabby: true and timestamp clustering near the newest normal content.
+ * The cluster band is the window the user actually scrolls: the 60 minutes of
+ * queue content ending at the newest NORMAL video. Normal and grabby are both
+ * measured over that one window (watched rows excluded — the queue excludes
+ * them, and only grabby depends on this function for replenishment), and grabby
+ * is placed inside it, so the mix stays a rolling interleave instead of a
+ * single long file parked above everything else.
+ *
+ * Placement converges on BOTH parity targets — duration (normalDur/ratio) and
+ * count (normalCount/ratio) — via the pure `planGrabbyFill`; see that function
+ * for why duration parity alone collapses a cluster to one or two items.
  */
-async function distributeGrabbyItems(): Promise<void> {
+export async function distributeGrabbyItems(): Promise<void> {
   const grabbyEnabled = (await getConfig('grabbyMixEnabled', 'true')) === 'true';
   if (!grabbyEnabled) {
     console.log(`⏭️ [ShuffleBag] GrabbyTube mix disabled — skipping distribution`);
@@ -693,11 +892,9 @@ async function distributeGrabbyItems(): Promise<void> {
     return;
   }
 
-  // Optional cap on the total number of grabby items in a cluster band
-  // (past hour around the newest normal content, incl. the ±30-min jitter).
-  // Applies across runs, not just one: the 5-min cron re-distributes
-  // constantly, so a per-run cap let a single cluster grow well past it.
-  // 0 = no limit (default, preserves current behavior).
+  // Optional cap on grabby items in the cluster band. Applies across runs, not
+  // just one: the 5-min cron re-distributes constantly, so a per-run cap let a
+  // single cluster grow well past it. 0 = no limit.
   const clusterMaxSize = parseInt(await getConfig('grabbyClusterMaxSize', '0')) || 0;
 
   // Ensure GrabbyTube channel exists
@@ -707,11 +904,12 @@ async function distributeGrabbyItems(): Promise<void> {
     create: { channelId: GRABBY_CHANNEL_ID, title: 'GrabbyTube', order: 999999, active: false }
   });
 
-  // Find the newest normal video to establish the timestamp band
+  // The band anchor: the newest normal video. Everything the user sees "now"
+  // clusters around it, and no normal video can exist above it by definition.
   const newestNormal = await prisma.video.findFirst({
-    where: { isGrabby: false, ignored: false },
+    where: { isGrabby: false, ignored: false, watched: false },
     orderBy: { publishedAt: 'desc' },
-    select: { publishedAt: true, duration: true }
+    select: { publishedAt: true }
   });
 
   if (!newestNormal) {
@@ -720,107 +918,144 @@ async function distributeGrabbyItems(): Promise<void> {
   }
 
   const newestTime = newestNormal.publishedAt.getTime();
-  const oneHourAgo = newestTime - 60 * 60 * 1000;
+  const bandStart = new Date(newestTime - GRABBY_BAND_LOOKBACK_MS);
+  // One window, both sides. A grabby-only ceiling above the anchor (the old
+  // ±30 min jitter) is space normal content can never fill, so measuring
+  // grabby up there — or placing items up there — skews the ratio the user
+  // sees at the top of the queue.
+  const bandWindow = { gte: bandStart, lte: newestNormal.publishedAt };
 
-  // Calculate total duration of normal videos in the past hour
-  const normalVideos = await prisma.video.findMany({
-    where: {
-      isGrabby: false,
-      ignored: false,
-      publishedAt: { gte: new Date(oneHourAgo), lte: newestNormal.publishedAt }
-    },
-    select: { duration: true }
+  // Repair what the old jitter left behind: unwatched grabby rows timestamped
+  // ABOVE the anchor sit at the very top of the queue, above every remaining
+  // normal video, which is how one 80-minute file came to "be" the cluster.
+  // Those timestamps were invented by us (not a real upload date), so
+  // re-clustering them into the band is safe, and it must happen BEFORE the
+  // tally — otherwise they are invisible to the ratio and to the cluster cap.
+  const stranded = await prisma.video.findMany({
+    where: { isGrabby: true, ignored: false, watched: false, publishedAt: { gt: newestNormal.publishedAt } },
+    select: { id: true, videoId: true }
   });
+  for (const row of stranded) {
+    await prisma.video.update({ where: { id: row.id }, data: { publishedAt: clusterTimestamp(newestNormal.publishedAt) } });
+  }
+  if (stranded.length > 0) {
+    console.log(`🔧 [ShuffleBag] Re-clustered ${stranded.length} grabby item(s) that the old ±30-min jitter parked above the newest normal video`);
+  }
 
-  const normalDurationSec = normalVideos.reduce((sum, v) => sum + (v.duration || 0), 0);
+  const bandTally = async (isGrabby: boolean) => {
+    const rows = await prisma.video.findMany({
+      where: { isGrabby, ignored: false, watched: false, publishedAt: bandWindow },
+      select: { duration: true }
+    });
+    return {
+      count: rows.length,
+      durationSec: rows.reduce((sum, v) => sum + (v.duration || 0), 0)
+    };
+  };
 
-  // Calculate total duration of grabby videos in the past hour
-  const grabbyVideos = await prisma.video.findMany({
-    where: {
-      isGrabby: true,
-      ignored: false,
-      publishedAt: { gte: new Date(oneHourAgo), lte: new Date(newestTime + 30 * 60 * 1000) }
-    },
-    select: { duration: true }
-  });
+  const normalBand = await bandTally(false);
+  const grabbyBand = await bandTally(true);
 
-  const grabbyDurationSec = grabbyVideos.reduce((sum, v) => sum + (v.duration || 0), 0);
+  // Quiet-hours floor on the TARGET, not on each run's shortfall: music keeps
+  // flowing when the channels are quiet, but a band that already meets its
+  // target is not topped up again every 5 minutes (the old per-run floor of
+  // max(deficit, 5–15 min) re-injected 36–180x the target per hour).
+  const minGrabbySec = targetRatio <= 5 ? 5 * 60 : 15 * 60;
+  const targets = grabbyTargets(normalBand.count, normalBand.durationSec, targetRatio, minGrabbySec);
+  const budgetSec = targets.budgetSec - grabbyBand.durationSec;
+  const bandState = `normal ${normalBand.count} items/${Math.round(normalBand.durationSec)}s, grabby ${grabbyBand.count} items/${Math.round(grabbyBand.durationSec)}s, target ${Math.round(targets.budgetSec)}s/${targets.targetCount.toFixed(1)} items`;
 
-  // Target grabby duration = normalDuration / ratio
-  const targetGrabbyDuration = normalDurationSec / targetRatio;
-  const deficitDuration = targetGrabbyDuration - grabbyDurationSec;
-
-  if (deficitDuration <= 0) {
-    console.log(`✅ [ShuffleBag] Grabby ratio satisfied (normal: ${Math.round(normalDurationSec)}s, grabby: ${Math.round(grabbyDurationSec)}s, target: ${Math.round(targetGrabbyDuration)}s)`);
+  if (budgetSec <= 0) {
+    console.log(`✅ [ShuffleBag] Band satisfied (${bandState}) — nothing to place`);
+    return;
+  }
+  if (clusterMaxSize > 0 && grabbyBand.count >= clusterMaxSize) {
+    console.log(`✅ [ShuffleBag] Cluster cap ${clusterMaxSize} already met (${grabbyBand.count} in band) — skipping`);
     return;
   }
 
-  console.log(`🎵 [ShuffleBag] Grabby deficit: ${Math.round(deficitDuration)}s (need ~${Math.round(deficitDuration / 60)}min of music)`);
+  console.log(`🎵 [ShuffleBag] Grabby deficit: ${Math.round(budgetSec)}s (~${Math.round(budgetSec / 60)}min of music) (${bandState})`);
 
   // Load grabby index for metadata lookups
   const grabbyMap = loadGrabbyIndex();
 
-  // Floor on grabby content per distribution: keeps music flowing in quiet
-  // hours without overriding the user's ratio. The old 60-min floor made
-  // 10:1 meaningless — a tiny deficit still injected a full hour of grabby.
-  // At high ratios the floor scales down to 15 min (still ~3x the 10:1
-  // target for a typical hour of normal content).
-  const minGrabbySec = targetRatio <= 5 ? 5 * 60 : 15 * 60;
-  const neededDuration = Math.max(deficitDuration, minGrabbySec);
-
-  // Pull enough items from shufflebag to cover the needed duration.
-  // Use the real average from the index (catalog avg is ~18 min, not 4).
-  const allDurations = [...grabbyMap.values()].map(m => m.duration || 0).filter(d => d > 0);
-  const avgGrabbyDuration = allDurations.length
-    ? allDurations.reduce((a, b) => a + b, 0) / allDurations.length
-    : 240;
-  let estimatedCount = Math.ceil(neededDuration / avgGrabbyDuration) + 5; // buffer
-  let toPull = estimatedCount;
-  if (clusterMaxSize > 0) {
-    // Cap the whole cluster band, not just this run: grabby items already
-    // clustered in the window by earlier cron runs count against the cap.
-    const inCluster = await prisma.video.count({
-      where: {
-        isGrabby: true,
-        ignored: false,
-        publishedAt: { gte: new Date(oneHourAgo), lte: new Date(newestTime + 30 * 60 * 1000) }
-      }
-    });
-    toPull = Math.min(toPull, clusterMaxSize - inCluster);
-    if (toPull <= 0) {
-      console.log(`✅ [ShuffleBag] Cluster cap ${clusterMaxSize} already met (${inCluster} in band) — skipping`);
-      return;
-    }
-  }
-
-  const pulled = await pullFromShuffleBag(toPull);
+  // Pull only as many candidates as the plan could place: the count deficit, or
+  // the fewest items that could still reach the budget with the longest tracks
+  // the catalog has. The +5 absorbs unusable entries, which go back to the bag
+  // below rather than being burned as `used`.
+  const usableDurations = [...grabbyMap.values()]
+    .map(m => (m.duration || 0))
+    .filter(d => d > 0);
+  const longestUsable = usableDurations.length ? Math.max(...usableDurations) : 240;
+  const wantCount = Math.max(1, Math.ceil(targets.targetCount - grabbyBand.count));
+  const reachCount = Math.ceil(budgetSec / longestUsable);
+  const pulled = await pullFromShuffleBag(Math.max(wantCount, reachCount) + 5);
   if (pulled.length === 0) {
     console.log(`⚠️ [ShuffleBag] No items available in shufflebag`);
     return;
   }
 
-  // Collect grabby items until we have enough duration
-  const toInsert: any[] = [];
-  let accumulatedDuration = 0;
-  let reusedCount = 0;
-
+  // Keep only candidates that are real, playable and have known length.
+  // A pulled entry with NO grabby-index record is catalog-dead (deleted from
+  // GrabbyTube's index) — it can never be placed, so it is pruned from the bag
+  // instead of rotating back for another wasted pull. A record whose file is
+  // missing stays in the bag: that can be transient (GrabbyTube moving its
+  // cache), and the next run resolves the path again.
+  const usable: { videoId: string; durationSec: number }[] = [];
   for (const entry of pulled) {
     const meta = grabbyMap.get(entry.videoId);
-    if (!meta) continue;
-
+    if (!meta) continue; // catalog-dead: reconcile prunes it (see below)
     const duration = meta.duration || 0;
     if (duration <= 0) continue;
+    if (!fs.existsSync(resolveGrabbyAudioPath(entry.videoId, meta.audioPath))) continue;
+    usable.push({ videoId: entry.videoId, durationSec: duration });
+  }
 
-    // Check MP3 exists
-    const mp3Path = resolveGrabbyAudioPath(entry.videoId, meta.audioPath);
-    if (!fs.existsSync(mp3Path)) continue;
+  const plan = planGrabbyFill({
+    normalCount: normalBand.count,
+    normalDurationSec: normalBand.durationSec,
+    grabbyCount: grabbyBand.count,
+    grabbyDurationSec: grabbyBand.durationSec,
+    ratio: targetRatio,
+    clusterMaxSize,
+    minGrabbySec,
+    candidates: usable
+  });
 
-    // Check if already in DB
-    const existing = await prisma.video.findUnique({ where: { videoId: entry.videoId } });
+  // Bag bookkeeping for this run: EVERY candidate the plan did not place
+  // rotates back into the rotation un-used — the planner rejected it for LENGTH
+  // reasons (or it had no playable file), not because it is bad, and `used`
+  // only resets when the whole bag is re-initialized. Entries the catalog no
+  // longer lists are pruned index-wide, whether or not this run pulled them.
+  const placedIds = new Set(plan.take);
+  const { returned, dropped, absent } = reconcileShuffleBag(
+    pulled.map(p => p.videoId).filter(id => !placedIds.has(id)),
+    new Set(grabbyMap.keys())
+  );
+  if (absent > dropped) {
+    console.log(`⚠️ [ShuffleBag] ${absent} bag entries missing from grabby-index but NOT pruned (mass absence — partial index rewrite?)`);
+  }
+  const bagNote = [returned ? `${returned} returned to bag` : '', dropped ? `${dropped} pruned (catalog-deleted)` : '']
+    .filter(Boolean).join(', ');
+  if (plan.take.length === 0) {
+    console.log(`⚠️ [ShuffleBag] Nothing usable to place (${plan.reason}${bagNote ? `, ${bagNote}` : ''})`);
+    return;
+  }
+
+  const toInsert: Prisma.VideoCreateManyInput[] = [];
+  let reusedCount = 0;
+
+  for (const videoId of plan.take) {
+    const meta = grabbyMap.get(videoId);
+    if (!meta) continue;
+    const duration = meta.duration || 0;
+    const mp3Path = resolveGrabbyAudioPath(videoId, meta.audioPath);
+
+    const existing = await prisma.video.findUnique({ where: { videoId } });
     if (existing) {
-      // Recondition the existing row: refresh its timestamp to cluster near the
-      // newest normal content and reset its playback state, so it re-enters the
-      // mix window instead of being skipped.
+      // Recondition the existing row: refresh its timestamp to cluster inside
+      // the band and reset its playback state, so it re-enters the mix window
+      // instead of being skipped.
       const data: Prisma.VideoUpdateInput = {
         publishedAt: clusterTimestamp(newestNormal.publishedAt),
         duration,
@@ -838,11 +1073,11 @@ async function distributeGrabbyItems(): Promise<void> {
       }
       await prisma.video.update({ where: { id: existing.id }, data });
       reusedCount++;
-      console.log(`   ♻️ [ShuffleBag] Reconditioned existing: ${entry.videoId}`);
+      console.log(`   ♻️ [ShuffleBag] Reconditioned existing: ${videoId} (${Math.round(duration)}s)`);
     } else {
       const author = grabbyAuthor(meta);
       toInsert.push({
-        videoId: entry.videoId,
+        videoId,
         channelId: author ? await ensureGrabbyArtistChannel(author) : GRABBY_CHANNEL_ID,
         title: meta.title || 'GrabbyTube Track',
         publishedAt: clusterTimestamp(newestNormal.publishedAt),
@@ -854,10 +1089,6 @@ async function distributeGrabbyItems(): Promise<void> {
         isGrabby: true
       });
     }
-
-    accumulatedDuration += duration;
-
-    if (accumulatedDuration >= neededDuration) break;
   }
 
   const totalChanged = toInsert.length + reusedCount;
@@ -870,7 +1101,7 @@ async function distributeGrabbyItems(): Promise<void> {
     // Last-moment recheck: a concurrent grabby delete may have removed an MP3
     // after the per-item check above. Don't insert DB rows for missing files
     // (updateIndexFile's defunct filter is the backstop if one slips through).
-      const live = toInsert.filter(i => fs.existsSync(i.audioPath));
+    const live = toInsert.filter(i => fs.existsSync(i.audioPath));
     if (live.length < toInsert.length) {
       console.log(`⏭️ [ShuffleBag] Skipping ${toInsert.length - live.length} items deleted mid-harvest`);
     }
@@ -880,16 +1111,18 @@ async function distributeGrabbyItems(): Promise<void> {
   }
   await updateIndexFile();
 
-  console.log(`✅ [ShuffleBag] ${toInsert.length} inserted + ${reusedCount} reconditioned grabby items (${Math.round(accumulatedDuration)}s total${clusterMaxSize > 0 ? `, cluster cap ${clusterMaxSize}` : ''})`);
+  console.log(`✅ [ShuffleBag] ${toInsert.length} inserted + ${reusedCount} reconditioned grabby items (${Math.round(plan.placedDurationSec)}s placed against a ${Math.round(budgetSec)}s budget${clusterMaxSize > 0 ? `, cluster cap ${clusterMaxSize}` : ''})`);
 }
 
 /**
- * Cluster a grabby item's timestamp near the newest normal content.
- * Places it within ±30 minutes of the reference time.
+ * Cluster a grabby item's timestamp INSIDE the measured band: it lands at or
+ * below the anchor, up to `bandMs` earlier. Placing items above the newest
+ * normal video (the old ±30 min jitter) put a single grabby file at the very
+ * top of the queue, above everything the user had left to watch.
  */
-export function clusterTimestamp(reference: Date): Date {
-  const offsetMs = (Math.random() - 0.5) * 60 * 60 * 1000; // ±30 min
-  return new Date(reference.getTime() + offsetMs);
+export function clusterTimestamp(reference: Date, bandMs: number = GRABBY_BAND_LOOKBACK_MS): Date {
+  const offsetMs = Math.random() * Math.max(0, bandMs);
+  return new Date(reference.getTime() - offsetMs);
 }
 
 // === HELPER: Channel title extraction ===
