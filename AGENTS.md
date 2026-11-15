@@ -41,13 +41,28 @@
   before/after, and unwatch test-consumed rows with a direct SQLite
   `UPDATE Video SET watched=0, progress=0` (the index self-heals on the
   next harvest, seconds later).
-- **T4 — frontend liveness logic (pure, no browser, no network)**:
+- **T4 — frontend playback logic (pure, no browser, no network)**:
   `node tests/stall-guard.test.mjs` (~1 s). Compiles `frontend/src/app/stall-guard.ts`
   and drives the watchdog decision on simulated ticks: the `readyState 4`
   stale-buffer case (the real freeze), a load that never answers, scrubbing /
   paused / frozen-tab immunity, the 3-reload give-up cadence, and both resume
-  clocks (`stallResumeTarget`: element `currentTime` vs the laggy index copy).
-  No live system, no DB, no build.
+  clocks (`stallResumeTarget`: element `currentTime` vs the laggy index copy)
+  plus `streamTrackId(audio.src)` — the function that says WHICH track a
+  `currentTime` belongs to, which is what fixes the next-track inherits its
+  predecessor's position bug. No live system, no DB, no build.
+- **T5 — advance/resume browser E2E recipe** (headless Chromium + `--autoplay-policy=no-user-gesture-required`):
+  open the app, tag a short (≤150 s) queue row by id, click it (a trusted click
+  is what grants playback permission), then either await its `ended` event or
+  click a row whose id differs from the element's `src`. An auto-advanced track
+  that logs `Resumed <id> from <X>s` with X > 0 while X is not that track's own
+  saved progress is the bug. Prove the invariant both ways by serving the OLD
+  and NEW bundle side by side (`docker cp` the pre-fix `index.html` as
+  `old-index.html`, keep the fixed web root) — the buggy bundle reproduces
+  `Resumed cm7i62EE7T8 from 105.9s`/`from 80.0s` where the fixed one starts at
+  0. CAUTION: instrument the element with an `addInitScript` that wraps
+  `window.Audio` (`window.__audios`) BEFORE the goto; a `tab.run`/evaluate after
+  load is too late to observe the boot autoplay, and each headless SPA tab
+  writes progress/watched — zero or unwatch the touched rows afterwards.
 
 ## Workflow Reminders
 - Use `Task`/`explore` agents for complex searches.
@@ -264,9 +279,29 @@
   `currentTime` once metadata has landed, else the (10 s-laggy) index copy —
   computed BEFORE `src` is re-assigned, because the load algorithm wipes the
   position; resuming at 0 with a 28 MB retained buffer replays ~6 min of a
-  64 kbps mono track. NOTE: this is the *playback* watchdog; the similarly named
-  `Config.stallWindowMs` mechanism above is the *download* watchdog — different
-  problem, different file.
+  64 kbps mono track. Whether a load is a SAME-track load is decided by
+  `streamTrackId(this.audio.src) === video.videoId`, NEVER by `currentVideo`
+  (see the next bullet). NOTE: this is the *playback* watchdog; the similarly
+  named `Config.stallWindowMs` mechanism above is the *download* watchdog —
+  different problem, different file.
+
+- **"Same track" is a property of the ELEMENT, not of `currentVideo`**
+  (2026-11-15, see ARCHITECTURE.md §12.3): the app keeps one detached
+  `new Audio()`, and `_tryPlay` sets `currentVideo` to the candidate BEFORE its
+  HEAD probe resolves, while the `currentVideo -> null` effect that would clear
+  `audio.src` is scheduled after that set — so on every advance (`onended`,
+  `skipNext` with skip-marks-watched, `newest`/`oldest` autoplay, `_loadIndexAndPlay`)
+  the element still holds the track being left while `currentVideo` already
+  names the next one. `loadAndSeekVideo` used to derive `sameTrack` from
+  `currentVideo`, so the NEXT track looked like the same track and was seeked to
+  the finished track's position: any next track longer than the position being
+  left started partway through itself (a 28-minute item resumed at 1:45 after a
+  1:46 item ended; a row click inherited 80 s). Its side effect was also a spent
+  watchdog budget — an advance inherited the old track's `_stallRecoveries`.
+  `stall-guard.streamTrackId(src)` (the id inside `/api/stream/<id>`, null when
+  `src` is '') is the only honest answer; a track the element is not loaded with
+  passes `currentTime: 0`, so its own saved progress (or 0) decides. Row clicks
+  on the ALREADY-playing track must still keep its live position (verified).
 
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 
@@ -288,11 +323,25 @@ absence → prune nothing, log only). T2 gained section 15 — the compiled
 `distributeGrabbyItems()` driven against a scratch DB, 122 assertions — because
 the pure planner tests cannot see timestamps or bag state. The frontend
 playback liveness watchdog (`stall-guard.ts` + `_runStallCheck()`, T4 =
-`node tests/stall-guard.test.mjs`, 45 assertions) is now in the DEPLOYED
+`node tests/stall-guard.test.mjs`, 53 assertions) is now in the DEPLOYED
 bundle: 20 s of no `timeupdate` progress on a "playing" element →
 `⏳ Buffering…/Reconnecting…` badge + same-track reload over a NEW request,
 resumed at `stallResumeTarget()`, skip after 3 attempts. E2E-proven against a
 real wedged media socket: old bundle froze at 29.4 s with zero requests and no
 badge, new bundle recovered in ~12 s and continued from 29.4 s with no replay.
 T1's `hostPath()` translation of stored `/cache/...` audioPaths fixed 3
-false-failure groups.)
+false-failure groups.
+Last updated: 2026-11-15 (the next track no longer starts where the previous
+one stopped. `loadAndSeekVideo` decided "same track" from `currentVideo`, which
+`_tryPlay` had ALREADY overwritten with the candidate while the element still
+held the finished track — so every advance seeked the next track to the
+finished one's `currentTime`, and any next track longer than the position being
+left began partway through itself (`Resumed cm7i62EE7T8 from 105.9s` after a
+1:46 item; 80 s after a mid-track row click). Same-track identity now comes
+from `stall-guard.streamTrackId(audio.src)`, so a different track passes
+`currentTime: 0` and resumes at its own saved progress or 0, and gets a fresh
+watchdog budget. T4 gained the ownership cases (8 assertions); T5 documents the
+paired before/after headless-Chromium recipe. Verified in two real browser tabs
+serving the pre-fix and post-fix bundles side by side, then deployed via
+`docker compose up -d --build` — the deployed bundle is `main-EPSOMVDU.js` and
+T1 still PASSes.)

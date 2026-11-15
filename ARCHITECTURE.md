@@ -937,6 +937,20 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   `currentTime` is 0 there). Computed BEFORE `src` is re-assigned: the load
   algorithm wipes the playback position the moment a new source is set. A resume
   at 0 with a 28 MB retained buffer replays ~6 min at 64 kbps mono.
+- **"Same track" is a question about the ELEMENT** (`streamTrackId(audio.src)
+  === video.videoId`, fixed 2026-11-15): every advance path writes the next
+  candidate into `currentVideo` inside `_tryPlay` *before* the HEAD probe
+  resolves, and the `currentVideo -> null` effect that would clear `src` is
+  scheduled after that set — so at load time the element still holds the track
+  being left while `currentVideo` already names the candidate. The old
+  `currentVideo`-based check therefore read `sameTrack = true` for the NEXT
+  track and seeked it to the finished one's position: a 105.9 s item ending
+  parked the 28-minute item that followed at 1:45 (`Resumed … from 105.9s`), and
+  any next track longer than the position being left started partway through
+  itself (a mid-track row click inherited 80 s the same way). Passing 0 for a
+  different track leaves its own saved progress (or 0) as the resume record;
+  the same rule now also grants a fresh `MAX_STALL_RECOVERIES` budget per track
+  instead of spending the finished track's count.
 - Clock trust: a frozen/suspended tab runs its timers ~1/min, so a stale
   heartbeat proves nothing there; `visibilitychange` / `resume` own that
   decision and are granted a shortened budget (`RESUME_DETECT_MS` 6 s).
@@ -948,10 +962,14 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   badge — `⏳ Buffering…` / `⏳ Reconnecting…` — the only visible sign any of
   this happened (`idle` renders nothing; silent starvation used to render nothing
   at all, which is why "the app just stopped and nothing said why").
-- Test: `node tests/stall-guard.test.mjs` (45 assertions, no browser and no
-  network: the pure decision plus both resume clocks, driven on simulated ticks
-  — including the `readyState 4` stale buffer, a load that never answers, the
-  give-up cadence, and scrubbing/paused/frozen-tab immunity).
+- Test: `node tests/stall-guard.test.mjs` (53 assertions, no browser and no
+  network: the pure decision plus both resume clocks and the
+  `streamTrackId` track-ownership rule, driven on simulated ticks — including
+  the `readyState 4` stale buffer, a load that never answers, the give-up
+  cadence, scrubbing/paused/frozen-tab immunity, and the advance cases: a
+  longer next track never inherits the finished track's position, a next track
+  resumes at its own saved progress, and a same-track re-load keeps its live
+  position).
 
 ### 12.4 Progress persistence
 
