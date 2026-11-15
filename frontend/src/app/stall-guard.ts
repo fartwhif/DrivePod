@@ -34,6 +34,13 @@
  * `evaluateStall` owns only the decision (total and side-effect free over its
  * inputs); `app.component.ts` owns the side effects: reload / skip / show
  * "Reconnecting…" (see `tests/stall-guard.test.mjs`).
+ *
+ * `streamTrackId` is the other DOM-free question the same file answers, because
+ * it decides which track an element's `currentTime` belongs to (see
+ * `stallResumeTarget`): the app keeps a detached `new Audio()`, and an advance
+ * path writes the next candidate into `currentVideo` before the load lands, so
+ * the element can still hold the track being left. Only its `src` says which
+ * track a position was measured on.
  */
 
 /** Budget granted after a frozen/suspended tab comes back (`resume` /
@@ -195,10 +202,22 @@ export function evaluateStall(t: StallTick): StallDecision {
  *  `currentTime` is 0 and only the index knows where the listener was. */
 export const HAVE_POSITION_READY_STATE = 1;
 
+/** The videoId of the `/api/stream/<id>` source a media element is loaded
+ *  with, or null when it holds no track (`src` is '' after a skip or stop).
+ *  A position, an error and a progress save all belong to THAT track. */
+export function streamTrackId(src: string): string | null {
+  const m = /\/api\/stream\/([A-Za-z0-9_-]+)/.exec(src);
+  return m ? m[1] : null;
+}
+
 export interface ResumeTarget {
   /** The element's playback position, read BEFORE its source is re-assigned
-   *  (the load algorithm wipes it). Pass 0 when the load is a DIFFERENT
-   *  track: that position belongs to the track being left. */
+   *  (the load algorithm wipes it). Pass 0 when the element is loaded with a
+   *  DIFFERENT track — i.e. when `streamTrackId(audio.src)` is not this video:
+   *  that position belongs to the track being left, and seeking a new, longer
+   *  track to it starts the next item wherever the last one happened to stop.
+   *  Passing it for a different track is the reported bug: advancing from a
+   *  40-minute item to a 30-minute one resumed the new track at 24 minutes. */
   currentTime: number;
   readyState: number;
   /** This track's progress as the index carried it when last fetched. */

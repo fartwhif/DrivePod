@@ -38,7 +38,8 @@ const {
   STALL_CHECK_MS,
   STALL_DETECT_MS,
   STALL_PHASE_LABEL,
-  stallResumeTarget
+  stallResumeTarget,
+  streamTrackId
 } = await import(tmpFile);
 
 let pass = 0, fail = 0;
@@ -325,6 +326,55 @@ t('neither clock usable: resume at 0 rather than a garbage offset',
       stallResumeTarget({ currentTime: -5, readyState: 4, savedProgress: -5 })]) === at([0, 0, 0]));
 t('a progress file clobbered to 0 does not override a live position',
   stallResumeTarget({ currentTime: 29.4, readyState: 3, savedProgress: 0 }) === 29.4);
+
+console.log('\nwhich track an element position belongs to (advance to next)');
+// The reported bug: the app keeps ONE detached `new Audio()`, and every
+// advance path writes the NEXT candidate into `currentVideo` (in `_tryPlay`,
+// before the HEAD probe resolves) while the element is still loaded with the
+// track being left. `streamTrackId(audio.src)` is the only thing that says
+// whose position `currentTime` is.
+const streamSrc = id => `/api/stream/${id}?bitrate=128`;
+/** Faithful model of `loadAndSeekVideo`'s resume decision for one load. */
+function resumeFor({ elementSrc, elementTime, elementReadyState, video, savedProgress }) {
+  const sameTrack = streamTrackId(elementSrc) === video.videoId;
+  return stallResumeTarget({
+    currentTime: sameTrack ? elementTime : 0,
+    readyState: elementReadyState,
+    savedProgress: savedProgress ?? video.progress ?? 0
+  });
+}
+t('streamTrackId reads the id out of the real stream URL', () => {
+  const ids = [streamSrc('Id0XE5s7-Ck'), `/api/stream/HgCFjlhHfeQ?bitrate=64-mono`,
+               '/api/stream/cm7i62EE7T8'];
+  return at(ids.map(streamTrackId)) === at(['Id0XE5s7-Ck', 'HgCFjlhHfeQ', 'cm7i62EE7T8']);
+}, at(['/Id0XE5s7-Ck', 'HgCFjlhHfeQ', 'cm7i62EE7T8']));
+t('no source (skipped/stopped element) owns no track',
+  at(['', 'about:blank', '/cache/index.json'].map(streamTrackId)) === at([null, null, null]));
+{
+  // 1059 s item left at 1000 s, next item is 1710 s and was never played:
+  // the old `currentVideo`-based check said "same track" (currentVideo was
+  // already the 1710 s candidate) and seeked the new item to 1000 s.
+  const el = { elementSrc: streamSrc('Id0XE5s7-Ck'), elementTime: 1000.4, elementReadyState: 4 };
+  t('advancing to a LONGER next track never inherits the finished track position',
+    resumeFor({ ...el, video: { videoId: 'cm7i62EE7T8', progress: 0 } }) === 0,
+    `${resumeFor({ ...el, video: { videoId: 'cm7i62EE7T8', progress: 0 } })}`);
+  t('advancing resumes at the NEXT track\'s own recorded position',
+    resumeFor({ ...el, video: { videoId: 'cm7i62EE7T8', progress: 312 } }) === 312,
+    `${resumeFor({ ...el, video: { videoId: 'cm7i62EE7T8', progress: 312 } })}`);
+  t('a shorter next track is not rescued by the 0.98 guard either — no inherited seek',
+    resumeFor({ elementSrc: streamSrc('Sv6dMFF_yts'), elementTime: 1000.4, elementReadyState: 4,
+                video: { videoId: 'HgCFjlhHfeQ', progress: 0 } }) === 0);
+  t('the same track re-loaded by the watchdog keeps its live position',
+    resumeFor({ ...el, video: { videoId: 'Id0XE5s7-Ck', progress: 8 } }) === 1000.4);
+  t('a fresh pick on an element with no source resumes from the record',
+    resumeFor({ elementSrc: '', elementTime: 1000.4, elementReadyState: 4,
+                video: { videoId: 'cm7i62EE7T8', progress: 312 } }) === 312);
+  // The advance also has to spend a fresh watchdog budget: inheriting the
+  // finished track's count could skip the new track on its first stall.
+  t('a load whose source is the next track is judged a different track',
+    streamTrackId(streamSrc('Id0XE5s7-Ck')) === 'Id0XE5s7-Ck'
+    && streamTrackId(streamSrc('Id0XE5s7-Ck')) !== 'cm7i62EE7T8');
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 fs.rmSync(tmpDir, { recursive: true, force: true });

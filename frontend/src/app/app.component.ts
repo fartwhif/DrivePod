@@ -9,7 +9,8 @@ import {
   RESUME_DETECT_MS,
   STALL_DETECT_MS,
   STALL_PHASE_LABEL,
-  stallResumeTarget
+  stallResumeTarget,
+  streamTrackId
 } from './stall-guard';
 import { Title } from '@angular/platform-browser';
 
@@ -1117,14 +1118,26 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    * `currentTime` IS where the listener stopped being heard: the element
    * keeps its playback position when its pipeline is discarded or its
    * connection dies, and the fresh request refills the buffer from there.
-   * A different track (row click, autoplay, boot) has no live position of
-   * its own, so its saved progress from the index still wins.
+   *
+   * Whether a load is a same-track load is therefore a question about the
+   * ELEMENT, and `streamTrackId(audio.src)` is the only honest answer. The
+   * previous code asked `currentVideo`, which the advance paths had ALREADY
+   * overwritten with the candidate (`_tryPlay` sets it before the HEAD probe
+   * resolves, and the `currentVideo -> null` effect never clears `src`
+   * because it is scheduled after that set), so the finished track still sat
+   * in the element while the candidate was already "current": `sameTrack`
+   * read TRUE for the NEXT track and seeked it to the finished one's
+   * position. That is the reported bug — a 20-minute item ending parked the
+   * 40-minute item that followed at 20:00 instead of at its own saved
+   * progress, and any next track longer than the position being left
+   * started partway through itself. A track the element is not loaded with
+   * has no live position of its own, so its saved progress from the index
+   * (or 0) decides.
    */
   private loadAndSeekVideo(video: Video): void {
     // A DIFFERENT track gets a fresh attempt budget; re-loading the same one
     // keeps it, which is what bounds the watchdog's retries.
-    const previous = this.currentVideo();
-    const sameTrack = !!previous && previous.videoId === video.videoId;
+    const sameTrack = streamTrackId(this.audio.src) === video.videoId;
     if (!sameTrack) this._stallRecoveries = 0;
     this.currentVideo.set(video);
     this.updatePageTitle(video);
