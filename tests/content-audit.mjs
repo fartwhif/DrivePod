@@ -8,7 +8,7 @@
  * playable file, progress/ordering invariants broken, or structurally
  * unreachable by autoplay.
  *
- * Hard failures (exit 1): A1-A9, A11. Informational: A10, A12-A14.
+ * Hard failures (exit 1): A1-A9, A11, A14. Informational: A10, A12-A13.
  *
  * Usage: node tests/content-audit.mjs  (run from repo root)
  */
@@ -46,6 +46,20 @@ let failures = 0;
 const fail = (tag, msg) => { failures++; console.log(`  ✗ FAIL [${tag}] ${msg}`); };
 const ok = (tag, msg) => console.log(`  ✓ [${tag}] ${msg}`);
 const info = (tag, msg) => console.log(`  · [${tag}] ${msg}`);
+
+/**
+ * GrabbyTube's authorship marker — must match isGrabbyAuthored in the backend.
+ * GrabbyTube stamps createdAt into the per-item JSON of every track it
+ * downloads; DrivePod's own sidecar writers never do. The cache dir is SHARED
+ * between the two apps, so this marker is the only evidence of who owns the
+ * content of a folder, and every grabby/normal decision here keys on it.
+ */
+const isGrabbyAuthored = (meta) =>
+  !!meta && typeof meta === 'object' && String(meta.createdAt ?? '').trim() !== '';
+const sidecarAt = (videoId) => {
+  try { return JSON.parse(fs.readFileSync(path.join(CACHE_DIR, videoId, `${videoId}.json`), 'utf-8')); }
+  catch { return null; }
+};
 
 function loadJson(p, label) {
   if (!fs.existsSync(p)) { fail('io', `${label} missing: ${p}`); return null; }
@@ -113,13 +127,12 @@ console.log(`DB videos: ${videos.length} (non-ignored ${dbNonIgnored.size}) | in
     const mp3 = path.join(CACHE_DIR, id, `${id}.mp3`);
     if (!fs.existsSync(mp3)) continue;
     if (videoById.has(id)) continue;
-    const meta = path.join(CACHE_DIR, id, `${id}.json`);
-    const isGrabbyMeta = fs.existsSync(meta) && (() => { try { return !!JSON.parse(fs.readFileSync(meta, 'utf-8')).videoId; } catch { return false; } })();
+    const isGrabbyMeta = isGrabbyAuthored(sidecarAt(id));
     (isGrabbyMeta ? orphanGrabby : orphanMp3).push(id);
   }
   if (orphanMp3.length) fail('A3', `${orphanMp3.length} folder(s) with MP3 but NO DB row — content missed from queue (cleanup will delete them): ${orphanMp3.slice(0, 8).join(', ')}`);
   else ok('A3', 'no non-grabby orphan folders with MP3');
-  if (orphanGrabby.length) info('A3b', `${orphanGrabby.length} grabby folder(s) with MP3 but no DB row (protected by cleanup; only reachable via re-distribution): ${orphanGrabby.slice(0, 5).join(', ')}`);
+  if (orphanGrabby.length) info('A3b', `${orphanGrabby.length} GrabbyTube-authored folder(s) with MP3 but no DB row (protected by cleanup; reachable only via re-distribution): ${orphanGrabby.slice(0, 5).join(', ')}`);
   else ok('A3b', 'no grabby orphan folders');
 }
 
@@ -248,6 +261,26 @@ console.log(`DB videos: ${videos.length} (non-ignored ${dbNonIgnored.size}) | in
 {
   const stale = videos.filter(v => !v.ignored && !v.watched && v.progress > 0 && v.duration != null && v.duration > 0 && v.progress >= v.duration).length;
   info('A13', `unwatched rows with stale progress≥duration (resume reads 0): ${stale}`);
+}
+
+// ── A14: the grabby label must match GrabbyTube's authorship marker ──
+// grabby-index.json used to be a bare sweep of the shared cache, so it listed
+// DrivePod's own videos too; reconditioning flipped 464 such rows to isGrabby —
+// which reset watched/progress and replaced their real upload date with a
+// cluster draw, so they came back into the queue forever (auto-purge skips
+// grabby rows). A row may only be labeled grabby when GrabbyTube authored its
+// sidecar AND still lists the track.
+{
+  const authored = new Set(grabbyIndex.filter(isGrabbyAuthored).map(e => e.videoId));
+  const grabbyRows = videos.filter(v => v.isGrabby);
+  const noMarker = grabbyRows.filter(v => !isGrabbyAuthored(sidecarAt(v.videoId))).map(v => v.videoId);
+  const notListed = grabbyRows.filter(v => !authored.has(v.videoId)).map(v => v.videoId);
+  if (noMarker.length) fail('A14', `${noMarker.length} grabby row(s) whose sidecar lacks GrabbyTube's createdAt — DrivePod's own videos labeled as music (startup revert returns them to the normal queue): ${noMarker.slice(0, 8).join(', ')}${noMarker.length > 8 ? '…' : ''}`);
+  else ok('A14', `all ${grabbyRows.length} grabby row(s) carry the authorship marker`);
+  if (notListed.length) fail('A14b', `${notListed.length} grabby row(s) absent from the authored grabby-index.json — mislabeled, or GrabbyTube deleted the track and its folder survived: ${notListed.slice(0, 8).join(', ')}${notListed.length > 8 ? '…' : ''}`);
+  else ok('A14b', 'every grabby row is a track GrabbyTube currently lists');
+  const authoredNormal = [...authored].filter(id => videoById.has(id) && !videoById.get(id).isGrabby);
+  info('A14c', `authored tracks whose DrivePod row stays normal (ownership guard refuses to convert a harvested video): ${authoredNormal.length}`);
 }
 
 console.log(failures === 0 ? '\nT1 PASS — no missed content detected\n' : `\nT1 FAIL — ${failures} problem group(s)\n`);

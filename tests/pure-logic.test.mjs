@@ -7,6 +7,10 @@
  *
  * Run via tests/run-scratch.sh (container) — do NOT run on the host:
  * the host port 3000 is occupied and the server module listens on boot.
+ *
+ * GrabbyTube's authorship marker (`createdAt` in the per-item JSON) is what
+ * makes an index entry a library track; fixtures stamp it, and one entry is
+ * deliberately left without it to prove the marker is enforced.
  */
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -724,16 +728,22 @@ exit 0`);
   const bandStartMs = dbAnchor.getTime() - HOUR;
 
   // Catalog: 15 tracks of 900 s + one 3600 s archive file.
-  const mkTrack = (vid, dur) => {
+  // GrabbyTube stamps createdAt into every item it downloads; DrivePod's own
+  // sidecars never carry it. `integForeign` is exactly that: a DrivePod folder
+  // that the old bare-sweep index used to list as music.
+  const mkTrack = (vid, dur, authored = true) => {
     const dir = path.join(CACHE_DIR, vid);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, `${vid}.mp3`), Buffer.alloc(1024, 0x41));
-    return { videoId: vid, title: `Track ${vid}`, author: '', duration: dur, audioPath: `${vid}/${vid}.mp3` };
+    const entry = { videoId: vid, title: `Track ${vid}`, author: '', duration: dur, audioPath: `${vid}/${vid}.mp3` };
+    if (authored) entry.createdAt = new Date(Date.now() - 86400000).toISOString();
+    return entry;
   };
   const catalog = [];
   for (let i = 0; i < 15; i++) catalog.push(mkTrack(`integG${i}`, 900));
   catalog.push(mkTrack('integMega', 3600));
-  fs.writeFileSync(GIDX, JSON.stringify(catalog, null, 2));
+  const foreign = mkTrack('integForeign', 900, false);
+  fs.writeFileSync(GIDX, JSON.stringify([...catalog, foreign], null, 2));
   // `gone` = pulled once before GrabbyTube deleted it: no index record, still
   // marked used, so under the old narrow prune it sat in the file forever.
   const seedBag = () => fs.writeFileSync(BAGF, JSON.stringify(
@@ -762,6 +772,9 @@ exit 0`);
   const r1 = await grabbyRows();
   t('distribute: count parity places 7 items, not the one 60-min archive file',
     r1.length === 7 && r1.every(v => v.duration === 900), `rows=${r1.length} (${r1.map(v => v.videoId).join(',')})`);
+  t('distribute: an index entry without GrabbyTube\'s createdAt is never placed (another app owns that folder)',
+    !r1.some(v => v.videoId === 'integForeign'),
+    (await prisma.video.findUnique({ where: { videoId: 'integForeign' } })) ? 'row exists' : 'no row');
   t('distribute: every placed item is timestamped inside the measured band',
     r1.every(v => v.publishedAt.getTime() <= dbAnchor.getTime() && v.publishedAt.getTime() >= bandStartMs),
     r1.map(v => `${v.videoId}@${v.publishedAt.getTime() - dbAnchor.getTime()}ms`).join(' '));
@@ -855,6 +868,181 @@ exit 0`);
   await prisma.video.deleteMany({ where: { channelId: chan } });
   await prisma.video.deleteMany({ where: { isGrabby: true } });
   await prisma.channel.delete({ where: { channelId: chan } }).catch(() => {});
+}
+// ── 16. ownership: GrabbyTube's marker decides what may be music ──
+// The cache dir is SHARED. GrabbyTube stamps createdAt into the item JSON of
+// every track it downloads; DrivePod writes a sidecar for every video it
+// harvests without that key. Every ownership decision — bag seed, candidate
+// filter, the mislabel revert — keys on that marker, because a bare folder
+// sweep used to catalogue DrivePod's own videos as music and 464 of the
+// owner's watched videos came back into the queue forever.
+{
+  const GIDX = path.join(CACHE_DIR, 'grabby-index.json');
+  const BAGF = path.join(CACHE_DIR, 'shufflebag.json');
+  await prisma.video.deleteMany({});
+
+  const mkSidecar = (vid, extra = {}, authored = true) => {
+    const dir = path.join(CACHE_DIR, vid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${vid}.mp3`), Buffer.alloc(1024, 0x41));
+    const meta = { videoId: vid, title: `Item ${vid}`, author: 'Own Artist', duration: 900,
+      channelId: 'UCOwnChan', publishedAt: '2024-05-01T00:00:00.000Z',
+      audioPath: `${vid}/${vid}.mp3`, ...extra };
+    if (authored) meta.createdAt = new Date(Date.now() - 86400000).toISOString();
+    fs.writeFileSync(path.join(dir, `${vid}.json`), JSON.stringify(meta));
+    return meta;
+  };
+  const mkIndex = (entries) => fs.writeFileSync(GIDX, JSON.stringify(entries, null, 2));
+  const idxEntry = (vid, dur = 900, authored = true) => {
+    const e = { videoId: vid, title: `Track ${vid}`, author: 'Track Artist', duration: dur,
+      audioPath: `${vid}/${vid}.mp3` };
+    if (authored) e.createdAt = new Date(Date.now() - 86400000).toISOString();
+    return e;
+  };
+  const readBag = () => JSON.parse(fs.readFileSync(BAGF, 'utf-8'));
+  const realLog = console.log;
+  const quiet = async (fn) => {
+    const lines = [];
+    console.log = (...a) => lines.push(a.join(' '));
+    try { await fn(); } finally { console.log = realLog; }
+    return lines;
+  };
+
+  // ── bag seed: authored entries with a playable file, nothing else ──
+  mkSidecar('ownV1', {}, false);                       // DrivePod's own: no marker
+  mkSidecar('gA', { author: 'Track Artist' });           // authored library track
+  mkSidecar('gB', { author: 'Track Artist' });
+  mkSidecar('gMissing', { author: 'Track Artist' });
+  fs.rmSync(path.join(CACHE_DIR, 'gMissing'), { recursive: true, force: true });
+  mkIndex([idxEntry('ownV1', 900, false), idxEntry('gA'), idxEntry('gB'), idxEntry('gMissing'),
+    idxEntry('ownNoFile', 900, false)]);
+  const seedLines = await quiet(() => server.initShuffleBag());
+  const seeded = readBag().map(e => e.videoId).sort();
+  t('bag seed: only GrabbyTube-authored entries with an MP3 are admitted',
+    JSON.stringify(seeded) === JSON.stringify(['gA', 'gB']), `bag=${seeded.join(',')}`);
+  t('bag seed: an index entry without the authorship marker never enters the rotation',
+    !seeded.includes('ownV1') && !seeded.includes('ownNoFile'), seeded.join(','));
+  t('bag seed: a defunct authored item is reported, not silently dropped',
+    seedLines.some(l => l.includes('Skipping defunct item: gMissing')), seedLines.join(' | '));
+  t('bag seed: every entry starts un-used', readBag().every(e => e.used === false));
+
+  // ── distribution: the mix may never convert DrivePod's own video ──
+  await prisma.channel.upsert({
+    where: { channelId: 'UCOwnChan' }, update: {},
+    create: { channelId: 'UCOwnChan', title: 'Own Channel', order: 1, active: true }
+  });
+  const ownDate = new Date('2024-05-01T00:00:00.000Z');
+  await prisma.video.create({
+    data: { videoId: 'ownV1', channelId: 'UCOwnChan', title: 'Own Video', publishedAt: ownDate,
+      audioPath: '/cache/ownV1/ownV1.mp3', duration: 900, watched: true, progress: 400 }
+  });
+  // Band anchor: the mix clusters around the newest UNWATCHED normal video,
+  // so the band needs one (ownV1 is watched, i.e. already consumed).
+  await prisma.video.create({
+    data: { videoId: 'normAnchor', channelId: 'UCOwnChan', title: 'Normal anchor',
+      publishedAt: new Date(Date.now() - 2 * 3600 * 1000),
+      audioPath: '/cache/normAnchor/normAnchor.mp3', duration: 900 }
+  });
+  // ownV1 IS in the catalog (GrabbyTube downloaded the same video the channels
+  // already carried) and IS in the bag, so the planner would take it.
+  mkIndex([idxEntry('ownV1'), idxEntry('gA'), idxEntry('gB')]);
+  fs.writeFileSync(BAGF, JSON.stringify([{ videoId: 'ownV1', used: false },
+  { videoId: 'gA', used: false }, { videoId: 'gB', used: false }], null, 2));
+  for (const [k, v] of Object.entries({
+    grabbyMixEnabled: 'true', grabbyMixRatio: '1', grabbyClusterMaxSize: '0'
+  })) await setCfg(k, v);
+  const dLines = await quiet(() => server.distributeGrabbyItems());
+  const ownRow = await prisma.video.findUnique({ where: { videoId: 'ownV1' } });
+  const placed = await prisma.video.findMany({ where: { isGrabby: true }, select: { videoId: true } });
+  t('distribute: a normal row is never converted, even when the catalog lists it',
+    ownRow.isGrabby === false && placed.length === 1 && placed[0].videoId === 'gA',
+    `ownV1.isGrabby=${ownRow.isGrabby} placed=${placed.map(p => p.videoId).join(',')}`);
+  t('distribute: the listener\'s own state and real upload date survive',
+    ownRow.watched === true && ownRow.progress === 400 &&
+    ownRow.publishedAt.getTime() === ownDate.getTime() && ownRow.channelId === 'UCOwnChan',
+    `watched=${ownRow.watched} progress=${ownRow.progress} at=${ownRow.publishedAt.toISOString()} chan=${ownRow.channelId}`);
+  t('distribute: the refusal is logged',
+    dLines.some(l => l.includes("Refusing to convert DrivePod's own video ownV1")), dLines.join(' | '));
+  t('distribute: the refused entry rotates back un-used instead of burning a pull',
+    readBag().some(e => e.videoId === 'ownV1' && e.used === false), JSON.stringify(readBag()));
+
+  // ── the mislabel revert: sidecar evidence restores exactly what it says ──
+  await prisma.video.deleteMany({});
+  // DrivePod wrote these sidecars, so they carry NO createdAt — that absence is
+  // the ownership evidence revert acts on. rvAuth3 is GrabbyTube's own.
+  mkSidecar('rvSeen1', {}, false);
+  mkSidecar('rvSeen2', { channelId: 'UCMissingChan' }, false);
+  mkSidecar('rvAuth3');                                 // authored: stays grabby
+  fs.rmSync(path.join(CACHE_DIR, 'rvNoSidecar'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(CACHE_DIR, 'rvNoSidecar'), { recursive: true });
+  fs.writeFileSync(path.join(CACHE_DIR, 'rvNoSidecar/rvNoSidecar.mp3'), Buffer.alloc(1024, 0x41));
+  await prisma.channel.upsert({
+    where: { channelId: 'UCGrabbyTube' }, update: {},
+    create: { channelId: 'UCGrabbyTube', title: 'GrabbyTube', order: 999999, active: false }
+  });
+  // The channel rvSeen2's sidecar names does not exist: channel deletion only
+  // removes non-grabby rows, so the row outlived its own channel.
+  // Two rows the sweep-era index flipped: watched state reset by reconditioning,
+  // real date replaced by a cluster draw, re-pointed at the placeholder channel.
+  for (const vid of ['rvSeen1', 'rvSeen2']) {
+    await prisma.video.create({
+      data: { videoId: vid, channelId: 'UCGrabbyTube', title: `Flipped ${vid}`,
+        publishedAt: new Date(Date.now() - 60000), audioPath: `/cache/${vid}/${vid}.mp3`,
+        duration: 900, isGrabby: true, watched: true, progress: 700, protected: true }
+    });
+  }
+  await prisma.video.create({
+    data: { videoId: 'rvAuth3', channelId: 'UCGrabbyTube', title: 'Real track',
+      publishedAt: new Date(Date.now() - 60000), audioPath: '/cache/rvAuth3/rvAuth3.mp3',
+      duration: 900, isGrabby: true }
+  });
+  await prisma.video.create({
+    data: { videoId: 'rvNoSidecar', channelId: 'UCGrabbyTube', title: 'No evidence',
+      publishedAt: new Date(Date.now() - 60000), audioPath: '/cache/rvNoSidecar/rvNoSidecar.mp3',
+      duration: 900, isGrabby: true }
+  });
+  // (no UCRealChan: rvSeen2's real channel was never created at all)
+  const missingBefore = await prisma.channel.findUnique({ where: { channelId: 'UCMissingChan' } });
+  const revLines = await quiet(() => server.revertForeignGrabbyRows());
+  const rv1 = await prisma.video.findUnique({ where: { videoId: 'rvSeen1' } });
+  const rv2 = await prisma.video.findUnique({ where: { videoId: 'rvSeen2' } });
+  const rv3 = await prisma.video.findUnique({ where: { videoId: 'rvAuth3' } });
+  const rv4 = await prisma.video.findUnique({ where: { videoId: 'rvNoSidecar' } });
+  const recreated = await prisma.channel.findUnique({ where: { channelId: 'UCMissingChan' } });
+  t('revert precondition: the sidecar channel UCMissingChan did not exist beforehand',
+    !missingBefore, JSON.stringify(missingBefore));
+  t('revert: DrivePod-authored sidecars return their rows to the normal queue',
+    rv1.isGrabby === false && rv2.isGrabby === false,
+    `rvSeen1=${rv1.isGrabby} rvSeen2=${rv2.isGrabby} (${revLines.join(' | ')})`);
+  t('revert: the real upload date comes back from the sidecar',
+    rv1.publishedAt.getTime() === Date.parse('2024-05-01T00:00:00.000Z') &&
+    rv2.publishedAt.getTime() === Date.parse('2024-05-01T00:00:00.000Z'),
+    `${rv1.publishedAt.toISOString()} ${rv2.publishedAt.toISOString()}`);
+  t('revert: the row is re-pointed at the channel the sidecar names',
+    rv1.channelId === 'UCOwnChan', `chan=${rv1.channelId}`);
+  t('revert: a sidecar channel that was deleted is recreated INACTIVE (never re-harvested)',
+    rv2.channelId === 'UCMissingChan' && !!recreated && recreated.active === false &&
+    recreated.order === 999999 && recreated.title === 'Own Artist',
+    `chan=${rv2.channelId} recreated=${JSON.stringify(recreated)}`);
+  t('revert: watched/progress/protected are never touched — the listener\'s state',
+    rv1.watched === true && rv1.progress === 700 && rv1.protected === true,
+    `watched=${rv1.watched} progress=${rv1.progress} protected=${rv1.protected}`);
+  t('revert: an authored grabby row stays grabby (evidence, not guesswork)',
+    rv3.isGrabby === true && rv4.isGrabby === true,
+    `rvAuth3=${rv3.isGrabby} rvNoSidecar=${rv4.isGrabby}`);
+  t('revert: the index is rewritten so the reverted rows rejoin the queue',
+    JSON.parse(fs.readFileSync(path.join(CACHE_DIR, 'index.json'), 'utf-8'))
+      .filter(m => !m.isGrabby).map(m => m.videoId).includes('rvSeen1'),
+    'index.json missing rvSeen1');
+
+  await prisma.video.deleteMany({ where: { videoId: { in: ['ownV1', 'normAnchor', 'gA', 'gB', 'rvSeen1', 'rvSeen2', 'rvAuth3', 'rvNoSidecar'] } } });
+  await prisma.channel.deleteMany({ where: { channelId: { in: ['UCOwnChan', 'UCMissingChan'] } } });
+  await prisma.channel.deleteMany({ where: { channelId: { startsWith: 'UCGrabbyTube' } } });
+  for (const vid of ['ownV1', 'normAnchor', 'gA', 'gB', 'rvSeen1', 'rvSeen2', 'rvAuth3', 'rvNoSidecar']) {
+    fs.rmSync(path.join(CACHE_DIR, vid), { recursive: true, force: true });
+  }
+  fs.rmSync(GIDX, { force: true });
+  fs.rmSync(BAGF, { force: true });
 }
 
 await prisma.$disconnect();

@@ -115,9 +115,17 @@ startup by the self-heal pass (§5) to the canonical `{CACHE_DIR}/{videoId}/`
 layout, so a relocation needs no manual DB surgery.
 
 The shared cache dir is **shared with GrabbyTube** — both projects write
-per-video folders under `cache/`. DrivePod's cleanup routines must therefore
-recognize GrabbyTube folders (a folder whose `{videoId}.json` contains a
-`videoId` key is GrabbyTube's and is never deleted).
+per-video folders under `cache/`, and DrivePod's cleanup routines may only treat
+a folder as its own when the sidecar proves it. The proof is GrabbyTube's
+**authorship marker**: a non-empty `createdAt` in `{videoId}.json`. GrabbyTube
+writes that key for every track it downloads and nothing else in that directory
+emits it (DrivePod's two sidecar writers — harvest and import — omit it), so
+`isGrabbyAuthored()` / `sidecarIsGrabbyAuthored()` are the single ownership test
+used at *every* decision: the cleanup orphan rule, the bag seed, the distribute
+candidate filter, the startup mislabel revert, and the T1 A14 audit. (Checking
+for a bare `videoId` key is NOT ownership evidence: DrivePod's own sidecar
+carries one too, which is exactly what catalogued 1,340 DrivePod folders as
+music.)
 
 ### 3.3 Entrypoint order (`entrypoint.sh`)
 
@@ -202,12 +210,16 @@ string; parsed at the read site). See §10 for the full live key table.
 
 ### Scale (live, 2026-10-16)
 
-- 768 channels; **308,749 video rows** — the large majority are
+- 975 channels; **310,027 video rows** — the large majority are
   `ignored: true` records created by the per-channel ignore sweeps (§7.4)
   and duration/pub-date filtering. Only **non-ignored** rows appear in
-  `index.json` (1,592 items, 1,016 unwatched).
-- 716 rows currently `isGrabby: true` (non-ignored).
-- 1,624 folders under `cache/` (DrivePod + GrabbyTube items + `rss/` +
+  `index.json` (1,502 items: 1,114 normal + 388 grabby).
+- Census 2026-11-15, after the ownership fix (§9): 464 rows the bare-sweep index
+  had flipped to `isGrabby` were reverted to normal videos at startup (their
+  sidecars carry no `createdAt`), 389 genuine library tracks stayed grabby, and
+  `grabby-index.json` went 2,057 → **717 entries** (GrabbyTube now indexes only
+  what it authored). 690 of the 1,114 normal rows are watched again.
+- 1,833 folders under `cache/` (DrivePod + GrabbyTube items + `rss/` +
   top-level JSON files).
 
 ---
@@ -382,8 +394,16 @@ unbounded error-reload loop after the fixed build was live on the server).
 
 ### 5.7 Startup sequence (bottom of file)
 
-1. If `index.json` is absent → write one immediately.
-2. `initShuffleBag()` (async, non-blocking).
+1. `revertForeignGrabbyRows()` (§9) — **first**, because it decides which rows
+   are music at all: it returns every `isGrabby` row whose own sidecar lacks
+   GrabbyTube's `createdAt` to the normal queue, restoring the `publishedAt` and
+   `channelId` the sidecar records (and recreating a sidecar channel that was
+   deleted, INACTIVE so it is never silently re-harvested). watched / progress /
+   ignored / protected are never touched. Rows with no sidecar, an unreadable
+   one, or an authored one stay grabby: without evidence the mix label is the
+   safer assumption.
+2. `initShuffleBag()` → `backfillGrabbyArtistChannels()`, chained after the
+   revert so neither runs against rows step 1 is about to return.
 3. `cron.schedule('*/5 * * * *', harvestAndPurge)` **and** one immediate
    `harvestAndPurge()`.
 4. `app.listen(3000)`.
@@ -396,8 +416,11 @@ Runs every 5 minutes and once at boot. Full sequence:
 
 1. **Re-entry guards** (`isHarvesting` / `isImporting`), reset `harvestStatus`.
 2. **`cleanupCorruptedFolders()`** (full consistency pass):
-   - Folder with **no** DB record: if its `{id}.json` has a `videoId` key it's
-     a GrabbyTube item → skip; otherwise delete as orphan.
+   - Folder with **no** DB record: if its `{id}.json` is GrabbyTube-authored
+     (`createdAt`, §3.2) it's a library track → skip (`🎵 GrabbyTube item
+     (skipping)`); otherwise delete as orphan. Keying on the marker instead of
+     "has a `videoId` key" is what reclaims DrivePod's own leftover folders
+     (11 folders / 1.1 GB on 2026-11-15) without ever touching music.
    - Folder **with** record but corrupt (empty, 0/2+ mp3s, 0/2+ `{id}.json`,
      >2 thumbnails): grabby → delete **DB row only, keep files**; normal →
      delete folder + row.
@@ -541,14 +564,15 @@ before checking ignored), and are the reason the table holds 300k+ rows.
 ```
 cache/
 ├── index.json                  # THE queue (non-ignored rows, merged w/ per-item JSON)
-├── grabby-index.json           # written by GRABBYTUBE — its catalog
+├── grabby-index.json           # written by GRABBYTUBE — only tracks it authored
 ├── shufflebag.json             # shufflebag state (this app)
 ├── rss/<channelId>.xml         # RSS fallback cache
 └── <videoId>/                  # one folder per item (DrivePod OR GrabbyTube)
     ├── <videoId>.mp3           # final audio
     ├── <videoId>-small.webp    # 400×225 thumbnail (DrivePod)
     ├── <videoId>.jpg|webp      # original thumbnail (may be removed post-transcode? kept)
-    └── <videoId>.json          # rich metadata (DrivePod: videoInfo; GrabbyTube: own shape)
+    └── <videoId>.json          # sidecar: DrivePod writes videoInfo; GrabbyTube its
+                                # own shape PLUS `createdAt` — the ownership marker
 ```
 
 Corruption definition (per §5.7-2): a valid DrivePod folder has exactly one
@@ -564,6 +588,9 @@ a duration ratio, so the player is never silent.
 **State**:
 - `grabby-index.json` — written by GrabbyTube (single writer):
   `{videoId, channelId, title, author, publishedAt: "YYYYMMDD", thumbnailPath, audioPath, duration, createdAt}`.
+  Only tracks GrabbyTube **authored** are listed (it rebuilds from the
+  authorship marker on its sidecar, §3.2) — DrivePod's videos share the cache
+  dir and are not music.
 - `shufflebag.json` — this app's FIFO state: `[{videoId, used}]`.
 - **`resolveGrabbyAudioPath(videoId, audioPath)`** — the single resolver
   for grabby file paths: returns the literal path (absolute as-is, relative
@@ -583,9 +610,10 @@ a duration ratio, so the player is never silent.
 
 **Lifecycle**:
 
-- **Init** (boot): upsert the placeholder channel; load grabby-index, drop
-  defunct items (`resolveGrabbyAudioPath()` finds no file), Fisher–Yates
-  shuffle, persist. In
+- **Init** (boot): upsert the placeholder channel; load grabby-index keeping
+  only **authored** entries (`isGrabbyAuthored`, §3.2 — a bare-`videoId` index
+  entry is not a music track), drop defunct items
+  (`resolveGrabbyAudioPath()` finds no file), Fisher–Yates shuffle, persist. In
   parallel, `backfillGrabbyArtistChannels()` re-points any grabby row still
   on a stale channel (e.g. pre-migration rows on bare `UCGrabbyTube`) to its
   per-artist channel using the index's `author`, and regenerates
@@ -648,7 +676,13 @@ a duration ratio, so the player is never silent.
        stopped the instant the duration was covered. Count parity is what forces
        the same budget across several tracks.
   6. Place the plan's picks (re-verifying each file via
-     `resolveGrabbyAudioPath()`):
+     `resolveGrabbyAudioPath()`). **Ownership guard at two points**: a candidate
+     whose DB row exists with `isGrabby: false` is refused (`⛔ … Refusing to
+     convert DrivePod's own video …`) — once when candidates are filtered, so the
+     planner never spends a slot on it and the bag entry rotates back un-used,
+     and again here, because a concurrent import can insert that row in between.
+     Converting such a row is precisely what flipped 464 watched videos into
+     permanent mix items (§5.7-1).
      - **already in DB → "recondition"**: update row with clustered
        `publishedAt` (`clusterTimestamp` = uniform inside the band, i.e. **at or
        below** the newest normal video), fresh title/thumb/duration,
@@ -672,8 +706,22 @@ newest normal content, and nothing was placed. The same band measured
 symmetrically reads grabby **0 s** → a 2594 s deficit → one best-fit track
 placed inside the band.
 
+**Authorship is the other load-bearing invariant**: the cache dir is shared, so
+"the file is in `cache/`" and "the index lists this videoId" are both **not**
+evidence that the item is music. Only the sidecar `createdAt` marker (§3.2) is,
+and every layer consults it — GrabbyTube's index rebuild, DrivePod's bag seed
+(`initShuffleBag` → `loadGrabbyIndex`), the cleanup orphan rule (§6-2), the
+distribute candidate filter, and the T1 A14 audit. When the marker was missing
+from every layer at once, the bare sweep indexed 2,057 "tracks" of which 1,340
+were DrivePod videos, and 464 of those had already been converted.
+
 **Guard rails** (the `isGrabby` safety rule):
 
+- Ownership of a shared-cache item is decided by the **authorship marker**, never
+  by folder location or by the index listing (§9 invariant above).
+- `distributeGrabbyItems` refuses to convert a `isGrabby:false` row (candidate
+  filter **and** placement), so a harvested video can never be flipped by a stale
+  index entry.
 - Auto-purge and purge-all filter `isGrabby:false`.
 - Channel delete skips grabby rows.
 - `cleanupCorruptedFolders` preserves grabby **files** (deletes DB row only).

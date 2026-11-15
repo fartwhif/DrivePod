@@ -13,8 +13,11 @@
   DB → `index.json` → `progress.json` consistency: ordering
   (`publishedAt desc, videoId asc`), set equality, audioPath resolvability
   for every non-ignored row, dead grabby-index refs (INFO only when the DB
-  row is ignored — the resolver/init exclude those by design). Run before
-  AND after a deploy; it is the "is content being missed" gate.
+  row is ignored — the resolver/init exclude those by design), and the grabby
+  **authorship marker** (A14/A14b: every `isGrabby` row must carry GrabbyTube's
+  `createdAt` sidecar marker and be listed in the authored index — a hard failure
+  either way). Run before AND after a deploy; it is the "is content being missed"
+  gate.
   CAUTION (2026-11-11): stored `Video.audioPath` values are the NEUTRAL container
   paths (`/cache/<id>/<id>.mp3`); the host-side audit maps them back onto this
   checkout via `hostPath()` — never compare a stored path to `ROOT/cache`
@@ -154,6 +157,27 @@
   distribute (pull + recondition) and the pre-insert recheck. NEVER rewrite
   `grabby-index.json` — GrabbyTube owns it; its `audioPath` values go stale
   when its cache moves, which is why we resolve at read time.
+- **Ownership is the sidecar `createdAt` marker, never the folder or the index
+  listing** (2026-11-15): `cache/` is shared, so "the file is there" and
+  "grabby-index.json lists this videoId" are NOT evidence that an item is music.
+  GrabbyTube stamps `createdAt` into every sidecar it writes and nothing else in
+  that directory does, so `isGrabbyAuthored()` (index entries) /
+  `sidecarIsGrabbyAuthored()` (folders) are the single test at every decision:
+  cleanup orphan rule, bag seed, distribute candidate filter, startup revert,
+  T1 A14. The bare-sweep index that used `videoId`-key presence as ownership
+  catalogued 1,340 DrivePod videos as tracks and had already flipped 464 of them
+  to `isGrabby` — which reset watched/progress, faked their date (so auto-purge
+  never reached them) and hid their real artist. Consequences to preserve:
+  `distributeGrabbyItems` **refuses to convert an `isGrabby:false` row** (both at
+  candidate filtering, so the planner spends no slot on it and the entry rotates
+  back un-used, and again at placement, because a concurrent import can insert
+  the row in between), and `revertForeignGrabbyRows()` runs FIRST at startup —
+  before the bag seed, the artist backfill and the first harvest — restoring
+  `publishedAt`/`channelId` from the sidecar and recreating a deleted channel as
+  INACTIVE (re-activating it would silently resume harvesting). Missing or
+  unreadable sidecar ⇒ stays grabby: without evidence the mix label is safer.
+  T2 section 16 asserts all of it. GrabbyTube's own `update_index_file()` rebuilds
+  from the same marker, so its index lists only what it authored (2,057 → 717).
 - **Grabby timestamps are OURS, and the band is measured symmetrically**
   (2026-11-12): a grabby row's `publishedAt` is a `clusterTimestamp()` draw
   **inside** the band — at or below the newest normal video — never a real upload
@@ -345,3 +369,24 @@ paired before/after headless-Chromium recipe. Verified in two real browser tabs
 serving the pre-fix and post-fix bundles side by side, then deployed via
 `docker compose up -d --build` — the deployed bundle is `main-EPSOMVDU.js` and
 T1 still PASSes.)
+Last updated (same day, second fix): the shared `cache/` dir had **no ownership
+test** — GrabbyTube's index was a bare sweep keyed on "the sidecar has a
+`videoId` key", which DrivePod's own sidecar also has, so 1,340 of its 2,057
+"tracks" were DrivePod videos and 464 had already been converted to
+`isGrabby:true` by reconditioning (watched/progress reset, real upload date
+replaced by a band draw so auto-purge never reached them, artist replaced by a
+placeholder channel). Ownership is now GrabbyTube's `createdAt` marker
+(`isGrabbyAuthored` / `sidecarIsGrabbyAuthored`) and is consulted at EVERY
+decision: GrabbyTube's index rebuild (2,057 → 717 entries), DrivePod's bag seed,
+the cleanup orphan rule (which reclaimed 11 DrivePod folders / 1.1 GB instead of
+skipping everything that looked grabby), the distribute candidate filter (a
+`isGrabby:false` row is refused twice — filter time and placement time — and its
+bag entry rotates back un-used), the startup `revertForeignGrabbyRows()` (runs
+FIRST, before the bag seed / artist backfill / first harvest; restores
+`publishedAt` + `channelId` from the sidecar, recreates a deleted channel
+INACTIVE, never touches watched/progress/ignored/protected; no sidecar ⇒ stays
+grabby) and T1 A14/A14b, which now FAIL on an unmarked grabby row or a grabby
+row the authored index dropped. T2 gained section 16 (17 assertions over the real
+compiled `initShuffleBag`/`distributeGrabbyItems`/`revertForeignGrabbyRows`;
+suite total 139). Deployed: both containers rebuilt + recreated, 464 rows back to
+normal (690 watched again, 1,114 normal + 388 grabby in the index), T1 PASS.

@@ -331,16 +331,14 @@ async function cleanupCorruptedFolders() {
     const videoRecord = await prisma.video.findUnique({ where: { videoId } });
 
     if (!videoRecord) {
-      // Check if this is a GrabbyTube item (has a per-item .json with videoId key)
-      const grabbyMeta = path.join(folderPath, `${videoId}.json`);
-      if (fs.existsSync(grabbyMeta)) {
-        try {
-          const meta = JSON.parse(fs.readFileSync(grabbyMeta, 'utf-8'));
-          if (meta.videoId) {
-            console.log(`   🎵 GrabbyTube item (skipping): ${videoId}`);
-            continue;
-          }
-        } catch { /* not valid JSON, fall through to orphan deletion */ }
+      // Only GrabbyTube's own folders are protected here. DrivePod writes a
+      // per-item .json for every video it harvests too, so "has a sidecar with a
+      // videoId" is not ownership evidence — the missing createdAt is (see
+      // isGrabbyAuthored). Without that, DrivePod's own leftovers from a deleted
+      // row sat undeleted forever, skipped as "GrabbyTube items".
+      if (sidecarIsGrabbyAuthored(folderPath, videoId)) {
+        console.log(`   🎵 GrabbyTube item (skipping): ${videoId}`);
+        continue;
       }
       console.log(`   🗑️ ORPHAN FOLDER (no DB Video entity): ${videoId}`);
       try { fs.rmSync(folderPath, { recursive: true, force: true }); await updateIndexFile(); } catch { }
@@ -359,8 +357,10 @@ async function cleanupCorruptedFolders() {
     let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 2;
 
     if (isCorrupted) {
-      // Check if this is a grabby item — protect its files on disk
-      const isGrabbyItem = videoRecord?.isGrabby === true;
+      // Protect the files only when BOTH the DB label and the sidecar marker say
+      // GrabbyTube: a mislabeled normal row must not keep an undeleted folder
+      // whose DB entry is being removed right here.
+      const isGrabbyItem = videoRecord?.isGrabby === true && sidecarIsGrabbyAuthored(folderPath, videoId);
 
       let reason = isEmpty ? 'Empty folder' : 'Unknown';
       if (mp3Count !== 1) reason = mp3Count === 0 ? 'No .mp3 file' : 'Multiple .mp3 files';
@@ -570,7 +570,7 @@ async function backfillGrabbyArtistChannels(): Promise<void> {
  * Load grabby-index.json, filter defunct items (MP3 missing),
  * Fisher-Yates shuffle, and persist to shufflebag.json.
  */
-async function initShuffleBag(): Promise<void> {
+export async function initShuffleBag(): Promise<void> {
   console.log(`🎵 [ShuffleBag] Initializing shufflebag...`);
 
   // Ensure GrabbyTube placeholder channel exists
@@ -586,13 +586,14 @@ async function initShuffleBag(): Promise<void> {
     return;
   }
 
-  const grabbyIndex: any[] = JSON.parse(fs.readFileSync(GRABBY_INDEX_PATH, 'utf-8'));
-
-  // Filter out defunct items (MP3 missing on disk). Items already in the DB
-  // stay in the bag on purpose: grabby tracks are reused indefinitely —
-  // distributeGrabbyItems reconditions existing rows instead of skipping them.
+  // Only entries GrabbyTube authored (see loadGrabbyIndex): the cache dir is
+  // shared with DrivePod, so an index built by a bare folder sweep lists
+  // DrivePod's own videos, and seeding the bag with them wastes a pull on
+  // every rotation. Items already in the DB stay in the bag on purpose: grabby
+  // tracks are reused indefinitely — distributeGrabbyItems reconditions
+  // existing rows instead of skipping them.
   const valid: ShuffleBagEntry[] = [];
-  for (const item of grabbyIndex) {
+  for (const item of loadGrabbyIndex().values()) {
     const mp3Path = resolveGrabbyAudioPath(item.videoId, item.audioPath);
     if (fs.existsSync(mp3Path)) {
       valid.push({ videoId: item.videoId, used: false });
@@ -695,16 +696,129 @@ export function reconcileShuffleBag(
 }
 
 /**
- * Load grabby-index.json and return it as a map videoId -> metadata.
+ * GrabbyTube's authorship marker. GrabbyTube owns `cache/<id>/<id>.json` for
+ * every track it downloads and stamps it with a non-empty `createdAt`;
+ * DrivePod's two sidecar writers (harvest, import) never emit that key.
+ * grabby-index.json is a sweep of those files, so the marker — not the mere
+ * existence of a sidecar — is what says "this folder is a GrabbyTube library
+ * track". Anything without it is DrivePod's own harvested video, whatever
+ * index happens to list it.
+ */
+export function isGrabbyAuthored(meta: any): boolean {
+  return !!meta && typeof meta === 'object' && String(meta.createdAt ?? '').trim() !== '';
+}
+
+/**
+ * Load grabby-index.json as a map videoId -> metadata, keeping only the
+ * entries GrabbyTube authored (see isGrabbyAuthored).
+ *
+ * The cache dir is shared with DrivePod, so an index built by a bare folder
+ * sweep lists videos another app owns. Treating those as music is exactly what
+ * flipped 462 normal rows into the grabby mix (watched state reset, real upload
+ * date replaced by a cluster draw, immune to auto-purge). Every consumer of the
+ * index — bag seeding, distribution, artist backfill, the startup revert — sees
+ * only library tracks.
  */
 function loadGrabbyIndex(): Map<string, any> {
   if (!fs.existsSync(GRABBY_INDEX_PATH)) return new Map();
   const grabbyIndex: any[] = JSON.parse(fs.readFileSync(GRABBY_INDEX_PATH, 'utf-8'));
   const map = new Map<string, any>();
+  let foreign = 0;
   for (const item of grabbyIndex) {
-    map.set(item.videoId, item);
+    if (isGrabbyAuthored(item)) map.set(item.videoId, item);
+    else foreign++;
+  }
+  if (foreign > 0) {
+    console.log(`🎵 [GrabbyIndex] Ignoring ${foreign} index entr(ies) without the GrabbyTube authorship marker (not library tracks)`);
   }
   return map;
+}
+
+/** Read a folder's per-item sidecar JSON; null when missing or unreadable. */
+function readSidecar(folderPath: string, videoId: string): unknown {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(folderPath, `${videoId}.json`), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when a folder's sidecar carries GrabbyTube's authorship marker — the
+ * only proof (used at every ownership decision) that the CONTENT of a folder in
+ * the shared cache belongs to GrabbyTube rather than to DrivePod's harvest.
+ */
+function sidecarIsGrabbyAuthored(folderPath: string, videoId: string): boolean {
+  return isGrabbyAuthored(readSidecar(folderPath, videoId));
+}
+
+/**
+ * Startup repair for the mislabeled grabby rows.
+ *
+ * grabby-index.json was built for years by a bare sweep of the shared cache, so
+ * it listed DrivePod's own videos too; reconditioning flipped each of those rows
+ * to `isGrabby: true`, which reset watched/progress, replaced the real upload
+ * date with a cluster draw inside the band (so auto-purge never reached them and
+ * they returned to the queue forever), and re-pointed them at artist placeholder
+ * channels.
+ *
+ * The sidecar is the ownership record: DrivePod wrote it, so it has no
+ * `createdAt` (see isGrabbyAuthored). For those rows this restores exactly what
+ * the sidecar says — `publishedAt` and `channelId` — and clears `isGrabby`. A
+ * row whose sidecar is missing, unreadable, or authored stays grabby: without
+ * evidence, the mix label is the safer assumption. watched / progress / ignored /
+ * protected are never touched — that is the listener's own state.
+ *
+ * Runs BEFORE the bag is seeded, the artist backfill and the first harvest, so
+ * nothing downstream re-mixes a row this has just returned.
+ */
+export async function revertForeignGrabbyRows(): Promise<{ reverted: number; unknown: number }> {
+  const rows = await prisma.video.findMany({
+    where: { isGrabby: true },
+    select: { id: true, videoId: true, channelId: true }
+  });
+  let reverted = 0;
+  let unknown = 0;
+  const recreated = new Set<string>();
+  for (const row of rows) {
+    const folderPath = path.join(CACHE_DIR, row.videoId);
+    const sidecar = readSidecar(folderPath, row.videoId);
+    if (!sidecar || typeof sidecar !== 'object' || isGrabbyAuthored(sidecar)) {
+      unknown++;
+      continue;
+    }
+    const data: Prisma.VideoUpdateInput = { isGrabby: false };
+    if ('publishedAt' in sidecar && typeof sidecar.publishedAt === 'string') {
+      const date = new Date(sidecar.publishedAt);
+      if (Number.isFinite(date.getTime())) data.publishedAt = date;
+    }
+    if ('channelId' in sidecar && typeof sidecar.channelId === 'string' && sidecar.channelId.trim() && sidecar.channelId !== row.channelId) {
+      const channel = await prisma.channel.findUnique({ where: { channelId: sidecar.channelId } });
+      if (channel) {
+        data.channel = { connect: { channelId: sidecar.channelId } };
+      } else if (!recreated.has(sidecar.channelId)) {
+        // The row's real channel was deleted while the row survived as grabby
+        // (channel delete only removes non-grabby rows). Recreate it INACTIVE:
+        // the videos need a channel to display their artist, but re-activating a
+        // channel the owner removed would silently resume harvesting it.
+        const artist = grabbyAuthor(sidecar);
+        await prisma.channel.upsert({
+          where: { channelId: sidecar.channelId },
+          update: {},
+          create: { channelId: sidecar.channelId, title: artist || sidecar.channelId, order: 999999, active: false }
+        });
+        recreated.add(sidecar.channelId);
+        data.channel = { connect: { channelId: sidecar.channelId } };
+      }
+    }
+    await prisma.video.update({ where: { id: row.id }, data });
+    reverted++;
+  }
+  if (reverted > 0 || unknown > 0) {
+    console.log(`🩹 [GrabbyMix] Reverted ${reverted} mislabeled grabby row(s) to normal videos (${unknown} grabby row(s) left alone: no DrivePod-authored sidecar)`);
+  }
+  if (reverted > 0) await updateIndexFile();
+  return { reverted, unknown };
 }
 
 /**
@@ -1001,10 +1115,29 @@ export async function distributeGrabbyItems(): Promise<void> {
   // instead of rotating back for another wasted pull. A record whose file is
   // missing stays in the bag: that can be transient (GrabbyTube moving its
   // cache), and the next run resolves the path again.
+  //
+  // Ownership: a videoId DrivePod harvested itself is not a library track, even
+  // when the index lists it (GrabbyTube may download a video the channels
+  // already carried, and the bare-sweep index used to list every DrivePod
+  // folder). Converting such a row flipped its label, reset watched/progress and
+  // replaced its real upload date with a cluster draw — which is how 464 watched
+  // videos came back into the queue forever, invisible to auto-purge. Refusing
+  // here rather than at placement time means the planner never spends a slot on
+  // it and the entry rotates back into the rotation un-used.
+  const rowLabels = new Map(
+    (await prisma.video.findMany({
+      where: { videoId: { in: pulled.map(p => p.videoId) } },
+      select: { videoId: true, isGrabby: true }
+    })).map(r => [r.videoId, r.isGrabby])
+  );
   const usable: { videoId: string; durationSec: number }[] = [];
   for (const entry of pulled) {
     const meta = grabbyMap.get(entry.videoId);
     if (!meta) continue; // catalog-dead: reconcile prunes it (see below)
+    if (rowLabels.get(entry.videoId) === false) {
+      console.log(`   ⛔ [ShuffleBag] Refusing to convert DrivePod's own video ${entry.videoId} into a grabby item`);
+      continue;
+    }
     const duration = meta.duration || 0;
     if (duration <= 0) continue;
     if (!fs.existsSync(resolveGrabbyAudioPath(entry.videoId, meta.audioPath))) continue;
@@ -1052,6 +1185,13 @@ export async function distributeGrabbyItems(): Promise<void> {
     const mp3Path = resolveGrabbyAudioPath(videoId, meta.audioPath);
 
     const existing = await prisma.video.findUnique({ where: { videoId } });
+    if (existing && !existing.isGrabby) {
+      // Ownership guard, re-checked at placement: a normal row can appear
+      // between the candidate filter and here (a concurrent import inserts
+      // rows), and converting one resets watched/progress and fakes its date.
+      console.log(`   ⛔ [ShuffleBag] Refusing to convert DrivePod's own video ${videoId} into a grabby item`);
+      continue;
+    }
     if (existing) {
       // Recondition the existing row: refresh its timestamp to cluster inside
       // the band and reset its playback state, so it re-enters the mix window
@@ -3365,13 +3505,19 @@ app.get('/api/stream/:videoId', async (req, res) => {
 });
 
 // === START ===
-initShuffleBag().then(() => {
-  console.log(`🎵 [ShuffleBag] Startup init complete`);
-});
-
-backfillGrabbyArtistChannels().catch((err: unknown) => {
-  console.error(`❌ [GrabbyArtists] Startup backfill failed:`, err instanceof Error ? err.message : err);
-});
+// The ownership revert runs FIRST: it decides which rows are music at all, so
+// the bag seed and the artist backfill must not run against rows this function
+// is about to return to the normal queue. (The first harvest is safe either way:
+// its cleanup keys on the sidecar marker, and distribute can only ever place a
+// candidate that the authored index lists.)
+revertForeignGrabbyRows()
+  .catch((err: unknown) => console.error(`❌ [GrabbyMix] Startup revert failed:`, err instanceof Error ? err.message : err))
+  .then(() => initShuffleBag())
+  .then(() => {
+    console.log(`🎵 [ShuffleBag] Startup init complete`);
+    return backfillGrabbyArtistChannels();
+  })
+  .catch((err: unknown) => console.error(`❌ [GrabbyArtists] Startup backfill failed:`, err instanceof Error ? err.message : err));
 
 cron.schedule('*/5 * * * *', harvestAndPurge);
 harvestAndPurge();
