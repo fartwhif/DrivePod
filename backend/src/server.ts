@@ -316,7 +316,45 @@ async function yieldToEventLoop() {
 }
 
 // === FULL CONSISTENCY CLEANUP ===
-async function cleanupCorruptedFolders() {
+/**
+ * Why THIS folder's file set is corrupted, or `null` when it is whole. Pure —
+ * no DB, no filesystem, no logging — so a test can hand it a name list and the
+ * cleanup can never disagree with that test.
+ *
+ * The audio file is counted by EXACT NAME (`<id>.mp3`), not by extension: a
+ * derivative living beside the original is somebody else's cache, not a second
+ * copy of our audio. Two derivatives are known here —
+ *   `<id>.mp3.tr64k.mp3`  FrogRock's target-format transcode cache, created by
+ *                         the RADIO broadcast of any track that isn't already
+ *                         64k/mono/24kHz, which is every GrabbyTube track
+ *                         because tunester delivers 160k/44.1k/stereo;
+ *   `<id>.mp3.bak`        GrabbyTube's backup of the file it replaced.
+ * Counting the first by extension read "Multiple .mp3 files" on a perfectly
+ * healthy track and deleted its DB row (files preserved), so the item left the
+ * queue, its watched/progress state went with the row, and the shufflebag
+ * re-seeded it as FRESH — already-played tracks coming back forever.
+ *
+ * Transients are tolerated for the same reason: `<id>.mp4.part` /
+ * `<id>.mp4.frag9.part` (a download in flight), `<id>.mp3.vbrfix.tmp`, the
+ * `<id>_metadata.ffmeta` ffmpeg feeds, and the downloaded `<id>.webm`/`.m4a`
+ * raw audio. A `.json` under a DIFFERENT name (`<id>-extra.json`) is somebody
+ * else's file, not our sidecar doubled — the sidecar is counted by exact name, and
+ * a live census of the owner's 1,832 cache folders found zero stray `.json` names,
+ * so nothing real depends on flagging it. Only the counts below decide.
+ */
+export function folderCorruptionReason(videoId: string, files: string[]): string | null {
+  if (files.length === 0) return 'Empty folder';
+  if (!files.includes(`${videoId}.mp3`)) return 'No .mp3 file';
+  const jsonCount = files.filter(f => f === `${videoId}.json`).length;
+  if (jsonCount !== 1) return jsonCount === 0 ? 'No .json file' : `Multiple .json files (${jsonCount})`;
+  // One thumbnail is what the harvest writes; one spare is tolerated because a
+  // re-thump can leave the original file beside the resized `-small.webp`.
+  const thumbCount = files.filter(f => /\.(webp|jpg|png)$/i.test(f)).length;
+  if (thumbCount > 2) return `Too many thumbnails (${thumbCount})`;
+  return null;
+}
+
+export async function cleanupCorruptedFolders() {
   console.log(`🧹 [${logTimestamp()}] Starting full consistency cleanup...`);
   if (!fs.existsSync(CACHE_DIR)) return;
 
@@ -348,24 +386,14 @@ async function cleanupCorruptedFolders() {
     let files: string[] = [];
     try { files = fs.readdirSync(folderPath); } catch { continue; }
 
-    const isEmpty = files.length === 0;
-    const mp3Count = files.filter(f => f.endsWith('.mp3')).length;
-    const thumbCount = files.filter(f => /\.(webp|jpg|png)$/i.test(f)).length;
-    const jsonCount = files.filter(f => f === `${videoId}.json`).length;
-    const otherCount = files.length - mp3Count - thumbCount - jsonCount;
+    const reason = folderCorruptionReason(videoId, files);
 
-    let isCorrupted = isEmpty || mp3Count !== 1 || jsonCount !== 1 || thumbCount > 2;
-
-    if (isCorrupted) {
+    if (reason) {
       // Protect the files only when BOTH the DB label and the sidecar marker say
       // GrabbyTube: a mislabeled normal row must not keep an undeleted folder
       // whose DB entry is being removed right here.
       const isGrabbyItem = videoRecord?.isGrabby === true && sidecarIsGrabbyAuthored(folderPath, videoId);
 
-      let reason = isEmpty ? 'Empty folder' : 'Unknown';
-      if (mp3Count !== 1) reason = mp3Count === 0 ? 'No .mp3 file' : 'Multiple .mp3 files';
-      else if (jsonCount !== 1) reason = jsonCount === 0 ? 'No .json file' : 'Multiple .json files';
-      else if (thumbCount > 2) reason = `Too many thumbnails (${thumbCount})`;
       console.log(`   🚨 CORRUPTED: ${videoId} → ${reason}${isGrabbyItem ? ' (🎵 grabby — preserving files)' : ''}`);
       try {
         if (!isGrabbyItem) {
@@ -3534,9 +3562,20 @@ app.delete('/api/video/:videoId/grabby', async (req, res) => {
   // deleted) is neutralized by updateIndexFile()'s defunct-grabby filter, which
   // also self-heals deletes made directly from the GrabbyTube UI.
 
+  // A missing DB row is NOT "unknown track", and answering 404 here was a real
+  // robustness bug rather than a meaningful signal: the row is also absent when
+  // something else already consumed the track (cleanup, the defunct filter in
+  // updateIndexFile, a delete made from the GrabbyTube UI, or a second tab),
+  // while the caller's index.json copy — regenerated only on a harvest — still
+  // lists it. The folder's sidecar is the ownership record, so when it carries
+  // GrabbyTube's marker the track IS a library track and the consume still
+  // lands: the remote delete runs, the bag entry goes, and the caller drops it
+  // locally instead of being told to try again on an id that will never appear.
   const video = await prisma.video.findUnique({ where: { videoId } });
-  if (!video) return res.status(404).json({ error: 'Video not found' });
-  if (!video.isGrabby) return res.status(400).json({ success: false, error: 'Not a GrabbyTube item' });
+  if (video && !video.isGrabby) return res.status(400).json({ success: false, error: 'Not a GrabbyTube item' });
+  if (!video && !sidecarIsGrabbyAuthored(path.join(CACHE_DIR, videoId), videoId)) {
+    return res.status(404).json({ error: 'Video not found' });
+  }
 
   // Remote delete (GrabbyTube owns its catalog/index/files — single writer).
   // 200 = deleted, 404 = already gone remotely (treat as success).

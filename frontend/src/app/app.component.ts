@@ -1,5 +1,5 @@
 import { Component, signal, OnInit, effect, OnDestroy, AfterViewInit, ViewChild, ElementRef, inject, NgZone } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import {
@@ -12,6 +12,7 @@ import {
   stallResumeTarget,
   streamTrackId
 } from './stall-guard';
+import { AutoplayMode, manualNextMode, pickNextTrack } from './autoplay-order';
 import { Title } from '@angular/platform-browser';
 
 interface Video {
@@ -148,12 +149,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    lowBandwidthMode = signal(false);
 
    // 5-WAY AUTOPLAY MODE
-   autoplayMode = signal<'newest' | 'newer' | 'older' | 'oldest' | 'off'>('newest');
+   autoplayMode = signal<AutoplayMode>('newest');
 
    // SKIP MARKS WATCHED: treat skip-next as if the track finished playing
    skipMarksWatched = signal(false);
 
-  private readonly APP_VERSION = '1.10.0';   // ← bumped for the playback stall watchdog
+  private readonly APP_VERSION = '1.14.0';   // ← bumped for consume advancing the player
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched'>('queue');
   protectedPlaylist = signal<Video[]>([]);
@@ -474,18 +475,49 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    *  the Delete hotkey so behavior can never diverge. */
   consumeGrabbyTrack(videoId: string) {
     this.http.delete(`${this.apiUrl}/video/${videoId}/grabby`).subscribe({
-      next: () => {
-        // DB record already deleted server-side. Drop it from rawIndex FIRST so every
-        // tab reflects the deletion locally (no re-fetch), then advance like a normal
-        // completion. markAsWatchedAndPlayNext()'s own queue-filter becomes a no-op since
-        // the item is already gone, and its candidate pick correctly skips the deleted id.
-        this.removeLocalVideo(videoId);
-        this.markAsWatchedAndPlayNext();
-      },
-      error: (err: any) => {
-        alert(err?.error?.error || err?.message || 'Delete failed — try again');
+      next: () => this.consumedGrabbyTrack(videoId),
+      error: (err: HttpErrorResponse) => {
+        // 404 means there was nothing left to delete: the row is also absent when
+        // the track was already consumed by something else — integrity cleanup,
+        // updateIndexFile's defunct filter, a delete made from the GrabbyTube UI,
+        // or a second tab — while this tab's index.json copy (regenerated only on
+        // a harvest) still lists it. The item is gone either way, so dropping it
+        // locally and advancing is exactly what a successful delete does. Alerting
+        // "Video not found" left the row in the queue and asked the user to retry
+        // an id that would never come back.
+        if (err.status === 404) {
+          this.consumedGrabbyTrack(videoId);
+          return;
+        }
+        alert(err.error?.error || err.message || 'Delete failed — try again');
       }
     });
+  }
+
+  /**
+   * The consume landed — or the track turned out to be gone already. Drop it from
+   * this tab's copy, and when it was the track playing here, stop the element and
+   * advance the way the autoplay mode asks.
+   *
+   * Order is the whole point. `removeLocalVideo()` clears `currentVideo` (the item
+   * this tab was playing is gone), and `markAsWatchedAndPlayNext()` returns on its
+   * first line when `currentVideo` is null — so calling it AFTER the removal, as
+   * this handler used to, advanced nothing at all: pressing Delete on the track
+   * that was playing blanked the player and left the deleted file audible until it
+   * ran out. The reference for the step has to be snapshotted BEFORE the removal,
+   * and only a tab that was actually playing this id has playback to advance.
+   *
+   * No watched POST: the row is gone on the server — that IS the consume — so
+   * marking it watched would only queue retries against a 404. `_localWatched`
+   * loses the id with it, which is right: nothing left to pin.
+   */
+  private consumedGrabbyTrack(videoId: string): void {
+    const playing = this.currentVideo();
+    const left = playing?.videoId === videoId ? playing : undefined;
+
+    this.removeLocalVideo(videoId);
+
+    if (left) this.stopAndAdvance(left, this.autoplayMode());
   }
 
   // === Index-based client-side paging ===
@@ -1198,34 +1230,15 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.playbackPhase.set('idle');
   }
 
-  setAutoplayMode(mode: 'newest' | 'newer' | 'older' | 'oldest' | 'off') {
+  setAutoplayMode(mode: AutoplayMode) {
     this.autoplayMode.set(mode);
     localStorage.setItem('drivepod-autoplayMode', mode);
-  }
-
-  /**
-   * Pick the next track for 'older'/'newer' autoplay. The finished track is
-   * still in the list (rawIndex only changes on the next index load), so it
-   * is excluded by videoId — which also allows <=/>= so same-timestamp
-   * siblings (batched imports, grabby cluster bands) are not silently
-   * skipped: with strict </> they could never be picked by autoplay.
-   */
-  private getCandidate(playlist: Video[], mode: 'newer' | 'older', finishedTime: number, finishedId: string): Video | undefined {
-    if (mode === 'older') {
-      return playlist.find(v => v.videoId !== finishedId && new Date(v.publishedAt).getTime() <= finishedTime);
-    }
-    if (mode === 'newer') {
-      const newerOnes = playlist.filter(v => v.videoId !== finishedId && new Date(v.publishedAt).getTime() >= finishedTime);
-      if (newerOnes.length > 0) return newerOnes[newerOnes.length - 1];
-    }
-    return undefined;
   }
 
   markAsWatchedAndPlayNext() {
     if (!this.currentVideo()) return;
     const finishedVideo = this.currentVideo()!;
     const finishedVideoId = finishedVideo.videoId;
-    const finishedPublishedAt = new Date(finishedVideo.publishedAt).getTime();
 
     // Remember until the server confirms persistence (survives blackhole retries)
     this._localWatched.add(finishedVideoId);
@@ -1273,21 +1286,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       // holds it, and its watched POST may still be queued for retry) as
       // watched, so it never re-enters the new queue.
       this.currentVideo.set(null);
-      this._playFreshest();
+      this._playFreshest(finishedVideo);
       return;
     }
 
-    // newer/older/oldest modes
-    const queue = this.getQueueVideos();
-    let candidate: Video | undefined;
-
-    if (mode === 'oldest') {
-      if (queue.length > 0) {
-        candidate = queue[queue.length - 1];
-      }
-    } else {
-      candidate = this.getCandidate(queue, mode, finishedPublishedAt, finishedVideoId);
-    }
+    // newer/older/oldest: the nearest neighbour in the chosen direction, from
+    // the FULL queue (getQueueVideos, not the page slice the user is looking at).
+    const candidate = pickNextTrack(this.getQueueVideos(), mode, finishedVideo);
 
     if (candidate) {
       this.currentVideo.set(null);
@@ -1295,9 +1300,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    // No local candidates — reload index and play when ready
+    // Nothing left in that direction locally — reload index and try again.
+    // 'oldest'/'newest' can never reach here with a non-empty queue, so this
+    // is the exhausted-direction case: the refresh may have a new track.
     this.currentVideo.set(null);
-    this._loadIndexAndPlay();
+    this._loadIndexAndPlay(finishedVideo);
   }
 
   getVideoLinkUrl(video: Video): string {
@@ -1305,53 +1312,53 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     return `https://www.youtube.com/watch?v=${video.videoId}${t > 0 ? `&t=${t}s` : ''}`;
   }
 
+  /**
+   * Manual ⏭️ — the button, and `nexttrack` from a car head-unit.
+   *
+   * With skip-marks-watched on this IS the finish path: the left track is marked
+   * watched and `markAsWatchedAndPlayNext` already honours the mode. With it off
+   * the track stays in the queue unwatched, so the mode is applied here through
+   * the same `pickNextTrack` autoplay uses, under `manualNextMode` — 'off' steps
+   * one item older (see that function's comment). It used to play
+   * `playlist[idx + 1]`, a NEIGHBOUR IN NEWEST-FIRST LIST ORDER: not what
+   * 'older'/'oldest'/'newer' ask for, and with 'off' it re-picked a track the
+   * user had just pressed Next away from whenever the list shifted under it.
+   */
   skipNext() {
-     // When skipMarksWatched is enabled, treat skip as if the track just finished
-     if (this.skipMarksWatched() && this.currentVideo()) {
-       this.saveProgress(this.audio.duration || this.audio.currentTime || 0);
-       this.markAsWatchedAndPlayNext();
-       return;
-     }
-
-     const idx = this.playlist().findIndex(v => v.videoId === this.currentVideo()?.videoId);
-     if (idx < this.playlist().length - 1) {
-       // Stop current audio before probing next track (probe may fail offline)
-       this.audio.pause();
-       this.audio.src = '';
-       this.playVideo(this.playlist()[idx + 1]);
-     } else {
-       this.currentVideo.set(null);
-       this.updatePageTitle(null);
-       this.saveCurrentVideo(null);
-       this.resetQueuePage();
-       // Stop audio when player is visually hidden
-       this.audio.pause();
-       this.audio.src = '';
-       this.setMediaPlaybackState('none');
-     }
-   }
-
-  skipPrevious() {
-    if (!this.currentVideo()) return;
-
-    const currentId = this.currentVideo()!.videoId;
-    const playlist = this.playlist();
-    const idx = playlist.findIndex(v => v.videoId === currentId);
-
-    if (idx > 0) {
-      // Stop current audio before probing previous track (probe may fail offline)
-      this.audio.pause();
-      this.audio.src = '';
-      this.playVideo(playlist[idx - 1]);
-    } else {
-      this.audio.currentTime = 0;
-      if (this.audio.paused) {
-        this.audio.play();
-        // Explicit play intent: a replay from the start should also resume
-        // after a network drop, even if the track was paused before it.
-        this._wasPlayingBeforeDrop = true;
-      }
+    // When skipMarksWatched is enabled, treat skip as if the track just finished
+    if (this.skipMarksWatched() && this.currentVideo()) {
+      this.saveProgress(this.audio.duration || this.audio.currentTime || 0);
+      this.markAsWatchedAndPlayNext();
+      return;
     }
+
+    this.stopAndAdvance(this.currentVideo() ?? undefined, manualNextMode(this.autoplayMode()));
+  }
+
+  /**
+   * Stop the element, clear the track playing in this tab, then advance to what
+   * MODE wants next. Shared by the manual ⏭️ and by consuming the track that is
+   * playing here, so the two can never leave the player in different states.
+   *
+   * `left` is the track being abandoned — the reference a relative step measures
+   * from, excluded by id so NO mode hands it straight back. `currentVideo` is
+   * read into it by the caller when the track is already gone from this tab's
+   * index copy (a consume), because clearing it here would lose that reference.
+   *
+   * Stop and clear BEFORE probing the next track (the probe may fail offline): a
+   * candidate then arrives through playVideo → _tryPlay, which re-arms the
+   * watchdog. The element must be silenced even though a consume leaves its file
+   * on disk: the backend deletes the row, the index entry and the bag slot, so
+   * continuing to play it would play a track the library no longer has.
+   */
+  private stopAndAdvance(left: Video | undefined, mode: AutoplayMode): void {
+    this.audio.pause();
+    this.audio.src = '';
+    this.setMediaPlaybackState('none');
+    this.updatePageTitle(null);
+    this.currentVideo.set(null);
+    this.saveCurrentVideo(null);
+    this.advanceToNextTrack(left, mode);
   }
 
   loadChannels() {
@@ -1395,7 +1402,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     });
     navigator.mediaSession.setActionHandler('pause', () => this.audio.pause());
     navigator.mediaSession.setActionHandler('nexttrack', () => this.skipNext());
-    navigator.mediaSession.setActionHandler('previoustrack', () => this.skipPrevious());
   }
 
   private updateMediaSession(video: Video | null) {
@@ -1477,16 +1483,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     const queue = this.getQueueVideos();
     if (queue.length === 0) return;
 
-    let video: Video;
+    // The saved track wins when it is still in the queue: the user left mid-
+    // track, and resuming it beats any ordering. Only without one does the
+    // mode choose, and pickNextTrack's no-finished rule starts a direction mode
+    // at the END OF THE TIMELINE IT TRAVELS ALONG — 'older' at the oldest, so
+    // walking backwards actually has somewhere to walk. Hard-coding the head
+    // here is what made 'older' look ignored on a fresh page load.
     const savedId = this.currentVideoId();
-
-    if (savedId) {
-      video = queue.find(v => v.videoId === savedId) || queue[0];
-    } else if (mode === 'oldest') {
-      video = queue[queue.length - 1];
-    } else {
-      video = queue[0];
-    }
+    // The `|| queue[0]` covers the only undefined pickNextTrack can return with a
+    // non-empty queue and no finished track: every publishedAt unparseable,
+    // which is a junk index where the head is as good a start as any.
+    const video: Video = (savedId && queue.find(v => v.videoId === savedId))
+      || pickNextTrack(queue, mode) || queue[0];
 
     // The one load path: it sets the source, arms the liveness watchdog and
     // resumes at `video.progress` (fresh track: no live position to keep).
@@ -1588,7 +1596,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                       this.audio.pause();
                       this.audio.src = '';
                       this.setMediaPlaybackState('none');
-                      this.advanceToNextTrack();
+                      this.advanceToNextTrack(video);
                     } else if (res2.ok) {
                       // Bounded: the failure counter skips a track that keeps
                       // failing to load; otherwise one more reload attempt.
@@ -1608,7 +1616,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                     this.audio.pause();
                     this.audio.src = '';
                     this.setMediaPlaybackState('none');
-                    this.advanceToNextTrack();
+                    this.advanceToNextTrack(video);
                   });
               });
             }
@@ -1677,7 +1685,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     const mode = this.autoplayMode();
     if (mode !== 'off') {
-      this.advanceToNextTrack();
+      // The defunct track IS the reference for the step: without it a relative
+      // mode restarts at the wrong end of the timeline, and the same broken
+      // region gets re-entered. It is still in rawIndex (only `playlist` was
+      // filtered above), and pickNextTrack excludes it by id.
+      this.advanceToNextTrack(finishedVideo);
     }
   }
 
@@ -1838,28 +1850,46 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.resumeGraceUntil = Date.now() + RESUME_DETECT_MS;
   }
   /**
-   * 'newest' advance: refresh the index, then play the head of the queue.
+   * The freshest track still playable, or undefined when nothing is left.
+   *
+   * `exclude` is the track being left behind, dropped BY ID: same-timestamp
+   * siblings of a grabby cluster band stay pickable, which is what the
+   * timestamp-based filters could not do without stalling the queue.
+   */
+  private _nextLeft(exclude?: Video): Video | undefined {
+    const queue = this.getQueueVideos();
+    // pickNextTrack answers undefined for an empty queue, or when every
+    // publishedAt is unparseable; the list's own order is the last resort.
+    return pickNextTrack(queue, 'newest', exclude)
+      ?? queue.find(v => !exclude || v.videoId !== exclude.videoId);
+  }
+
+  /**
+   * 'newest' advance: refresh the index, then play the freshest track left.
    *
    * A head-only pick from the cached playlist plays 'newest as of the last
    * poll', not newest: a track harvested or downloaded since that poll is not
    * in the cache at all. So every advance re-fetches first — cheap, because
    * index.json 304s (byte-stable + no-cache) whenever nothing changed — and
-   * plays from the merged result, where a fresh item is finally visible. The
-   * just-finished track stays out through mergeIndexWithLocal's _localWatched
-   * pin; there is deliberately NO finishedId exclusion, so the same-timestamp
-   * siblings of a grabby cluster band (batched imports re-draw a fresh date)
-   * remain pickable — with strict 'newer than the finished track' they were
-   * the reason autoplay used to stall, and 'newest' never filtered by it.
+   * plays from the merged result, where a fresh item is finally visible.
+   *
+   * `exclude` is the track being left — one that just ended, failed, or was
+   * skipped by hand — and it is dropped by ID from the fresh queue too. A
+   * manual ⏭️ with skip-marks-watched OFF leaves it UNWATCHED, so the refresh
+   * still lists it and a head-only pick would hand it straight back; the
+   * just-finished track is pinned watched by mergeIndexWithLocal's
+   * _localWatched anyway, so passing it there is belt and braces.
    *
    * A dead backend must not hard-stop a playing queue: offline, or when the
    * refresh itself fails, play the freshest the cache still has. Deferring
    * (indexFetchPending) is reserved for the no-cache case — the existing
    * connectivity-resume path replays once the backend returns.
    */
-  private _playFreshest(): void {
+  private _playFreshest(exclude?: Video): void {
     if (!this.backendOnline) {
       this.indexFetchPending = true;
-      if (this.playlist().length > 0) this.playVideo(this.playlist()[0]);
+      const offline = this._nextLeft(exclude);
+      if (offline) this.playVideo(offline);
       return;
     }
 
@@ -1870,18 +1900,28 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.rawIndex.set(this.mergeIndexWithLocal(data));
         this.derivePlaylists();
         if (this.autoplayMode() !== 'newest') return; // mode flipped mid-fetch
-        const queue = this.getQueueVideos();
-        if (queue.length > 0) this.playVideo(queue[0]);
+        const freshest = this._nextLeft(exclude);
+        if (freshest) this.playVideo(freshest);
       })
       .catch(() => {
-        // Refresh failed: roll to the cached head rather than stopping.
-        if (this.playlist().length > 0) this.playVideo(this.playlist()[0]);
+        // Refresh failed: roll to the freshest the cache has rather than stopping.
+        const cached = this._nextLeft(exclude);
+        if (cached) this.playVideo(cached);
         else this.indexFetchPending = true;
       });
   }
 
-  /** Reload index and automatically play the first available track when ready. */
-  private _loadIndexAndPlay(): void {
+  /**
+   * Reload the index, then play what the MODE wants from the refreshed queue.
+   *
+   * `finished` is the track that just ended/failed, when there was one: the
+   * relative modes need it as their reference point, and it is excluded by id,
+   * so a defunct track that the refresh still lists cannot be re-played. With
+   * none, the pick starts at the end of the timeline the mode travels along.
+   * The mode is read AFTER the fetch on purpose — a Settings change made while
+   * the request was in flight must be the one honoured.
+   */
+  private _loadIndexAndPlay(finished?: Video): void {
     if (!this.backendOnline) {
       this.indexFetchPending = true;
       return;
@@ -1900,13 +1940,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         const mode = this.autoplayMode();
         if (mode !== 'off') {
           const queue = this.getQueueVideos();
-          if (queue.length > 0) {
-            if (mode === 'oldest') {
-              this.playVideo(queue[queue.length - 1]);
-            } else {
-              this.playVideo(queue[0]);
-            }
-          }
+          const candidate = pickNextTrack(queue, mode, finished);
+          if (candidate) this.playVideo(candidate);
         }
       })
       .catch(err => {
@@ -1916,27 +1951,34 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       });
   }
 
-  /** Advance to next track based on autoplay mode. */
-  private advanceToNextTrack(): void {
-    const mode = this.autoplayMode();
+  /**
+   * Advance to the next track the autoplay mode asks for.
+   *
+   * `finished` is the track being left behind — one that just ended, failed to
+   * play, or was skipped by hand. It is the reference for a relative step: pass
+   * nothing and 'older'/'newer' lose their direction and restart at the timeline
+   * end, which is how a broken track used to drag the queue back to the same
+   * region; pass it and NO mode can return it, 'newest'/'oldest' included.
+   * @param mode the mode to advance under: the autoplay setting by default, or
+   *        `manualNextMode(autoplayMode)` for the manual ⏭️.
+   */
+  private advanceToNextTrack(finished?: Video, mode: AutoplayMode = this.autoplayMode()): void {
     if (mode === 'off') return;
 
     if (mode === 'newest') {
-      this._playFreshest();
+      this._playFreshest(finished);
       return;
     }
 
-    const queue = this.getQueueVideos();
-    if (queue.length > 0) {
-      if (mode === 'oldest') {
-        this.playVideo(queue[queue.length - 1]);
-      } else {
-        this.playVideo(queue[0]);
-      }
+    const candidate = pickNextTrack(this.getQueueVideos(), mode, finished);
+    if (candidate) {
+      this.playVideo(candidate);
     } else {
-      this._loadIndexAndPlay();
+      // Nothing locally in that direction: a refresh may have a new track
+      // (harvest/download since the last poll) that satisfies it.
+      this._loadIndexAndPlay(finished);
     }
-}
+  }
 
   setTab(tab: 'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched') {
     this.activeTab.set(tab);

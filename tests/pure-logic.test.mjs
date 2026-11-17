@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import http from 'node:http';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1149,6 +1150,213 @@ exit 0`);
 
   await prisma.video.deleteMany({ where: { videoId: { startsWith: 'sb' } } });
   for (const vid of ['sbUnwatched', 'sbWatched', 'sbWatchedNorm', 'swA', 'swB']) {
+    fs.rmSync(path.join(CACHE_DIR, vid), { recursive: true, force: true });
+  }
+  fs.rmSync(GIDX, { force: true });
+  fs.rmSync(BAGF, { force: true });
+}
+
+// ── 18. a derivative file is not corruption — and a vanished row is not a 404 ──
+// The "it doesn't remember what I watched" report and the Delete key's "not
+// found" alert are the same bug. The integrity cleanup counted .mp3 BY
+// EXTENSION, so FrogRock's broadcast transcode — `<id>.mp3.tr64k.mp3`, written
+// the first time the RADIO plays any track that isn't already 64k/mono/24kHz,
+// which is every GrabbyTube track because tunester delivers 160k/44.1k/stereo —
+// read as "Multiple .mp3 files" on a perfectly healthy track. The DB row was
+// deleted (files preserved), taking its watched/progress state with it, and
+// initShuffleBag then seeded the folder as FRESH: a track the user had already
+// heard was back in the rotation forever. Delete answered 404 on exactly such a
+// track — the row was already gone while index.json still listed it.
+{
+  const GIDX = path.join(CACHE_DIR, 'grabby-index.json');
+  const BAGF = path.join(CACHE_DIR, 'shufflebag.json');
+  await prisma.video.deleteMany({});
+  await prisma.channel.deleteMany({ where: { channelId: { startsWith: 'UCGrabbyTube' } } });
+
+  const now = Date.now();
+  const DAY = 86400000;
+  const iso = (ago) => new Date(now - ago).toISOString();
+  const readBag = () => JSON.parse(fs.readFileSync(BAGF, 'utf-8'));
+  const realLog = console.log;
+  const quiet = async (fn) => {
+    const lines = []; console.log = (...a) => lines.push(a.join(' '));
+    try { await fn(); } finally { console.log = realLog; } return lines;
+  };
+  const corrupt = (lines) => lines.filter(l => l.includes('CORRUPTED')).join(' | ');
+  // A library track's folder, exactly as GrabbyTube + FrogRock leave it.
+  const putTrack = (vid, extras = [], authored = true) => {
+    const dir = path.join(CACHE_DIR, vid);
+    fs.mkdirSync(dir, { recursive: true });
+    // An ID3 head: the post-publish header check runs on a NORMAL row's file,
+    // and 0x41 filler would read as "junk at file start".
+    fs.writeFileSync(path.join(dir, `${vid}.mp3`),
+      Buffer.concat([Buffer.from('ID3\x04\x00\x00\x00\x00\x00\x00', 'binary'), Buffer.alloc(1014, 0x41)]));
+    fs.writeFileSync(path.join(dir, `${vid}-thumb.webp`), Buffer.alloc(64, 0x42));
+    for (const n of extras) fs.writeFileSync(path.join(dir, n), Buffer.alloc(1024, 0x43));
+    const meta = { videoId: vid, title: `Track ${vid}`, author: 'Track Artist', duration: 900,
+      channelId: 'UCOwnChan', publishedAt: '2024-05-01T00:00:00.000Z',
+      audioPath: `${vid}/${vid}.mp3` };
+    if (authored) meta.createdAt = iso(DAY);
+    fs.writeFileSync(path.join(dir, `${vid}.json`), JSON.stringify(meta));
+  };
+  const putRow = (vid, extra = {}) => prisma.video.create({
+    data: { videoId: vid, channelId: 'UCGrabbyTube', title: `Row ${vid}`,
+      publishedAt: new Date(now - 3600000), audioPath: `/cache/${vid}/${vid}.mp3`,
+      duration: 900, isGrabby: true, ...extra }
+  });
+  const catEntry = (vid) => ({ videoId: vid, title: `Track ${vid}`, author: 'Track Artist',
+    duration: 900, audioPath: `${vid}/${vid}.mp3`, createdAt: iso(DAY) });
+
+  // ── the verdict is about the FILE SET, never an extension count ──
+  const WHOLE = ['cA.mp3', 'cA.json', 'cA-thumb.webp'];
+  t('verdict: a whole folder is whole', server.folderCorruptionReason('cA', WHOLE) === null);
+  t('verdict: FrogRock\'s broadcast transcode beside the original is NOT corruption',
+    server.folderCorruptionReason('cA', [...WHOLE, 'cA.mp3.tr64k.mp3']) === null);
+  t('verdict: GrabbyTube\'s backup of the file it replaced is not corruption either',
+    server.folderCorruptionReason('cA', [...WHOLE, 'cA.mp3.bak']) === null);
+  t('verdict: in-flight downloads and ffmpeg side files are tolerated',
+    server.folderCorruptionReason('cA', [...WHOLE, 'cA.mp4.part', 'cA.mp4.frag9.part',
+      'cA.mp3.vbrfix.tmp', 'cA_metadata.ffmeta', 'cA.webm', 'cA.m4a']) === null);
+  t('verdict: an empty folder is corruption', server.folderCorruptionReason('cB', []) === 'Empty folder');
+  t('verdict: a missing audio file is named as one, backup or no backup',
+    server.folderCorruptionReason('cB', ['cB.json', 'cB.mp3.bak']) === 'No .mp3 file');
+  t('verdict: no sidecar is named as one', server.folderCorruptionReason('cB', ['cB.mp3']) === 'No .json file');
+  t('verdict: a FOREIGN .json beside ours is not corruption — it is somebody else\'s file',
+    server.folderCorruptionReason('cB', ['cB.mp3', 'cB.json', 'cB-extra.json']) === null);
+  t('verdict: a third thumbnail is corruption',
+    server.folderCorruptionReason('cB', ['cB.mp3', 'cB.json', 'a.webp', 'b.jpg', 'c.png']) === 'Too many thumbnails (3)');
+
+  // ── end to end: the cleanup leaves a broadcast track's row and state ALONE ──
+  await prisma.channel.upsert({
+    where: { channelId: 'UCGrabbyTube' }, update: {},
+    create: { channelId: 'UCGrabbyTube', title: 'GrabbyTube', order: 999999, active: false }
+  });
+  putTrack('clPlayed', ['clPlayed.mp3.tr64k.mp3']);                    // radio played it
+  putTrack('clBaked', ['clBaked.mp3.tr64k.mp3', 'clBaked.mp3.bak']);   // + tunester replaced its file
+  putTrack('clFresh', ['clFresh.mp3.tr64k.mp3']);                      // never played
+  putTrack('clNoAudio');
+  fs.rmSync(path.join(CACHE_DIR, 'clNoAudio/clNoAudio.mp3'), { force: true });  // genuinely broken
+  await putRow('clPlayed', { watched: true, progress: 600 });
+  await putRow('clBaked', { watched: true, progress: 900 });
+  await putRow('clFresh');
+  await putRow('clNoAudio', { watched: true, progress: 120 });
+  fs.writeFileSync(GIDX, JSON.stringify(['clPlayed', 'clBaked', 'clFresh', 'clNoAudio'].map(catEntry)));
+  fs.writeFileSync(BAGF, JSON.stringify(['clPlayed', 'clBaked', 'clFresh', 'clNoAudio']
+    .map(v => ({ videoId: v, used: false }))));
+
+  const clLines = await quiet(() => server.cleanupCorruptedFolders());
+  t('cleanup: a played broadcast track keeps its row (the fix)',
+    !clLines.some(l => l.includes('CORRUPTED: clPlayed')), corrupt(clLines));
+  t('cleanup: the track carrying a backup copy keeps its row too',
+    !clLines.some(l => l.includes('CORRUPTED: clBaked')), corrupt(clLines));
+  t('cleanup: a folder whose audio is REALLY gone is still diagnosed',
+    clLines.some(l => l.includes('CORRUPTED: clNoAudio → No .mp3 file')), corrupt(clLines));
+
+  const cl1 = await prisma.video.findUnique({ where: { videoId: 'clPlayed' } });
+  const cl4 = await prisma.video.findUnique({ where: { videoId: 'clNoAudio' } });
+  t('the watched/progress state survives with the row',
+    !!cl1 && cl1.watched === true && cl1.progress === 600 && cl1.isGrabby === true,
+    JSON.stringify(cl1 && { watched: cl1.watched, progress: cl1.progress, isGrabby: cl1.isGrabby }));
+  t('a broken grabby folder still loses its row', !cl4, JSON.stringify(cl4));
+  t('the derivative files are left alone — they are somebody else\'s cache',
+    fs.existsSync(path.join(CACHE_DIR, 'clPlayed/clPlayed.mp3.tr64k.mp3')) &&
+    fs.existsSync(path.join(CACHE_DIR, 'clBaked/clBaked.mp3.bak')) &&
+    fs.existsSync(path.join(CACHE_DIR, 'clNoAudio/clNoAudio.json')));
+  t('and the original audio of a preserved folder is never touched',
+    fs.existsSync(path.join(CACHE_DIR, 'clNoAudio/clNoAudio-thumb.webp')));
+
+  const seedLines = await quiet(() => server.initShuffleBag());
+  const seeded = readBag().map(e => e.videoId).sort();
+  t('rotation: the played tracks stay OUT of the bag now that their rows survived',
+    JSON.stringify(seeded) === JSON.stringify(['clFresh']), seeded.join(','));
+  t('rotation: they are set aside AS PLAYED, not silently lost',
+    seedLines.some(l => /Initialized with 1 valid items \(shuffled, 2 played-and-set-aside\)/.test(l)),
+    seedLines.join(' | '));
+  t('rotation: the audio-less track is reported as defunct, not played',
+    seedLines.some(l => l.includes('Skipping defunct item: clNoAudio')), seedLines.join(' | '));
+
+  // ── the Delete key: an already-vanished row is not "Video not found" ──
+  // The consume route asks GrabbyTube (single owner of its catalog and files)
+  // to delete first, so a stub on grabbytube:8101 (mapped by tests/run-scratch.sh
+  // through --add-host) stands in for the real service here.
+  const seen = [];
+  let answer = {};
+  const stubSrv = http.createServer((req, res) => {
+    const vid = decodeURIComponent((req.url || '').split('/').pop() || '');
+    seen.push(req.method + ' ' + vid);
+    const st = answer[vid] ?? 200;
+    res.writeHead(st, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(st === 200 ? { ok: true } : { error: 'nope' }));
+  });
+  await new Promise((r, j) => stubSrv.listen(8101, '127.0.0.1', (e) => e ? j(e) : r()));
+  const consume = async (vid) => {
+    const r = await fetch(`http://127.0.0.1:3000/api/video/${vid}/grabby`, { method: 'DELETE' });
+    return { status: r.status, body: await r.json().catch(() => null) };
+  };
+  fs.writeFileSync(BAGF, JSON.stringify(['cnGone', 'cnAuth', 'cnNorm', 'cnFail', 'cnOwnRowless'].map(v => ({ videoId: v, used: false }))));
+  putTrack('cnGone', ['cnGone.mp3.tr64k.mp3']);       // cleanup ate the row before the fix
+  putTrack('cnAuth');
+  putTrack('cnNorm', [], false);                      // DrivePod's own video, no marker
+  await putRow('cnAuth');
+  putTrack('cnOwnRowless', [], false);                 // DrivePod's own: row gone AND no marker
+  await prisma.channel.upsert({
+    where: { channelId: 'UCOwnChan' }, update: {},
+    create: { channelId: 'UCOwnChan', title: 'Own Channel', order: 1, active: true }
+  });
+  await prisma.video.create({
+    data: { videoId: 'cnNorm', channelId: 'UCOwnChan', title: 'Podcast', publishedAt: new Date(now - 7200000),
+      audioPath: '/cache/cnNorm/cnNorm.mp3', duration: 900, watched: true, progress: 300 }
+  });
+  putTrack('cnFail'); await putRow('cnFail');
+  putTrack('cnAlready'); await putRow('cnAlready');
+  answer = { cnFail: 500, cnAlready: 404 };
+
+  const gone = await consume('cnGone');
+  t('consume: a listed track whose ROW is already gone still lands (the fix)',
+    gone.status === 200 && gone.body?.remote === 'deleted' && gone.body?.localRecords === 0,
+    JSON.stringify(gone));
+  t('consume: the remote delete really was issued', seen.includes('DELETE cnGone'), seen.join(' | '));
+  t('consume: its bag entry is pruned, so the rotation can never pull it again',
+    !readBag().some(e => e.videoId === 'cnGone'), JSON.stringify(readBag()));
+  t('consume: the audio files stay GrabbyTube\'s to delete, not ours',
+    fs.existsSync(path.join(CACHE_DIR, 'cnGone/cnGone.mp3')));
+
+  const auth = await consume('cnAuth');
+  const authRow = await prisma.video.findUnique({ where: { videoId: 'cnAuth' } });
+  t('consume: the normal case (row present) still reports the deleted record',
+    auth.status === 200 && auth.body?.localRecords === 1 && !authRow, JSON.stringify(auth));
+  t('consume: a consumed track leaves the rotation', !readBag().some(e => e.videoId === 'cnAuth'),
+    JSON.stringify(readBag()));
+
+  const norm = await consume('cnNorm');
+  t('consume: a DrivePod video is still refused with 400, not treated as a library track',
+    norm.status === 400 && norm.body?.error === 'Not a GrabbyTube item', JSON.stringify(norm));
+  t('consume: and nothing is sent to GrabbyTube for it', !seen.some(s => s.endsWith('cnNorm')), seen.join(' | '));
+  t('consume: the refused row keeps its watched state and its bag slot',
+    !!readBag().find(e => e.videoId === 'cnNorm' && e.used === false), JSON.stringify(readBag()));
+
+  const unknown = await consume('cnUnknownId');
+  t('consume: a track with no row AND no authorship evidence is still a 404',
+    unknown.status === 404 && unknown.body?.error === 'Video not found', JSON.stringify(unknown));
+  const ownRowless = await consume('cnOwnRowless');
+  t('consume: a DrivePod-authored sidecar is NOT ownership evidence — still a 404',
+    ownRowless.status === 404 && !seen.some(s => s.endsWith('cnOwnRowless')), JSON.stringify(ownRowless));
+  t('consume: the 404 path never touched GrabbyTube', !seen.some(s => s.includes('cnUnknownId')), seen.join(' | '));
+
+  const failBody = await consume('cnFail');
+  const failRow = await prisma.video.findUnique({ where: { videoId: 'cnFail' } });
+  t('consume: a failed remote delete answers 502 with what to tell the user',
+    failBody.status === 502 && /nothing was deleted/.test(failBody.body?.error || ''), JSON.stringify(failBody));
+  t('consume: and is fail-closed — the row and its bag entry survive',
+    !!failRow && !!readBag().find(e => e.videoId === 'cnFail'), JSON.stringify(failRow && failRow.videoId));
+
+  const already = await consume('cnAlready');
+  const alreadyRow = await prisma.video.findUnique({ where: { videoId: 'cnAlready' } });
+  t('consume: already-gone remotely (404 there) is success here',
+    already.status === 200 && already.body?.remote === 'already-gone' && !alreadyRow, JSON.stringify(already));
+
+  stubSrv.close();
+  for (const vid of ['clPlayed', 'clBaked', 'clFresh', 'clNoAudio', 'cnGone', 'cnAuth', 'cnNorm', 'cnFail', 'cnAlready']) {
     fs.rmSync(path.join(CACHE_DIR, vid), { recursive: true, force: true });
   }
   fs.rmSync(GIDX, { force: true });

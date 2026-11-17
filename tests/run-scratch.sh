@@ -13,6 +13,7 @@ docker run --rm \
   -e CACHE_DIR=/scratch/cache \
   -e DATA_DIR=/scratch/data \
   -e DATABASE_URL=file:/scratch/data/scratch.db \
+  --add-host grabbytube:127.0.0.1 \
   node:20-bookworm bash -c '
     set -euo pipefail
     mkdir -p /scratch/cache /scratch/data
