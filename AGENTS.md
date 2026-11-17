@@ -417,20 +417,32 @@
   rolls to the freshest the CACHE has; only when the cache is empty too does it
   defer via `indexFetchPending` (the existing resume path).
 
-- **The manual ⏭️ is the SAME mode-aware advance, and there is no Previous**
-  (2026-11-17): `skipNext()` played `playlist[idx + 1]` — a neighbour in
-  newest-first LIST order — so it ignored `older`/`oldest`/`newer`, and under `off`
-  re-picked the track the user had just pressed Next away from as soon as the list
-  shifted. It now calls `advanceToNextTrack(left, manualNextMode(autoplayMode()))`:
-  the same `pickNextTrack` autoplay uses, with `off` → `older` (`manualNextMode`'s
-  comment: `off` forbids autoplay, not a button the user pressed, and one-step-older
-  is the only reading under which repeated Next walks the library instead of
-  stopping). The ⏮️ button and the `previoustrack` MediaSession handler are GONE —
-  the ← / → keys seek ∓10 s inside the current item, so a wrong Next is undone by
-  seeking or from the queue list, and no autoplay mode has a "backwards" step for a
-  Previous button to express; with no handler registered the OS's own ⏮️ is a rewind.
-  `skipMarksWatched` OFF is a user setting: the skipped track stays UNWATCHED and
-  therefore stays in the queue — the marking is what removes it, not the skipping.
+- **The manual ⏭️ is the SAME mode-aware advance; the ⏮️ is its inverse, and
+  both are gated on `skipMarksWatched`** (2026-11-17): `skipNext()` played
+  `playlist[idx + 1]` — a neighbour in newest-first LIST order — so it ignored
+  `older`/`oldest`/`newer`, and under `off` re-picked the track the user had just
+  pressed Next away from as soon as the list shifted. It now calls
+  `advanceToNextTrack(left, manualNextMode(autoplayMode()))`: the same
+  `pickNextTrack` autoplay uses, with `off` → `older` (`manualNextMode`'s comment:
+  `off` forbids autoplay, not a button the user pressed, and one-step-older is the
+  only reading under which repeated Next walks the library instead of stopping).
+  `skipPrevious()` (the ⏮️ button and the `previoustrack` handler, restored
+  2026-11-17 after briefly being deleted) is the same call with
+  `manualPrevMode(mode)` — the OPPOSITE direction, always a relative mode, never
+  an extreme — so ⏭️ then ⏮️ lands back on the track the user started from under
+  every neighbour-stepping mode (T6 §12b). **While `skipMarksWatched` is ON the
+  button is not rendered and the handler no-ops**: with that setting on, ⏭️ does
+  not leave the left track in the queue, it MARKS it finished (watched, out of the
+  queue, out of the bag), and a finished track is not something a "back" step can
+  undo — there is nothing to step back to, so offering ⏮️ would offer either a
+  dead press or a re-entry of a finished track. The handler stays REGISTERED even
+  then: an unregistered `previoustrack` makes the OS key a rewind, and letting
+  that meaning flip on a Settings toggle nobody is looking at is worse than an
+  inert key. Dead end of a walk = `pickNextTrack` answers undefined = restart the
+  current track from the top, the media-player convention the pre-mode `idx <= 0`
+  branch implemented. `skipMarksWatched` OFF is a user setting: the skipped track
+  stays UNWATCHED and therefore stays in the queue — the marking is what removes
+  it, not the skipping.
 
 - **ALL FIVE autoplay modes are honoured on EVERY advance path** (2026-11-17,
   `frontend/src/app/autoplay-order.ts` → `pickNextTrack(queue, mode, finished?)`):
@@ -626,3 +638,25 @@ no `node_modules`, so `ng build`/`tsc` run in the listen image's
 updated, image rebuilt, container recreated, then re-driven live in headless
 Chromium against `https://listen.example.com/l/owner/` (autoplay modes + the
 Delete key on a fixture row, both below).
+
+(2026-11-17, fourth round) The owner asked the ⏮️ / Previous back: restore the
+button, the `skipPrevious()` function and the `previoustrack` MediaSession
+handler, but keep them invisible / no-ops whenever "Skip marks as finished" is
+enabled — that setting makes ⏭️ a FINISH (it marks the left track watched, so the
+row leaves the queue and the bag), and a finished track is nothing a "back" step
+can undo, so a Previous in that mode has no coherent meaning. `skipPrevious()`
+therefore returns immediately when `skipMarksWatched()` is set and the template
+renders the button under `@if (!skipMarksWatched())`, while the handler stays
+registered either way (an unregistered `previoustrack` = OS rewind, and that
+meaning must not flip on a Settings toggle). With the setting OFF the button is
+`stopAndAdvance(left, manualPrevMode(autoplayMode()))` — new pure
+`manualPrevMode` returns the OPPOSITE direction of the chosen mode ('newer'/
+'newest' → 'older', 'older'/'oldest'/'off' → 'newer'), always relative, so a
+Next then Previous returns the origin track and a Previous is a neighbour rather
+than a jump to the far end. Nothing left in that direction restarts the current
+track from the top, as `idx <= 0` did before the mode rewrite. T6 43 → 49
+assertions (§12 = the mapping, the round-trip under the neighbour modes, the
+neighbour picks in both directions, and the direction-dependent dead end), T2
+185/exit 0, T1 PASS, T4 53 pass, `tsc --noEmit` clean, production `ng build` →
+`main-<hash>.js` reporting `APP_VERSION 1.15.0` (bundle hash below), re-vendored
+into the listen hub at this pin and redeployed.

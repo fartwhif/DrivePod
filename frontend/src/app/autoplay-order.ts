@@ -116,3 +116,19 @@ export function pickNextTrack<T extends AutoplayQueueItem>(
 export function manualNextMode(mode: AutoplayMode): Exclude<AutoplayMode, 'off'> {
   return mode === 'off' ? 'older' : mode;
 }
+
+/**
+ * The step a MANUAL ⏮️ takes, in mode terms.
+ *
+ * Previous is Next read backwards: whichever way the chosen mode travels in
+ * time, a step back travels the other way, so the same `pickNextTrack` answers
+ * it and a ⏭️ then ⏮️ lands back on the track the user started from (nothing
+ * was marked watched in between — `skipMarksWatched` OFF is what keeps the left
+ * track in the queue, and the button is hidden when it is ON). 'off' mirrors its
+ * own Next mapping: Next there walks one item older, so Previous walks one
+ * item newer. The result is always a RELATIVE mode, never an extreme, which is
+ * what makes it a NEIGHBOUR rather than a jump to the far end of the library.
+ */
+export function manualPrevMode(mode: AutoplayMode): Exclude<AutoplayMode, 'off'> {
+  return (mode === 'newer' || mode === 'newest') ? 'older' : 'newer';
+}

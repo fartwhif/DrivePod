@@ -35,7 +35,7 @@ const js = ts.transpileModule(fs.readFileSync(SRC, 'utf8'), {
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoplay-order-'));
 const tmpFile = path.join(tmpDir, 'autoplay-order.mjs');
 fs.writeFileSync(tmpFile, js);
-const { pickNextTrack, manualNextMode } = await import(tmpFile);
+const { pickNextTrack, manualNextMode, manualPrevMode } = await import(tmpFile);
 fs.rmSync(tmpDir, { recursive: true, force: true });
 
 let pass = 0, fail = 0;
@@ -188,6 +188,63 @@ t('6d no finished + oldest starts at the oldest', idOf(pick('oldest', null)) ===
   t('11d manual under oldest steps back from the oldest',
     idOf(pickNextTrack(QUEUE, manualNextMode('oldest'), QUEUE[4])) === 'old',
     `got ${idOf(pickNextTrack(QUEUE, manualNextMode('oldest'), QUEUE[4]))}`);
+}
+
+// ── 12. the manual ⏮️ is the manual ⏭️ read backwards ──
+{
+  // The mapping: a newer-ward mode steps back by travelling older, an
+  // older-ward mode (including 'off', whose Next already walks older) steps
+  // back by travelling newer. Never an extreme: the button is a neighbour step.
+  t('12a manual prev maps every mode to the opposite direction',
+    manualPrevMode('newer') === 'older' && manualPrevMode('newest') === 'older' &&
+    manualPrevMode('older') === 'newer' && manualPrevMode('oldest') === 'newer' &&
+    manualPrevMode('off') === 'newer');
+  // Next then Previous lands back on the track the user started from, for the
+  // modes that step by NEIGHBOURS ('newer', 'older', and 'off', whose Next maps
+  // to 'older') — the invariant the restored button rests on, and the reason it
+  // is hidden while skipMarksWatched is on (there a Next marks the left track
+  // watched, so it is out of the queue and nothing is left to step back to).
+  // The extremes cannot round-trip by construction: 'newest'/'oldest' jump to
+  // the far end of the library instead of to a neighbour, so their Previous is
+  // the neighbour AT that end (12c/12d), not the origin.
+  const roundTrip = (mode, startId) => {
+    const start = QUEUE.find(v => v.videoId === startId);
+    const fwd = pickNextTrack(QUEUE, manualNextMode(mode), start);
+    return fwd && pickNextTrack(QUEUE, manualPrevMode(mode), fwd);
+  };
+  t('12b next then prev returns the starting track under the neighbour modes',
+    ['newer', 'older', 'off'].every(m =>
+      roundTrip(m, 'target')?.videoId === 'target'),
+    ['newer', 'older', 'off'].map(m => `${m}=${idOf(roundTrip(m, 'target'))}`).join(' '));
+  // Under 'newer'/'newest' the walk goes forward in time, so Previous is the
+  // NEAREST older track — the same neighbour Next took one step ago.
+  t('12c prev under newer/newest steps to the nearest older neighbour',
+    idOf(pickNextTrack(QUEUE, manualPrevMode('newer'), QUEUE[2])) === 'old' &&
+    idOf(pickNextTrack(QUEUE, manualPrevMode('newest'), QUEUE[2])) === 'old',
+    `got ${idOf(pickNextTrack(QUEUE, manualPrevMode('newer'), QUEUE[2]))}`);
+  // Under 'older'/'oldest'/'off' the walk goes backwards, so Previous climbs.
+  t('12d prev under older/oldest/off steps to the nearest newer neighbour',
+    idOf(pickNextTrack(QUEUE, manualPrevMode('older'), QUEUE[2])) === 'mid' &&
+    idOf(pickNextTrack(QUEUE, manualPrevMode('oldest'), QUEUE[2])) === 'mid' &&
+    idOf(pickNextTrack(QUEUE, manualPrevMode('off'), QUEUE[2])) === 'mid',
+    `got ${idOf(pickNextTrack(QUEUE, manualPrevMode('older'), QUEUE[2]))}`);
+  // Where the walk has no step left, `pickNextTrack` answers undefined — the
+  // caller's "restart this track from the top" signal (the media-player
+  // convention the pre-mode `idx <= 0` branch implemented). The dead end is
+  // DIRECTION-dependent: a step that travels newer dead-ends at the freshest
+  // track, a step that travels older at the oldest — so it fires at the freshest
+  // under an older-ward mode and at the oldest under a newer-ward one.
+  t('12e prev dead-ends only at the far end of the direction it travels',
+    pickNextTrack(QUEUE, manualPrevMode('older'), QUEUE[0]) === undefined &&
+    pickNextTrack(QUEUE, manualPrevMode('oldest'), QUEUE[0]) === undefined &&
+    pickNextTrack(QUEUE, manualPrevMode('newer'), QUEUE[4]) === undefined &&
+    pickNextTrack(QUEUE, manualPrevMode('newest'), QUEUE[4]) === undefined,
+    `newer-ward from freshest=${idOf(pickNextTrack(QUEUE, manualPrevMode('older'), QUEUE[0]))} older-ward from oldest=${idOf(pickNextTrack(QUEUE, manualPrevMode('newer'), QUEUE[4]))}`);
+  // And the far end of an older-ward walk: prev under 'off' climbs from the
+  // oldest to its neighbour rather than stopping.
+  t('12f prev under off climbs from the oldest',
+    idOf(pickNextTrack(QUEUE, manualPrevMode('off'), QUEUE[4])) === 'old',
+    `got ${idOf(pickNextTrack(QUEUE, manualPrevMode('off'), QUEUE[4]))}`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

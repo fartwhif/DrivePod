@@ -12,7 +12,7 @@ import {
   stallResumeTarget,
   streamTrackId
 } from './stall-guard';
-import { AutoplayMode, manualNextMode, pickNextTrack } from './autoplay-order';
+import { AutoplayMode, manualNextMode, manualPrevMode, pickNextTrack } from './autoplay-order';
 import { Title } from '@angular/platform-browser';
 
 interface Video {
@@ -154,7 +154,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    // SKIP MARKS WATCHED: treat skip-next as if the track finished playing
    skipMarksWatched = signal(false);
 
-  private readonly APP_VERSION = '1.14.0';   // ← bumped for consume advancing the player
+  private readonly APP_VERSION = '1.15.0';   // ← bumped for the restored, gated ⏮️
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched'>('queue');
   protectedPlaylist = signal<Video[]>([]);
@@ -1337,8 +1337,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   /**
    * Stop the element, clear the track playing in this tab, then advance to what
-   * MODE wants next. Shared by the manual ⏭️ and by consuming the track that is
-   * playing here, so the two can never leave the player in different states.
+   * MODE wants next. Shared by the manual ⏭️, the manual ⏮️ and by consuming
+   * the track that is playing here, so the three can never leave the player in
+   * different states.
    *
    * `left` is the track being abandoned — the reference a relative step measures
    * from, excluded by id so NO mode hands it straight back. `currentVideo` is
@@ -1359,6 +1360,57 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.currentVideo.set(null);
     this.saveCurrentVideo(null);
     this.advanceToNextTrack(left, mode);
+  }
+
+  /**
+   * Manual ⏮️ — the button and the `previoustrack` MediaSession handler.
+   *
+   * INVISIBLE and a NO-OP while `skipMarksWatched` is on, and both halves are
+   * load-bearing for the same reason: with that setting on, ⏭️ does not leave
+   * the track behind in the queue, it MARKS it finished (the `skipNext()` path
+   * above). A finished track is not something a "back" step can undo — the row
+   * is watched, out of the queue, and out of the shufflebag — so the only
+   * coherent reading of "previous" in that mode is "not offered". Keeping it
+   * visible but inert would invite a press that does nothing; keeping it live
+   * would re-enter a finished track. The handler stays REGISTERED either way (an
+   * unregistered `previoustrack` makes the OS key a rewind, and that reading
+   * would then change with a Settings toggle nobody is looking at), so the key
+   * is simply inert while the setting is on.
+   *
+   * With the setting off, ⏮️ is ⏭️ read backwards: `manualPrevMode` flips the
+   * chosen autoplay mode to its opposite direction and the SAME `pickNextTrack`
+   * answers it, so a Next then Previous lands back on the track the user started
+   * from — nothing was marked watched in between, which is exactly what
+   * `skipMarksWatched` OFF guarantees. It used to play `playlist[idx - 1]`, a
+   * neighbour in newest-first LIST order, for the same reason the Next button
+   * used to play `playlist[idx + 1]`.
+   *
+   * With nothing left in that direction the media-player convention holds: the
+   * track playing here restarts from the top (`idx <= 0` did this before the mode
+   * rewrite). NOT `stopAndAdvance`'s refresh-and-advance — a Previous is not an
+   * advance, and an empty step here means "you are at the end of this walk", not
+   * "the library may have grown a candidate".
+   */
+  skipPrevious() {
+    if (this.skipMarksWatched()) return;
+
+    const left = this.currentVideo() ?? undefined;
+    if (!left) return;
+
+    const mode = manualPrevMode(this.autoplayMode());
+    if (pickNextTrack(this.getQueueVideos(), mode, left)) {
+      this.stopAndAdvance(left, mode);
+      return;
+    }
+
+    // Nothing older (or newer, under a newer-ward mode) to step to.
+    this.audio.currentTime = 0;
+    if (this.audio.paused) {
+      this.audio.play();
+      // Explicit play intent: a replay from the start should also resume
+      // after a network drop, even if the track was paused before it.
+      this._wasPlayingBeforeDrop = true;
+    }
   }
 
   loadChannels() {
@@ -1402,6 +1454,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     });
     navigator.mediaSession.setActionHandler('pause', () => this.audio.pause());
     navigator.mediaSession.setActionHandler('nexttrack', () => this.skipNext());
+    // No-ops itself while skipMarksWatched is on (see skipPrevious).
+    navigator.mediaSession.setActionHandler('previoustrack', () => this.skipPrevious());
   }
 
   private updateMediaSession(video: Video | null) {

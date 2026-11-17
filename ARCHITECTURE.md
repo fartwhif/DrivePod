@@ -1049,9 +1049,18 @@ under the chosen mode, with 'off' stepping one item older (`manualNextMode`'s
 comment says why). It used to play `playlist[idx + 1]` — a neighbour in newest-first
 LIST order, which is not what `older`/`oldest`/`newer` ask for, and under 'off' it
 re-picked a track the user had just pressed Next away from once the list shifted.
-There is no ⏮️ / Previous: arrow keys seek ∓10 s inside the current item (§12.7), so
-a wrong Next is undone by seeking or by the queue list, and no mode has a
-"backwards" reading that a Previous button could express.
+**⏮️ is ⏭️ read backwards, and only exists while `skipMarksWatched` is OFF**:
+`skipPrevious()` (button + `previoustrack`) calls the same `stopAndAdvance` with
+`manualPrevMode(autoplayMode())` — the OPPOSITE direction, always relative, never
+an extreme — so a Next then Previous returns the origin track under every
+neighbour-stepping mode. With `skipMarksWatched` ON the button is not rendered and
+the handler no-ops: there ⏭️ MARKS the left track finished (watched, out of the
+queue and bag), and a finished track is not something a back step can undo. When
+the walk has nothing left in that direction the current track restarts from the
+top (the media-player convention, as the pre-mode `idx <= 0` branch did) rather
+than refreshing and advancing — a Previous is not an advance. The ← / → keys still
+seek ∓10 s inside the current item (§12.7); they are a different axis, not a
+stand-in for this.
 
 **Hide ⇒ stop invariant**: every path that sets `currentVideo` to null also
 does `audio.pause(); audio.src=''; setMediaPlaybackState('none')` (enforced by
@@ -1161,9 +1170,12 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   position, rate) throttled to **1.8 s** — this is what renders the Ford Sync
   style progress on car displays.
 - Handlers: play (re-arms playing flag), pause, `nexttrack` → `skipNext()` (so
-  head-unit next respects `skipMarksWatched` AND the autoplay mode). No
-  `previoustrack` handler: with none registered, the OS's own ⏮️ is a rewind, which
-  matches the arrow keys' ∓10 s seek (§12.7) — the app has no Previous to offer.
+  head-unit next respects `skipMarksWatched` AND the autoplay mode) and
+  `previoustrack` → `skipPrevious()` (the inverse direction of the same mode;
+  **no-ops while `skipMarksWatched` is on**, and the handler stays registered even
+  then on purpose — an unregistered `previoustrack` makes the OS key a rewind, and
+  that meaning must not flip when the user toggles a Settings checkbox they may be
+  looking away from).
 
 ### 12.7 Keyboard shortcuts (input-field guarded)
 
