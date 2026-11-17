@@ -591,7 +591,11 @@ a duration ratio, so the player is never silent.
   Only tracks GrabbyTube **authored** are listed (it rebuilds from the
   authorship marker on its sidecar, §3.2) — DrivePod's videos share the cache
   dir and are not music.
-- `shufflebag.json` — this app's FIFO state: `[{videoId, used}]`.
+- `shufflebag.json` — this app's FIFO state: `[{videoId, used}]`. Entries the user
+  WATCHED are held out of it entirely (see the Init / Reconcile bullets below):
+  `initShuffleBag` set-asides any watched grabby row, a watched row pulled mid-run
+  is pruned rather than reconditioned, and the
+  `/api/video/:id/watched` hooks (`syncBagForWatched`) add or drop entries directly.
 - **`resolveGrabbyAudioPath(videoId, audioPath)`** — the single resolver
   for grabby file paths: returns the literal path (absolute as-is, relative
   joined to CACHE_DIR) when the file exists, else the canonical
@@ -613,16 +617,19 @@ a duration ratio, so the player is never silent.
 - **Init** (boot): upsert the placeholder channel; load grabby-index keeping
   only **authored** entries (`isGrabbyAuthored`, §3.2 — a bare-`videoId` index
   entry is not a music track), drop defunct items
-  (`resolveGrabbyAudioPath()` finds no file), Fisher–Yates shuffle, persist. In
-  parallel, `backfillGrabbyArtistChannels()` re-points any grabby row still
+  (`resolveGrabbyAudioPath()` finds no file) **and any row the DB marks watched**
+  (`isGrabby:true, watched:true` → `played-and-set-aside`; an unwatched row — and
+  a watched row that is NOT grabby — still seeds), Fisher–Yates shuffle, persist.
+  In parallel, `backfillGrabbyArtistChannels()` re-points any grabby row still
   on a stale channel (e.g. pre-migration rows on bare `UCGrabbyTube`) to its
   per-artist channel using the index's `author`, and regenerates
   `index.json` if anything moved. Idempotent.
 - **Pull** (`pullFromShuffleBag(n)`): take n `used:false` entries in bag order
   (shuffled order = pseudo-random draw), mark used, persist. On exhaustion,
   reinitialize **once** (reusing items is allowed — grabby tracks re-enter the
-  mix; see below).
-- **Reconcile** (`reconcileShuffleBag(returnIds, indexIds)`), once per run:
+  mix; see below — but a row the DB marks **watched** is set aside again, so
+  finished tracks never re-enter; see the Init bullet).
+- **Reconcile** (`reconcileShuffleBag(returnIds, indexIds, pruneIds)`), once per run:
   - candidates the plan did NOT place are un-used and moved to the **tail** of
     the bag. A head-insert would starve the bag (an item too long for the
     current deficit would be pulled and returned every 5 min, blocking every
@@ -636,6 +643,13 @@ a duration ratio, so the player is never silent.
     (> 10 % of the bag — smells like a partial index rewrite, not real
     deletions) is logged but not pruned, since a pruned entry only rejoins
     after a full ~23 h pass.
+  - the third argument `pruneIds` (ids this run's `rowStates` query proved
+    **watched**) leaves the bag **unconditionally** — `used` or not — and
+    **bypasses the mass-absence guard**: unlike index absence these were checked
+    against the DB this run, so there is no transient-read risk, and a played
+    track that merely rotated back would be re-pulled on every run until the next
+    re-init. Played wins over returned: an id both skipped and proved watched is
+    pruned, not rotated to the tail.
 - **Distribute** (after harvest, before auto-purge; skipped when
   `grabbyMixEnabled=false` — **it is currently ON in the live deployment**,
   ratio 1, cluster cap 7):
@@ -660,7 +674,10 @@ a duration ratio, so the player is never silent.
      track)) + 5` (the +5 absorbs unusable entries). If
      `grabbyClusterMaxSize > 0`, items already in the band count against the cap
      **across runs**, so a run pulls only the remaining headroom and stops once
-     the band is full.
+     the band is full. A pull whose DB row is already **watched** is not a
+     candidate at all (`⏭️ Skipping played item …`): it is collected as a played id
+     and handed to reconcile's `pruneIds`, so it leaves the rotation instead of
+     cycling back (see the Reconcile bullet above).
   5. **Plan** (`planGrabbyFill`, pure + exported, deterministic — a run is
      reproducible from its log line): which candidates to place, converging on
      **both** targets at once. Hard: the slot cap, and the duration budget
@@ -682,8 +699,11 @@ a duration ratio, so the player is never silent.
      planner never spends a slot on it and the bag entry rotates back un-used,
      and again here, because a concurrent import can insert that row in between.
      Converting such a row is precisely what flipped 464 watched videos into
-     permanent mix items (§5.7-1).
-     - **already in DB → "recondition"**: update row with clustered
+     permanent mix items (§5.7-1). The **watched check is re-run at placement**
+     too: the user may have marked the row watched mid-run, after the candidate
+     filter saw it unwatched; such a pick is dropped and goes to `pruneIds`.
+     - **already in DB → "recondition"** (reached only by UNWATCHED rows — a
+       watched pick `continue`s above): update row with clustered
        `publishedAt` (`clusterTimestamp` = uniform inside the band, i.e. **at or
        below** the newest normal video), fresh title/thumb/duration,
        `watched:false, progress:0`, the resolved `audioPath` (literal index path
@@ -854,8 +874,8 @@ otherwise re-download, then `upsert` (preserving the original `publishedAt`).
 | Method | Path | Behavior |
 |---|---|---|
 | PATCH | `/api/video/:videoId/progress` | set progress (int seconds); also sets `currentVideoId`; clears `currentVideoId` if the row is gone |
-| POST | `/api/video/:videoId/watched` | mark watched=true (track finished); regenerates index |
-| PATCH | `/api/video/:videoId/watched` | toggle to given value; regenerates index; clears `_localWatched` hold on the client |
+| POST | `/api/video/:videoId/watched` | mark watched=true (track finished); regenerates index; `syncBagForWatched` drops the shufflebag entry |
+| PATCH | `/api/video/:videoId/watched` | toggle to given value; regenerates index; clears `_localWatched` hold on the client; `syncBagForWatched` drops (watched) or re-adds at the tail (unwatched, only if the catalog still lists a playable MP3) |
 | PATCH | `/api/video/:videoId/protect` | 404 if unknown; sets protected; regenerates index |
 | GET | `/api/player/current` | `{videoId: <currentVideoId> \| null}` |
 | PATCH | `/api/player/current` | `{videoId}` — persist last played |
@@ -937,13 +957,24 @@ current position, progress time labels.
 `oldest`→last else first; `play()` may be policy-blocked (fine).
 
 **Autoplay modes** (after a track ends — `markAsWatchedAndPlayNext` →
-`getCandidate(playlist, mode, finishedTime, finishedId)`): `newest` (top of
-queue, reload index when empty), `newer`/`older` (by publishedAt relative
-to the finished track), `oldest` (bottom), `off` (stop). The finished track
-is excluded by `videoId`, and the `newer`/`older` comparisons are
-`<=`/`>=` (not strict) so same-timestamp siblings (batched imports, grabby
-clusters) stay reachable — a strict `<`/`>` could strand the player at a
-shared timestamp.
+`getCandidate(playlist, mode, finishedTime, finishedId)`): `newest`,
+`newer`/`older` (by publishedAt relative to the finished track), `oldest`
+(bottom), `off` (stop). The finished track is excluded by `videoId`, and the
+`newer`/`older` comparisons are `<=`/`>=` (not strict) so same-timestamp
+siblings (batched imports, grabby clusters) stay reachable — a strict `<`/`>`
+could strand the player at a shared timestamp.
+
+**`newest` refreshes the index before picking** (`_playFreshest`, 2026-11-16):
+`newer`/`older`/`oldest` filter the cached queue by the finished track's
+timestamp and have no fresh-surface requirement, so they still pick straight
+from `playlist()`. `newest` alone must surface content harvested since the last
+poll, so every `newest` advance re-fetches `index.json` first (cheap — the file
+is byte-stable + `no-cache`, so it 304s when nothing changed) and plays the
+head of the RE-derived queue, where a freshly-harvested track is finally
+visible; the just-finished track stays out via the `mergeIndexWithLocal`
+`_localWatched` pin. The refresh never hard-stops the queue: offline, or if the
+refetch itself errors, it falls back to the cached head; only when the cache is
+empty too does it defer on `indexFetchPending` (the §12.5 resume path).
 
 **Skip semantics**: `skipNext()` = jump without marking watched, unless
 `skipMarksWatched` is on → full completion path. `skipPrevious()` at index 0

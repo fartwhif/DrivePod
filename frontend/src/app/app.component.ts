@@ -1264,16 +1264,16 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     if (mode === 'newest') {
-      // Try to play from local cache first, fall back to server reload
-      const localCandidate = this.playlist().length > 0 ? this.playlist()[0] : null;
-      if (localCandidate) {
-        this.currentVideo.set(null);
-        this.playVideo(localCandidate);
-        return;
-      }
-      // No local cache -- reload index and play when ready
+      // 'newest' must play the freshest track that actually EXISTS, not the
+      // freshest the cache happens to know: a track harvested or downloaded
+      // since the last index poll is invisible to playlist(), so a head-only
+      // pick is really 'newest as of two minutes ago'. Refresh before
+      // choosing. The just-finished video cannot resurface from the fresh
+      // fetch: mergeIndexWithLocal pins every _localWatched id (which still
+      // holds it, and its watched POST may still be queued for retry) as
+      // watched, so it never re-enters the new queue.
       this.currentVideo.set(null);
-      this._loadIndexAndPlay();
+      this._playFreshest();
       return;
     }
 
@@ -1837,6 +1837,48 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     // discarded pipeline for as long as the tab had been frozen.
     this.resumeGraceUntil = Date.now() + RESUME_DETECT_MS;
   }
+  /**
+   * 'newest' advance: refresh the index, then play the head of the queue.
+   *
+   * A head-only pick from the cached playlist plays 'newest as of the last
+   * poll', not newest: a track harvested or downloaded since that poll is not
+   * in the cache at all. So every advance re-fetches first — cheap, because
+   * index.json 304s (byte-stable + no-cache) whenever nothing changed — and
+   * plays from the merged result, where a fresh item is finally visible. The
+   * just-finished track stays out through mergeIndexWithLocal's _localWatched
+   * pin; there is deliberately NO finishedId exclusion, so the same-timestamp
+   * siblings of a grabby cluster band (batched imports re-draw a fresh date)
+   * remain pickable — with strict 'newer than the finished track' they were
+   * the reason autoplay used to stall, and 'newest' never filtered by it.
+   *
+   * A dead backend must not hard-stop a playing queue: offline, or when the
+   * refresh itself fails, play the freshest the cache still has. Deferring
+   * (indexFetchPending) is reserved for the no-cache case — the existing
+   * connectivity-resume path replays once the backend returns.
+   */
+  private _playFreshest(): void {
+    if (!this.backendOnline) {
+      this.indexFetchPending = true;
+      if (this.playlist().length > 0) this.playVideo(this.playlist()[0]);
+      return;
+    }
+
+    this.fetchIndexWithProgress()
+      .then((data: Video[]) => {
+        this.backendOnline = true;
+        this.indexFetchPending = false;
+        this.rawIndex.set(this.mergeIndexWithLocal(data));
+        this.derivePlaylists();
+        if (this.autoplayMode() !== 'newest') return; // mode flipped mid-fetch
+        const queue = this.getQueueVideos();
+        if (queue.length > 0) this.playVideo(queue[0]);
+      })
+      .catch(() => {
+        // Refresh failed: roll to the cached head rather than stopping.
+        if (this.playlist().length > 0) this.playVideo(this.playlist()[0]);
+        else this.indexFetchPending = true;
+      });
+  }
 
   /** Reload index and automatically play the first available track when ready. */
   private _loadIndexAndPlay(): void {
@@ -1880,12 +1922,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (mode === 'off') return;
 
     if (mode === 'newest') {
-      const localCandidate = this.playlist().length > 0 ? this.playlist()[0] : null;
-      if (localCandidate) {
-        this.playVideo(localCandidate);
-        return;
-      }
-      this._loadIndexAndPlay();
+      this._playFreshest();
       return;
     }
 

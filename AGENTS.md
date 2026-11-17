@@ -197,17 +197,40 @@
   these queue-level invariants (every placed row inside the band, nothing above
   the anchor, deficit log, tail-returns, index-wide bag prune, satisfied band
   writes nothing) — the pure planner tests cannot see timestamps or bag state.
-- **`reconcileShuffleBag(returnIds, indexIds)` owns ALL bag bookkeeping**
-  (2026-11-12): unplaced pulls rotate back un-used at the TAIL (a head-insert
-  re-pulls them every 5 min and starves shorter items), and entries
-  grabby-index.json no longer lists are pruned index-wide — `used:true` ones
-  included, since `used` only resets on re-init (~23 h for 1,985 entries) and
-  T1 A9 catches exactly that stranding. Two guards, because a pruned entry
-  never rejoins until the next re-init: an empty `indexIds` prunes nothing, and
-  a MASS absence (> 10 % of the bag — a partial index rewrite, not real
-  deletions) is logged as `NOT pruned` and left alone. NEVER rewrite
-  `grabby-index.json` (GrabbyTube is its only writer) — read it, and prune OUR
-  bag against it.
+- **`reconcileShuffleBag(returnIds, indexIds, pruneIds)` owns ALL bag bookkeeping**
+  (2026-11-12, played-prune added 2026-11-16): unplaced pulls rotate back un-used
+  at the TAIL (a head-insert re-pulls them every 5 min and starves shorter items),
+  and entries grabby-index.json no longer lists are pruned index-wide —
+  `used:true` ones included, since `used` only resets on re-init (~23 h for 1,985
+  entries) and T1 A9 catches exactly that stranding. Two index-absence guards,
+  because a pruned entry never rejoins until the next re-init: an empty `indexIds`
+  prunes nothing, and a MASS absence (> 10 % of the bag — a partial index rewrite,
+  not real deletions) is logged as `NOT pruned` and left alone. The third arg
+  `pruneIds` is for ids the DB proved WATCHED this run (`distributeGrabbyItems`
+  collects them from `rowStates`): those leave the bag **unconditionally** — `used`
+  or not — and **bypass the mass-absence guard**, because unlike index absence they
+  were checked against the DB this run, so there is no transient-read risk and a
+  played track that rotated back would be re-pulled on every run until re-init.
+  Played wins over returned: an id both skipped and proved watched is pruned, not
+  rotated. NEVER rewrite `grabby-index.json` (GrabbyTube is its only writer) —
+  read it, and prune OUR bag against it.
+- **"Played" means out of the bag AND out of the rotation until un-played**
+  (2026-11-16): reconditioning used to reset `watched:false, progress:0` on every
+  existing row it placed, so a grabby track the user finished was dragged back to
+  the top of the queue with a fresh date on the next 5-min run — and un-watching
+  never stuck, because the bag kept holding it. Three points now close that:
+  `initShuffleBag` set-asides any `isGrabby:true, watched:true` row (`🎵 … N
+  played-and-set-aside`, an UNWATCHED row still seeds, a watched NON-grabby row
+  too); `distributeGrabbyItems` treats a pull whose DB row is already watched as
+  **not a candidate** (`⏭️ Skipping played item …`, collected into `playedIds` →
+  reconcile's `pruneIds`), re-checked at placement in case the user marked it
+  watched mid-run; and the two `/api/video/:id/watched` routes call
+  `syncBagForWatched(id, watched)`, which drops the entry on watch and re-adds it
+  at the tail on un-watch — but ONLY when grabby-index.json still lists the id
+  with a playable MP3 (the same eligibility test a pull applies). A track deleted
+  from the catalog then un-watched stays out of the bag by design. T2 section 6c
+  locks the prune (mass-guard bypass, `used` entries, played-wins-over-returned);
+  section 17 locks the seed set-aside and the un-watch re-admit guards.
 - **Downloads run under a STALL watchdog, never a wall-clock cap**
   (2026-11-05): `downloadAndProcessVideo` uses
   `safeExecWithStallWatchdog(cmd, context, videoDir, opts)`. While the child
@@ -326,6 +349,21 @@
   `src` is '') is the only honest answer; a track the element is not loaded with
   passes `currentTime: 0`, so its own saved progress (or 0) decides. Row clicks
   on the ALREADY-playing track must still keep its live position (verified).
+
+- **'newest' autoplay refreshes the index before picking** (2026-11-16,
+  `_playFreshest` in `app.component.ts`): a head-only pick from `playlist()` plays
+  "newest as of the last poll", not newest — a track harvested or downloaded since
+  that poll is invisible to the cache, so autoplay could keep replaying a stale
+  head and never surface a fresh item. Every `newest` advance now re-fetches first
+  (cheap: `index.json` is byte-stable + no-cache, so it 304s when nothing changed)
+  and plays the head of the RE-derived queue, where the fresh item is finally
+  visible; the just-finished track stays out through `mergeIndexWithLocal`'s
+  `_localWatched` pin. A dead backend never hard-stops the queue: offline, or if
+  the refresh itself fails, it rolls to the cached head; only when the cache is
+  empty too does it defer via `indexFetchPending` (the existing resume path). The
+  `oldest`/`newer`/`older` modes are unchanged (they filter by the finished
+  track's timestamp and have no fresh-surface requirement). T2 cannot see the SPA;
+  this is covered by the typecheck and the T5 advance E2E recipe, not a unit test.
 
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 

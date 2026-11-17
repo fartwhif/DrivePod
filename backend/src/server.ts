@@ -589,17 +589,28 @@ export async function initShuffleBag(): Promise<void> {
   // Only entries GrabbyTube authored (see loadGrabbyIndex): the cache dir is
   // shared with DrivePod, so an index built by a bare folder sweep lists
   // DrivePod's own videos, and seeding the bag with them wastes a pull on
-  // every rotation. Items already in the DB stay in the bag on purpose: grabby
-  // tracks are reused indefinitely — distributeGrabbyItems reconditions
-  // existing rows instead of skipping them.
+  // every rotation. A track the user PLAYED is out of the bag too: an existing
+  // UNWATCHED row stays in (distributeGrabbyItems reconditions it back into
+  // the band), a WATCHED row is skipped here, pruned by reconcileShuffleBag
+  // when a pull stumbles on it, and dropped by syncBagForWatched the moment
+  // the mark lands — so "played" now means "gone from the queue AND from the
+  // rotation", which is exactly what the reconditioning used to undo.
+  const playedIds = new Set(
+    (await prisma.video.findMany({
+      where: { isGrabby: true, watched: true },
+      select: { videoId: true }
+    })).map(r => r.videoId)
+  );
   const valid: ShuffleBagEntry[] = [];
+  let playedSkipped = 0;
   for (const item of loadGrabbyIndex().values()) {
     const mp3Path = resolveGrabbyAudioPath(item.videoId, item.audioPath);
-    if (fs.existsSync(mp3Path)) {
-      valid.push({ videoId: item.videoId, used: false });
-    } else {
+    if (!fs.existsSync(mp3Path)) {
       console.log(`   🗑️ [ShuffleBag] Skipping defunct item: ${item.videoId} (no MP3)`);
+      continue;
     }
+    if (playedIds.has(item.videoId)) { playedSkipped++; continue; }
+    valid.push({ videoId: item.videoId, used: false });
   }
 
   // Fisher-Yates shuffle
@@ -609,7 +620,7 @@ export async function initShuffleBag(): Promise<void> {
   }
 
   fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(valid, null, 2));
-  console.log(`✅ [ShuffleBag] Initialized with ${valid.length} valid items (shuffled)`);
+  console.log(`✅ [ShuffleBag] Initialized with ${valid.length} valid items (shuffled${playedSkipped ? `, ${playedSkipped} played-and-set-aside` : ''})`);
 }
 
 /**
@@ -671,13 +682,21 @@ async function pullFromShuffleBag(count: number, reinitialized = false): Promise
  * nothing, and a MASS absence (> 10 % of the bag — a partial rewrite, not real
  * deletions) is reported but not pruned, because dropped entries only rejoin
  * after a full ~23 h pass.
+ *
+ * `pruneIds` — videoIds this run proved UNPLAYABLE-BY-STATE (the user watched
+ * them; see syncBagForWatched) — leave the bag unconditionally, `used` or not,
+ * and bypass the mass-absence guard: unlike index absence, these were checked
+ * against the DB THIS run, so there is no transient-read risk. Rotating them
+ * back would re-pull a played track on every run until the next
+ * re-initialization wasted it.
  */
 export function reconcileShuffleBag(
-  returnIds: string[], indexIds: Set<string>
+  returnIds: string[], indexIds: Set<string>, pruneIds: string[] = []
 ): { returned: number; dropped: number; absent: number } {
   const none = { returned: 0, dropped: 0, absent: 0 };
   if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) return none;
   const back = new Set(returnIds);
+  const played = new Set(pruneIds);
   const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
   const absent = indexIds.size > 0
     ? bag.reduce((n, e) => (indexIds.has(e.videoId) ? n : n + 1), 0) : 0;
@@ -686,13 +705,43 @@ export function reconcileShuffleBag(
   const revived: ShuffleBagEntry[] = [];
   let dropped = 0;
   for (const entry of bag) {
-    if (pruning && !indexIds.has(entry.videoId)) { dropped++; continue; }
+    if (played.has(entry.videoId) || (pruning && !indexIds.has(entry.videoId))) { dropped++; continue; }
     if (back.has(entry.videoId)) revived.push({ videoId: entry.videoId, used: false });
     else kept.push(entry);
   }
   if (revived.length === 0 && dropped === 0) return { ...none, absent };
   fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify([...kept, ...revived], null, 2));
   return { returned: revived.length, dropped, absent };
+}
+
+/**
+ * Keep shufflebag.json in step with one watched mark, so "played" means gone
+ * from the queue AND gone from the rotation until the user un-plays it.
+ *
+ * watched=true drops the entry (initShuffleBag's played filter keeps it out at
+ * the next re-initialization too). watched=false puts it back at the TAIL —
+ * same rationale as reconcileShuffleBag's rotate — and only when GrabbyTube
+ * still lists the track and the MP3 is still on disk, which is exactly the
+ * eligibility test distributeGrabbyItems applies to a pull. A normal (non-
+ * grabby) video may legitimately have an entry (GrabbyTube can download a
+ * video DrivePod's channels already carried): dropping it on watch is right
+ * either way — the user played it — and re-adding it on un-watch is harmless,
+ * because the ownership guard refuses to convert the row.
+ */
+export function syncBagForWatched(videoId: string, watched: boolean): void {
+  if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) return;
+  const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
+  const at = bag.findIndex(e => e.videoId === videoId);
+  if (watched) {
+    if (at < 0) return;
+    bag.splice(at, 1);
+  } else {
+    if (at >= 0) return;
+    const item = loadGrabbyIndex().get(videoId);
+    if (!item || !fs.existsSync(resolveGrabbyAudioPath(videoId, item.audioPath))) return;
+    bag.push({ videoId, used: false });
+  }
+  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(bag, null, 2));
 }
 
 /**
@@ -1124,18 +1173,32 @@ export async function distributeGrabbyItems(): Promise<void> {
   // videos came back into the queue forever, invisible to auto-purge. Refusing
   // here rather than at placement time means the planner never spends a slot on
   // it and the entry rotates back into the rotation un-used.
-  const rowLabels = new Map(
+  //
+  // The same query answers "did the user play this?" — a WATCHED row is not a
+  // candidate at all. Reconditioning used to reset watched/progress on every
+  // existing row it placed, which is what dragged finished tracks back to the
+  // top of the queue with a fresh date. Played pulls go to `playedIds` below
+  // and leave the bag through reconcile rather than rotating back for another
+  // wasted pull.
+  const rowStates = new Map(
     (await prisma.video.findMany({
       where: { videoId: { in: pulled.map(p => p.videoId) } },
-      select: { videoId: true, isGrabby: true }
-    })).map(r => [r.videoId, r.isGrabby])
+      select: { videoId: true, isGrabby: true, watched: true }
+    })).map(r => [r.videoId, r])
   );
   const usable: { videoId: string; durationSec: number }[] = [];
+  const playedIds: string[] = [];
   for (const entry of pulled) {
     const meta = grabbyMap.get(entry.videoId);
     if (!meta) continue; // catalog-dead: reconcile prunes it (see below)
-    if (rowLabels.get(entry.videoId) === false) {
+    const st = rowStates.get(entry.videoId);
+    if (st && st.isGrabby === false) {
       console.log(`   ⛔ [ShuffleBag] Refusing to convert DrivePod's own video ${entry.videoId} into a grabby item`);
+      continue;
+    }
+    if (st?.watched) {
+      console.log(`   ⏭️ [ShuffleBag] Skipping played item ${entry.videoId} (watched rows stay out of the mix)`);
+      playedIds.push(entry.videoId);
       continue;
     }
     const duration = meta.duration || 0;
@@ -1159,16 +1222,20 @@ export async function distributeGrabbyItems(): Promise<void> {
   // rotates back into the rotation un-used — the planner rejected it for LENGTH
   // reasons (or it had no playable file), not because it is bad, and `used`
   // only resets when the whole bag is re-initialized. Entries the catalog no
-  // longer lists are pruned index-wide, whether or not this run pulled them.
+  // longer lists are pruned index-wide, whether or not this run pulled them,
+  // and so are the played pulls (`playedIds`): the user finished them, so
+  // rotating them back would burn a pull on every run until the next
+  // re-initialization — which skips them anyway (see initShuffleBag).
   const placedIds = new Set(plan.take);
   const { returned, dropped, absent } = reconcileShuffleBag(
-    pulled.map(p => p.videoId).filter(id => !placedIds.has(id)),
-    new Set(grabbyMap.keys())
+    pulled.map(p => p.videoId).filter(id => !placedIds.has(id) && !playedIds.includes(id)),
+    new Set(grabbyMap.keys()),
+    playedIds
   );
   if (absent > dropped) {
     console.log(`⚠️ [ShuffleBag] ${absent} bag entries missing from grabby-index but NOT pruned (mass absence — partial index rewrite?)`);
   }
-  const bagNote = [returned ? `${returned} returned to bag` : '', dropped ? `${dropped} pruned (catalog-deleted)` : '']
+  const bagNote = [returned ? `${returned} returned to bag` : '', dropped ? `${dropped} pruned (played or catalog-deleted)` : '']
     .filter(Boolean).join(', ');
   if (plan.take.length === 0) {
     console.log(`⚠️ [ShuffleBag] Nothing usable to place (${plan.reason}${bagNote ? `, ${bagNote}` : ''})`);
@@ -1193,9 +1260,17 @@ export async function distributeGrabbyItems(): Promise<void> {
       continue;
     }
     if (existing) {
+      if (existing.watched) {
+        // Raced with the candidate filter: the user marked it watched (via the
+        // API, which drops it from the bag) between the query above and here.
+        // Reconditioning a played row is exactly the resurrection the queue
+        // filter exists to prevent, so leave it watched and leave it out.
+        console.log(`   ⏭️ [ShuffleBag] Skipping played item ${videoId} (marked watched mid-run)`);
+        continue;
+      }
       // Recondition the existing row: refresh its timestamp to cluster inside
       // the band and reset its playback state, so it re-enters the mix window
-      // instead of being skipped.
+      // instead of being skipped. Only UNWATCHED rows get here (see above).
       const data: Prisma.VideoUpdateInput = {
         publishedAt: clusterTimestamp(newestNormal.publishedAt),
         duration,
@@ -3359,6 +3434,10 @@ app.post('/api/video/:videoId/watched', async (req, res) => {
     if (result.count === 0) {
       console.warn(`⚠️ Mark watched skipped — video ${req.params.videoId} not found`);
     }
+    // A played track is done with the rotation too, not just the queue —
+    // otherwise the next distribution reconditions it back into the band
+    // (watched reset, fresh cluster date) and it reappears near the top.
+    syncBagForWatched(req.params.videoId, true);
     await updateIndexFile();
     res.json({ success: true });
   } catch (e: any) {
@@ -3377,6 +3456,9 @@ app.patch('/api/video/:videoId/watched', async (req, res) => {
     if (result.count === 0) {
       console.warn(`⚠️ Toggle watched skipped — video ${req.params.videoId} not found`);
     }
+    // The other half of the round trip: un-watching re-joins the rotation
+    // immediately (tail-insert, guarded by grabby-index + MP3 presence).
+    syncBagForWatched(req.params.videoId, !!watched);
     await updateIndexFile();
     res.json({ success: true });
   } catch (e: any) {

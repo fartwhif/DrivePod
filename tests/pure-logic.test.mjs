@@ -292,6 +292,30 @@ console.log('\n== T2 Pure pipeline logic (real compiled code) ==\n');
   t('bag: nothing to return/prune → no write, placed pulls stay used',
     r.returned === 0 && r.dropped === 0 && fs.readFileSync(BAG, 'utf-8') === before && readBag()[0].used === true);
 
+  // ── pruneIds: the DB proved THIS track was played — leave the bag for good ──
+  // A played track that rotated back would be re-pulled on the next run (it has
+  // an MP3 and the catalog still lists it), burning a pull forever. Unlike index
+  // absence this was checked against the DB this run, so it bypasses the
+  // mass-absence guard: no transient-read risk, no reason to keep it.
+  seedBag(Array.from({ length: 20 }, (_, i) => ({ videoId: `p${i}`, used: false })));
+  r = server.reconcileShuffleBag([], S('p0'), ['p5']);   // 19 absent > 10 % → mass, but p5 was played
+  bag = readBag();
+  t('bag: a played entry is pruned even under MASS absence (the guard is bypassed)',
+    r.dropped === 1 && r.absent === 19 && !bag.some(e => e.videoId === 'p5'), JSON.stringify(r));
+  t('bag: mass-guard bypass prunes ONLY the played id — the other absent entries stay',
+    bag.length === 19 && bag.some(e => e.videoId === 'p1') && bag.some(e => e.videoId === 'p19'),
+    JSON.stringify(bag.length));
+  seedBag([{ videoId: 'playedUsed', used: true }, { videoId: 'keepU', used: false }]);
+  r = server.reconcileShuffleBag([], S('playedUsed', 'keepU'), ['playedUsed']);
+  t('bag: a played entry leaves even when it is `used` (never a zombie slot)',
+    r.dropped === 1 && !readBag().some(e => e.videoId === 'playedUsed'), JSON.stringify(readBag()));
+  // Played wins over returned: a pull the plan both skipped AND proved watched left
+  // the queue, so it leaves the bag too — rotating it back would re-pull a played track.
+  seedBag([{ videoId: 'pboth', used: true }]);
+  r = server.reconcileShuffleBag(['pboth'], S('pboth'), ['pboth']);
+  t('bag: played wins over returned — never rotated back into the rotation',
+    r.dropped === 1 && r.returned === 0 && readBag().length === 0, JSON.stringify(r));
+
   fs.rmSync(BAG);
   r = server.reconcileShuffleBag(['ghost'], S('ghost'));
   t('bag: missing shufflebag.json → no-op, no file created',
@@ -1039,6 +1063,92 @@ exit 0`);
   await prisma.channel.deleteMany({ where: { channelId: { in: ['UCOwnChan', 'UCMissingChan'] } } });
   await prisma.channel.deleteMany({ where: { channelId: { startsWith: 'UCGrabbyTube' } } });
   for (const vid of ['ownV1', 'normAnchor', 'gA', 'gB', 'rvSeen1', 'rvSeen2', 'rvAuth3', 'rvNoSidecar']) {
+    fs.rmSync(path.join(CACHE_DIR, vid), { recursive: true, force: true });
+  }
+  fs.rmSync(GIDX, { force: true });
+  fs.rmSync(BAGF, { force: true });
+}
+
+// ── 17. watched ⇄ bag — "played" leaves the rotation until un-played ──
+// The old bug: a played grabby track was reconditioned back into the band on
+// the next 5-min run, so un-watching it never stuck AND the rotation kept
+// pulling a track the user had already heard. These lock the new contract: a
+// watched id leaves the bag for good (initShuffleBag set-aside + the sync),
+// and an un-watch puts it back ONLY if the catalog still lists it with a file.
+{
+  const GIDX = path.join(CACHE_DIR, 'grabby-index.json');
+  const BAGF = path.join(CACHE_DIR, 'shufflebag.json');
+  await prisma.video.deleteMany({ where: { isGrabby: true } });
+  await prisma.video.deleteMany({ where: { videoId: { startsWith: 'sw' } } });
+  await prisma.channel.upsert({
+    where: { channelId: 'UCGrabbyTube' }, update: {},
+    create: { channelId: 'UCGrabbyTube', title: 'GrabbyTube', order: 999999, active: false }
+  });
+  const mkFile = (vid) => {
+    const dir = path.join(CACHE_DIR, vid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${vid}.mp3`), Buffer.alloc(1024, 0x41));
+  };
+  const idxEntry = (vid) => ({ videoId: vid, title: `Track ${vid}`, author: 'A',
+    duration: 900, audioPath: `${vid}/${vid}.mp3`,
+    createdAt: new Date(Date.now() - 86400000).toISOString() });
+  const mkRow = (vid, isGrabby, watched) => prisma.video.create({
+    data: { videoId: vid, channelId: 'UCGrabbyTube', title: vid,
+      publishedAt: new Date(), audioPath: `${vid}/${vid}.mp3`, isGrabby, watched }
+  });
+  const readBag = () => JSON.parse(fs.readFileSync(BAGF, 'utf-8'));
+  const writeBag = (e) => fs.writeFileSync(BAGF, JSON.stringify(e));
+  const realLog = console.log;
+  const quiet = async (fn) => {
+    const lines = []; console.log = (...a) => lines.push(a.join(' '));
+    try { await fn(); } finally { console.log = realLog; } return lines;
+  };
+
+  for (const vid of ['sbUnwatched', 'sbWatched', 'sbWatchedNorm', 'swA', 'swB']) mkFile(vid);
+  // swNoFile is catalogued but its MP3 is gone — un-watching must not re-admit it.
+  fs.writeFileSync(GIDX, JSON.stringify(
+    ['sbUnwatched', 'sbWatched', 'sbWatchedNorm', 'swA', 'swB', 'swNoFile'].map(idxEntry)));
+  await mkRow('sbUnwatched', true, false);
+  await mkRow('sbWatched', true, true);
+  await mkRow('sbWatchedNorm', false, true);   // watched but NOT grabby: still bag-eligible
+
+  const seedLines = await quiet(() => server.initShuffleBag());
+  const seeded = readBag().map(e => e.videoId).sort();
+  t('seed: a played (watched) grabby track is set aside, never seeded',
+    !seeded.includes('sbWatched'), seeded.join(','));
+  t('seed: an unwatched grabby track and a watched NON-grabby track both stay in',
+    seeded.includes('sbUnwatched') && seeded.includes('sbWatchedNorm'), seeded.join(','));
+  t('seed: the set-aside is reported, not silent',
+    seedLines.some(l => /played-and-set-aside/.test(l)), seedLines.join(' | '));
+
+  // syncBagForWatched is file-only (it reads grabby-index.json, not the DB).
+  writeBag([]);
+  server.syncBagForWatched('swA', false);
+  t('watch-sync: un-watch re-admits a listed track with a file (at the tail, unused)',
+    JSON.stringify(readBag()) === JSON.stringify([{ videoId: 'swA', used: false }]),
+    JSON.stringify(readBag()));
+  writeBag([]);
+  server.syncBagForWatched('ghostX', false);
+  server.syncBagForWatched('swNoFile', false);
+  t('watch-sync: un-watch never adds an unlisted id or a file-less id',
+    readBag().length === 0, JSON.stringify(readBag()));
+  writeBag([{ videoId: 'swA', used: true }, { videoId: 'swGone', used: true }]);
+  server.syncBagForWatched('swA', true);
+  server.syncBagForWatched('swGone', true);   // used entry the catalog no longer lists
+  t('watch-sync: watch removes a used entry and one absent from the index alike',
+    readBag().length === 0, JSON.stringify(readBag()));
+  writeBag([{ videoId: 'swB', used: false }]);
+  const noopBefore = fs.readFileSync(BAGF, 'utf-8');
+  server.syncBagForWatched('swB', false);   // already present → no write
+  t('watch-sync: un-watch of an already-present entry is a no-op (no churn)',
+    fs.readFileSync(BAGF, 'utf-8') === noopBefore);
+  writeBag([{ videoId: 'swB', used: false }]);
+  server.syncBagForWatched('ghostY', true);   // watched but never in the bag
+  t('watch-sync: watch of an absent id leaves the file untouched',
+    JSON.stringify(readBag()) === JSON.stringify([{ videoId: 'swB', used: false }]));
+
+  await prisma.video.deleteMany({ where: { videoId: { startsWith: 'sb' } } });
+  for (const vid of ['sbUnwatched', 'sbWatched', 'sbWatchedNorm', 'swA', 'swB']) {
     fs.rmSync(path.join(CACHE_DIR, vid), { recursive: true, force: true });
   }
   fs.rmSync(GIDX, { force: true });
