@@ -52,14 +52,18 @@
   `UPDATE Video SET watched=0, progress=0` (the index self-heals on the
   next harvest, seconds later).
 - **T4 — frontend playback logic (pure, no browser, no network)**:
-  `node tests/stall-guard.test.mjs` (~1 s). Compiles `frontend/src/app/stall-guard.ts`
-  and drives the watchdog decision on simulated ticks: the `readyState 4`
-  stale-buffer case (the real freeze), a load that never answers, scrubbing /
-  paused / frozen-tab immunity, the 3-reload give-up cadence, and both resume
-  clocks (`stallResumeTarget`: element `currentTime` vs the laggy index copy)
-  plus `streamTrackId(audio.src)` — the function that says WHICH track a
+  `node tests/stall-guard.test.mjs` (~1 s, 64 assertions). Compiles
+  `frontend/src/app/stall-guard.ts` and drives the watchdog decision on simulated
+  ticks: the `readyState 4` stale-buffer case (the real freeze), a load that never
+  answers, scrubbing / paused / frozen-tab immunity, the 3-reload give-up cadence,
+  both resume clocks (`stallResumeTarget`: element `currentTime` vs the laggy index
+  copy), `streamTrackId(audio.src)` — the function that says WHICH track a
   `currentTime` belongs to, which is what fixes the next-track inherits its
-  predecessor's position bug. No live system, no DB, no build.
+  predecessor's position bug — and the error-attribution rules (`mediaEventTrackId`
+  prefers the element's actual selection `currentSrc` over the `src` attribute,
+  `mediaErrorIsTrackDefect` / `playRejectIsTrackDefect` decide whether a signal
+  implicates the FILE at all), all driven on the shapes measured from the deployed
+  chromium on 2026-11-17. No live system, no DB, no build.
 - **T5 — advance/resume browser E2E recipe** (headless Chromium + `--autoplay-policy=no-user-gesture-required`):
   open the app, tag a short (≤150 s) queue row by id, click it (a trusted click
   is what grants playback permission), then either await its `ended` event or
@@ -504,7 +508,7 @@ absence → prune nothing, log only). T2 gained section 15 — the compiled
 `distributeGrabbyItems()` driven against a scratch DB, 122 assertions — because
 the pure planner tests cannot see timestamps or bag state. The frontend
 playback liveness watchdog (`stall-guard.ts` + `_runStallCheck()`, T4 =
-`node tests/stall-guard.test.mjs`, 53 assertions) is now in the DEPLOYED
+`node tests/stall-guard.test.mjs`, 64 assertions) is now in the DEPLOYED
 bundle: 20 s of no `timeupdate` progress on a "playing" element →
 `⏳ Buffering…/Reconnecting…` badge + same-track reload over a NEW request,
 resumed at `stallResumeTarget()`, skip after 3 attempts. E2E-proven against a

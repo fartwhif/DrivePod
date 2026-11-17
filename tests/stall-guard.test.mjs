@@ -33,6 +33,10 @@ const {
   evaluateStall,
   HAVE_POSITION_READY_STATE,
   MAX_STALL_RECOVERIES,
+  MEDIA_ERROR,
+  mediaErrorIsTrackDefect,
+  mediaEventTrackId,
+  playRejectIsTrackDefect,
   READY_STATE_FED,
   RESUME_DETECT_MS,
   STALL_CHECK_MS,
@@ -374,6 +378,68 @@ t('no source (skipped/stopped element) owns no track',
   t('a load whose source is the next track is judged a different track',
     streamTrackId(streamSrc('Id0XE5s7-Ck')) === 'Id0XE5s7-Ck'
     && streamTrackId(streamSrc('Id0XE5s7-Ck')) !== 'cm7i62EE7T8');
+}
+
+console.log('\nwhich track a media ELEMENT event belongs to (error attribution)');
+// Measured 2026-11-17 in the deployed Chromium against the deployed backend
+// (two presses while the first load was still in flight): `error`, `emptied`
+// and `loadstart` all reported `currentSrc` = the track that press had
+// ABANDONED with `error.code` 4 / `networkState` 3, while `audio.src` already
+// named the track the press had SELECTED. Charging that event to `src` marked
+// a file the listener never heard as broken (twice → skipped + `/watched`).
+{
+  const pressedAway = streamSrc('Id0XE5s7-Ck');
+  const justPressed = streamSrc('cm7i62EE7T8');
+  t('an aborted selection is owned by currentSrc, not by the new src',
+    mediaEventTrackId(pressedAway, justPressed) === 'Id0XE5s7-Ck');
+  t('a selection that completed owns the event under its own currentSrc',
+    mediaEventTrackId(justPressed, justPressed) === 'cm7i62EE7T8');
+  t('no selection yet (loadstart of a fresh pick) falls back to the src we set',
+    mediaEventTrackId('', justPressed) === 'cm7i62EE7T8');
+  t('our own teardown (src cleared, no selection) attributes to no track',
+    at([mediaEventTrackId('', ''), mediaEventTrackId('about:blank', '/cache/index.json')])
+      === at([null, null]));
+  // `src=''` is a real value, not just an idle marker: the spec resolves it
+  // against the document, and the element then re-selects and errors on the
+  // PAGE URL — measured to fire ~1.1 s after the clear, still naming the OLD
+  // currentSrc. The owner is that old track, which is exactly why nothing may
+  // be charged for it once we have moved on.
+  t('a teardown error still names the track the element last selected',
+    mediaEventTrackId(pressedAway, 'https://listen.example.com/l/owner/') === 'Id0XE5s7-Ck');
+}
+
+console.log('\nwhich element signals say the FILE is broken');
+{
+  // On the wire: a 404 stream and a 200 body of garbage BOTH settle on
+  // MEDIA_ERR_SRC_NOT_SUPPORTED with a NotSupportedError play rejection —
+  // code 4 is the engine's answer for "what I selected is not playable",
+  // which is a defect of the file we served it.
+  t('DECODE, NETWORK and SRC_NOT_SUPPORTED are file defects',
+    at([MEDIA_ERROR.DECODE, MEDIA_ERROR.NETWORK, MEDIA_ERROR.SRC_NOT_SUPPORTED]
+      .map(mediaErrorIsTrackDefect)) === at([true, true, true]));
+  // ABORTED is the element dropping a selection WE replaced (a newer src, a
+  // load(), a stop). It says nothing about the file: on the wire, pressing
+  // through a track mid-load produced code 4 under the abandoned track's
+  // currentSrc only because that load had ALREADY failed on its own, while a
+  // clean supersede fired abort/emptied with `error` = null and no code at all.
+  t('ABORTED is never a file defect', mediaErrorIsTrackDefect(MEDIA_ERROR.ABORTED) === false);
+  t('silence (no MediaError: the emptied/abort shape) is never a file defect',
+    at([null, undefined, 0, 5, NaN].map(mediaErrorIsTrackDefect))
+      === at([false, false, false, false, false]));
+  // The autoplay policy refusing an unprompted play, and our own next load()
+  // cancelling a pending play() ("The play() request was interrupted by a call
+  // to load()"), are both measurements of US, not of the file. Charging
+  // AbortError skipped playable tracks; recovering from it re-pointed `src`
+  // back at the track being left and wiped the pick.
+  t('NotAllowedError and AbortError play rejections say nothing about the file',
+    at(['NotAllowedError', 'AbortError'].map(playRejectIsTrackDefect)) === at([false, false]));
+  t('a play rejection that DOES name the file is a defect',
+    at(['NotSupportedError', 'EncodingError'].map(playRejectIsTrackDefect)) === at([true, true]));
+  // Conservative on the unknown: a name we do not recognize goes through the
+  // probe (charge + reload allowed) rather than being swallowed.
+  t('an absent or unrecognized play-rejection name is treated as a defect',
+    at([null, undefined, 'NetworkError', 'SomethingNewError'].map(playRejectIsTrackDefect))
+      === at([true, true, true, true]));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

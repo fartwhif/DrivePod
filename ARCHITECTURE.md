@@ -980,11 +980,51 @@ current position, progress time labels.
      playlist, POST watched, advance);
    - unreachable/other → `_probeAndPlay`: exponential backoff
      (3 s × 1.5^n, cap 30 s), **indefinite** until 200 or 404.
-2. `play()` rejection: `NotAllowedError` = autoplay policy (stay paused,
-   ready for gesture); anything else → probe again; on persistent failure
-   stop the player and `advanceToNextTrack()`.
-3. `audio.onerror` (fires for both 404 and network loss) → same HEAD probe:
-   404 skip, 200 reload, unreachable do nothing (probe loop owns retry).
+2. `play()` rejection → `playRejectIsTrackDefect(err.name)`: `NotAllowedError`
+   (autoplay policy — stay paused, ready for gesture) and `AbortError` ("the
+   play() request was interrupted by a call to `load()`": OUR next selection
+   cancelled this attempt, the normal outcome of two presses) say NOTHING about
+   the file — no probe, no reload, no charge; a reload would re-point `src` at
+   the track being left and wipe the pick. Any other or absent name → probe
+   again; on persistent failure stop the player and `advanceToNextTrack()`.
+3. `audio.onerror` → **attribute** (`mediaEventTrackId`), **classify**
+   (`mediaErrorIsTrackDefect`), then the same HEAD probe: 404 → skip
+   (the file really is gone, whatever brought the error here); file present +
+   defect → charge one recovery and reload; file present + not a defect (the
+   element dropped a load WE replaced) → nothing, the watchdog owns that
+   attempt.
+
+**Every media signal is attributed by `currentSrc`, not by `src`**
+(`mediaEventTrackId(audio.currentSrc, audio.src)`, `stall-guard.ts`; T4 drives
+it). Assigning `src` updates the ATTRIBUTE synchronously while the selection it
+aborts is still being torn down, so a press that lands during the previous load
+produces an `error`/`emptied`/`loadstart` for the ABANDONED track with the NEW
+track already sitting in `src`. Measured 2026-11-17 in the deployed chromium
+against this backend (two presses, first load still in flight): those events
+carried `currentSrc` = the pressed-away track with `error.code` 4 /
+`networkState` 3 while `audio.src` named the track that press had selected — so
+the healthy new track was charged with its predecessor's aborted load, and two
+such charges hit `MAX_TRACK_PLAY_FAILURES` and marked watched a file the
+listener never heard (a large part of "it does not remember what I watched").
+A selection that fails AFTER being chosen reports under its OWN `currentSrc`
+(the load algorithm assigns it before the fetch), so preferring `currentSrc`
+never hides a real failure of the current track. `onwaiting`/`onstalled` (which
+settle the fresh-load window) and `saveProgress` carry the same gate: a stale
+`waiting` must not burn the new track's recovery budget, and a position that
+belongs to the track being left (0, once its load is aborted) must not be
+written over the resume point earned on the candidate.
+
+**What each error shape means** (measured 2026-11-17 in the deployed chromium,
+not read off the spec): a stream 404 AND a 200 whose body is not playable both
+settle on `MEDIA_ERR_SRC_NOT_SUPPORTED` (4) with a `NotSupportedError` play
+rejection — code 4 is the engine's "what I selected is not playable", and both
+of those ARE defects of the file we served. A clean supersede fires
+`abort`/`emptied` with `audio.error === null` and no code implicating any file,
+and its `play()` rejection is named `AbortError`. `src = ''` (every stop path)
+is NOT a silent marker: the element re-selects it against the document and
+~1.1 s later fires its own code-4 `error` naming the OLD `currentSrc` under the
+page URL — attribution plus "not the current track ⇒ ignore" is what keeps that
+teardown from charging or reloading the track that replaced it.
 
 **Autoplay on load**: first successful `loadIndex()` triggers
 `_attemptInitialAutoplay()`. The saved `currentVideoId` wins whenever it is still
@@ -1123,14 +1163,18 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   badge — `⏳ Buffering…` / `⏳ Reconnecting…` — the only visible sign any of
   this happened (`idle` renders nothing; silent starvation used to render nothing
   at all, which is why "the app just stopped and nothing said why").
-- Test: `node tests/stall-guard.test.mjs` (53 assertions, no browser and no
-  network: the pure decision plus both resume clocks and the
-  `streamTrackId` track-ownership rule, driven on simulated ticks — including
-  the `readyState 4` stale buffer, a load that never answers, the give-up
-  cadence, scrubbing/paused/frozen-tab immunity, and the advance cases: a
+- Test: `node tests/stall-guard.test.mjs` (64 assertions, no browser and no
+  network: the pure decision plus both resume clocks, the `streamTrackId`
+  track-ownership rule and the `mediaEventTrackId` / `mediaErrorIsTrackDefect` /
+  `playRejectIsTrackDefect` error-attribution rules, driven on simulated ticks —
+  including the `readyState 4` stale buffer, a load that never answers, the
+  give-up cadence, scrubbing/paused/frozen-tab immunity, the advance cases (a
   longer next track never inherits the finished track's position, a next track
-  resumes at its own saved progress, and a same-track re-load keeps its live
-  position).
+  resumes at its own saved progress, a same-track re-load keeps its live
+  position), and the measured element shapes: an aborted selection is owned by
+  `currentSrc` not by the new `src`, a teardown error still names the track the
+  element last selected, code 4 is a defect while code 1 and no-code silence are
+  not, and `AbortError`/`NotAllowedError` play rejections are not.)
 
 ### 12.4 Progress persistence
 

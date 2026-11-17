@@ -61,6 +61,90 @@ export const STALL_DETECT_MS = 20_000;
  *  so it rides on the existing always-on connectivity probe's 5 s timer. */
 export const STALL_CHECK_MS = 5_000;
 
+/** `audio.error.code` (MediaError), as the DOM numbers them — verified
+ *  against a live element in Chromium on 2026-11-17, not from memory. */
+export const MEDIA_ERROR = {
+  /** MEDIA_ERR_ABORTED: this selection was superseded (a newer `src`, a
+   *  `load()`, or a stop). The element cancelling its own load is our doing,
+   *  never evidence about the file. */
+  ABORTED: 1,
+  /** MEDIA_ERR_NETWORK: the fetch died. */
+  NETWORK: 2,
+  /** MEDIA_ERR_DECODE: the bytes reached us and will not play. */
+  DECODE: 3,
+  /** MEDIA_ERR_SRC_NOT_SUPPORTED: what the element settled on is not playable
+   *  media (a 404 body, a wrong MIME, a codec the element lacks). */
+  SRC_NOT_SUPPORTED: 4
+} as const;
+
+/** `audio.networkState`, for reading a failure the way an engine records it:
+ *  NO_SOURCE means NO selection is in progress — the state a superseded load
+ *  leaves behind, where the stale `error` object of the abandoned track is
+ *  what `audio.error` still holds when its `error` event finally arrives. */
+export const MEDIA_NETWORK_STATE = {
+  NETWORK_EMPTY: 0,
+  NETWORK_IDLE: 1,
+  NETWORK_LOADING: 2,
+  NETWORK_NO_SOURCE: 3
+} as const;
+
+/** `play()` rejection names that say NOTHING about the file: the autoplay
+ *  policy refusing an unprompted play, and a superseding load cancelling the
+ *  attempt. Anything else (NotSupportedError, NetworkError, an engine-specific
+ *  name we do not recognize) goes through the probe. */
+export const PLAY_REJECT_NON_DEFECT_NAMES: readonly string[] = ['NotAllowedError', 'AbortError'];
+
+/** Which track a media-element event belongs to: the resource the element
+ *  actually selected (`currentSrc`), falling back to what we asked for
+ *  (`src`) when no selection completed.
+ *
+ *  Asking `src` is the bug this exists for. Assigning a new `src` updates the
+ *  attribute SYNCHRONOUSLY, while the selection it aborts is still being torn
+ *  down, so a press that lands while the previous load is in flight produces
+ *  an `error` for the ABANDONED track with the NEW track already sitting in
+ *  `src`. Measured on the wire (2026-11-17, two quick presses):
+ *  `error`/`emptied`/`loadstart` all carried `currentSrc` = the pressed-away
+ *  track with `error.code` 4 and `networkState` 3, while `audio.src` named the
+ *  track that press had selected — so the healthy new track was charged with
+ *  its predecessor's aborted load, and two such charges skipped it as broken
+ *  and POSTed `/watched` for a file the listener never heard.
+ *
+ *  A selection that fails after it is chosen reports under its OWN
+ *  `currentSrc` (the algorithm assigns it before the fetch: `loadstart`
+ *  arrives with `currentSrc` already naming the new track), so preferring
+ *  `currentSrc` never hides a real failure of the current track. */
+export function mediaEventTrackId(currentSrc: string, src: string): string | null {
+  return streamTrackId(currentSrc) ?? streamTrackId(src);
+}
+
+/** Does this `error` event say something is wrong with the FILE?
+ *  ABORTED never does (it is the element dropping a selection we replaced);
+ *  `null` (no MediaError attached — the shape of `emptied`/`abort`) never
+ *  does. Silence from an abandoned selection is judged by the liveness
+ *  watchdog, which keys on the track actually loaded. */
+export function mediaErrorIsTrackDefect(code: number | null): boolean {
+  return code === MEDIA_ERROR.DECODE
+    || code === MEDIA_ERROR.NETWORK
+    || code === MEDIA_ERROR.SRC_NOT_SUPPORTED;
+}
+
+/** Is this `play()` rejection evidence about the FILE?
+ *
+ *  `NotAllowedError` is the autoplay policy refusing an unprompted play, and
+ *  `AbortError` ("The play() request was interrupted by a call to load()") is
+ *  what a superseding selection — OUR next load, the next press — produces.
+ *  Charging either to the track is how a playable file gets marked watched
+ *  after being heard zero times; re-loading to "recover" from `AbortError`
+ *  additionally wipes the track the user just picked by pointing `src` back at
+ *  the track being left.
+ *  An absent or unrecognized name is treated as a defect so a new
+ *  engine-specific failure still goes through the probe instead of going
+ *  silent. */
+export function playRejectIsTrackDefect(name?: string | null): boolean {
+  return name === undefined || name === null
+    || !PLAY_REJECT_NON_DEFECT_NAMES.includes(name);
+}
+
 /** Fresh loads attempted on one track before it is given up on. Any audible
  *  progress clears the count, so only a track that never plays again is
  *  skipped — a flaky link that keeps recovering is never abandoned. */
@@ -204,7 +288,9 @@ export const HAVE_POSITION_READY_STATE = 1;
 
 /** The videoId of the `/api/stream/<id>` source a media element is loaded
  *  with, or null when it holds no track (`src` is '' after a skip or stop).
- *  A position, an error and a progress save all belong to THAT track. */
+ *  Only what the element ACTUALLY selected is evidence about a track: see
+ *  `mediaEventTrackId` for the `currentSrc`/`src` precedence a position, an
+ *  error event and a progress save all need. */
 export function streamTrackId(src: string): string | null {
   const m = /\/api\/stream\/([A-Za-z0-9_-]+)/.exec(src);
   return m ? m[1] : null;

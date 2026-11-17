@@ -5,6 +5,9 @@ import { FormsModule } from '@angular/forms';
 import {
   evaluateStall,
   MAX_STALL_RECOVERIES,
+  mediaErrorIsTrackDefect,
+  mediaEventTrackId,
+  playRejectIsTrackDefect,
   PlaybackPhase,
   RESUME_DETECT_MS,
   STALL_DETECT_MS,
@@ -154,7 +157,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    // SKIP MARKS WATCHED: treat skip-next as if the track finished playing
    skipMarksWatched = signal(false);
 
-  private readonly APP_VERSION = '1.15.0';   // ← bumped for the restored, gated ⏮️
+  private readonly APP_VERSION = '1.16.0';   // ← bumped for currentSrc error attribution
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched'>('queue');
   protectedPlaylist = signal<Video[]>([]);
@@ -989,18 +992,36 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     };
 
     this.audio.onerror = () => {
-      // The error belongs to the src currently on the element — which may
-      // differ from currentVideo if we already advanced past the failing
-      // track. Stale errors for an abandoned track must be ignored.
-      const m = /\/api\/stream\/([A-Za-z0-9_-]+)/.exec(this.audio.src);
-      const videoId = m ? m[1] : (this.currentVideo()?.videoId ?? null);
-      if (videoId) {
-        console.warn('Audio playback error for', videoId, '-- probing');
-        this._handleAudioError(videoId);
-      } else {
+      // Attribution BEFORE anything else. An `error` belongs to the selection
+      // the element actually made (`currentSrc`), NOT to `src`: assigning a
+      // new `src` updates that attribute synchronously while the selection it
+      // aborts is still being torn down, so a press landing during the
+      // previous load used to charge the ABANDONED track's aborted load to
+      // the healthy track that press had just selected. Two such charges hit
+      // MAX_TRACK_PLAY_FAILURES and skipped a file the listener never heard
+      // (verified on the wire 2026-11-17: `error` carried `currentSrc` = the
+      // pressed-away track while `audio.src` named the new one).
+      const owner = mediaEventTrackId(this.audio.currentSrc, this.audio.src);
+      if (!owner) {
         console.warn('Audio playback error (no current video)');
         this.setMediaPlaybackState('none');
+        return;
       }
+      const code = this.audio.error?.code ?? null;
+      const defect = mediaErrorIsTrackDefect(code);
+      if (!defect && owner !== this.currentVideo()?.videoId) {
+        // A superseded selection we already moved on from: not evidence about
+        // any file, and the track that owns the element now has its own fresh
+        // load being judged by the liveness watchdog.
+        console.log(`Superseded load on ${owner} (error code ${code ?? 'none'}) -- not a file defect`);
+        return;
+      }
+      // An ABORTED error on the track that is STILL current is the element
+      // having given up on our load of it. That is not proof of a corrupt
+      // file (so it must not spend the failure counter), but it can be a
+      // vanished one, so the existence probe still runs — it just cannot
+      // charge or reload anything.
+      this._handleAudioError(owner, defect);
     };
 
     // Silent starvation: a connection that dies without an RST (dead Wi-Fi,
@@ -1009,10 +1030,16 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     // judges it on the next tick instead of waiting behind `loadInFlight`;
     // neither one triggers a reload by itself (a buffer refill mid-song fires
     // `stalled` routinely).
+    // Gated on the same ownership: a `waiting`/`stalled` belonging to a
+    // selection the element has already abandoned must not settle the NEW
+    // track's fresh-load window, or the watchdog would count an attempt that
+    // was never the new track's and burn its recovery budget.
     this.audio.onwaiting = () => {
+      if (mediaEventTrackId(this.audio.currentSrc, this.audio.src) !== this.currentVideo()?.videoId) return;
       this._freshLoad = false;
     };
     this.audio.onstalled = () => {
+      if (mediaEventTrackId(this.audio.currentSrc, this.audio.src) !== this.currentVideo()?.videoId) return;
       this._freshLoad = false;
     };
 
@@ -1063,6 +1090,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private saveProgress(progress: number): void {
     const video = this.currentVideo();
     if (!video?.videoId) return;
+    // The position belongs to the track the ELEMENT holds, which during an
+    // advance is the one being left (and 0 once the load is aborted).
+    // Writing it onto the new candidate clobbers the resume point earned
+    // there, so an element not loaded with the current track saves nothing —
+    // the track being left had its real position saved on the last interval.
+    if (mediaEventTrackId(this.audio.currentSrc, this.audio.src) !== video.videoId) return;
 
     const progressInt = Math.floor(progress);
 
@@ -1629,6 +1662,15 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           this.setMediaPlaybackState('paused');
           return;
         }
+        if (!playRejectIsTrackDefect(err.name)) {
+          // AbortError: `audio.load()` of the NEXT selection cancelled this
+          // attempt while its promise was pending — our own doing, the usual
+          // outcome of two presses in a row. Probing proves nothing (the file
+          // was never the problem) and reloading would point `src` back at
+          // this track, wiping the one the user just picked.
+          console.log(`Play superseded for ${video.videoId} (${err.name}) -- newer selection owns the element`);
+          return;
+        }
         // Real error -- probe to decide
         const headers: Record<string, string> = {};
 
@@ -1640,7 +1682,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
             } else {
               console.log(`Play rejected for ${video.videoId} -- reloading audio`);
               this.loadAndSeekVideo(video);
-              this.audio.play().catch(() => {
+              this.audio.play().catch((er: Error) => {
+                if (!playRejectIsTrackDefect(er?.name)) return;
                 fetch(`/api/stream/${video.videoId}`, { method: 'HEAD', headers })
                   .then(res2 => {
                     if (res2.status === 404 || res2.status >= 500) {
@@ -1680,8 +1723,22 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  /** Called from audio.onerror. Probe to decide: skip (defunct) or retry (transient). */
-  private _handleAudioError(videoId: string): void {
+  /**
+   * Called from audio.onerror. The HEAD probe decides what the FILE is, the
+   * caller's `defect` flag (from the element's own error code) decides what
+   * may be charged for it:
+   *  - 404: the file is gone (purged mid-play, harvest deleted it) — drop it
+   *    from the queue and advance, whatever brought the error here.
+   *  - file present AND the element blaming the file (DECODE / NETWORK /
+   *    SRC_NOT_SUPPORTED): spend one recovery of this track's budget and
+   *    reload it.
+   *  - file present and the element NOT blaming it (`ABORTED`: it dropped the
+   *    load we ourselves replaced): nothing is proven about the file, so
+   *    charge nothing and reload nothing — a reload here would re-point `src`
+   *    back at a track the user may already have left, and a charge is what
+   *    skipped playable files. The liveness watchdog owns this attempt.
+   */
+  private _handleAudioError(videoId: string, defect = true): void {
     if (this.currentVideo()?.videoId !== videoId) return;
 
     const headers: Record<string, string> = {};
@@ -1691,6 +1748,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         if (res.status === 404) {
           console.warn(`Audio error: track ${videoId} is defunct -- skipping`);
           this._skipDefunctTrack(videoId);
+        } else if (!defect) {
+          console.log(`Audio error on ${videoId}: element dropped our load, file is present -- leaving the attempt to the watchdog`);
         } else if (res.ok) {
           this._registerTrackPlayFailure(videoId);
           const video = this.currentVideo();
