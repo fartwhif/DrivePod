@@ -603,10 +603,10 @@ watched tracks, still not removing watched items from the queue, still ignoring
 the autoplay mode, and the Delete key occasionally alerting "not found". The
 404-alert half was already fixed server-side (round 1) — but the DEPLOYED
 bundle carried neither that frontend branch nor round 2: the vendored tree in
-the listen hub had been re-copied to the `23b03a9` pin, which predates both, so
+the listen hub had been re-copied to the `0642f8a` pin, which predates both, so
 the hub image served `main-Q75CKKAZ.js` reporting `APP_VERSION 1.13.0` from a
 tree whose round-1 backend fix was present while its frontend was 265 lines
-behind upstream. Re-vendored the whole set from `23b03a9` + these commits
+behind upstream. Re-vendored the whole set from `0642f8a` + these commits
 (clean 3-way merge, hub patch set byte-unchanged) and redeployed. The remaining
 "autoplay mode ignored / watched not removed" half was a third instance of the
 ordering bug, this time in the consume handler: `markAsWatchedAndPlayNext()`

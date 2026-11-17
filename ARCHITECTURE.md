@@ -861,7 +861,7 @@ superseded versions): `alternativeMetadataFetchEnabled`,
 ## 11. Backend API Reference
 
 **All routes are unauthenticated** (auth was removed 2026-08-23, commit
-`b7664c0`). Anyone who can reach the port can call the full API, including
+`bb36974`). Anyone who can reach the port can call the full API, including
 destructive routes. Access control is the WireGuard perimeter + network
 topology. There are no `/api/auth/*` routes; the `requireAuth` middleware
 referenced in older docs does not exist.
@@ -1246,7 +1246,7 @@ docker exec drivepod curl -s http://drivepod-bgutil:4416/ping  # sidecar
 
 ### 13.4 Line endings
 
-Repo is normalized to **LF** (commit `c6a99e9`; `.gitattributes`
+Repo is normalized to **LF** (commit `2e7c3de`; `.gitattributes`
 `* text=auto eol=lf`). Older skill notes about CRLF are stale — normal
 `patch`/`write_file` edits are fine now.
 
