@@ -27,9 +27,16 @@
   (~1 min). Builds the REAL `backend/dist/server.js` and drives its
   exported seams (`cleanRssItems`, `parseYtDlpDuration`,
   `applyTodayMidnightRule`, `isFilteredOutByDuration`, `readMp3HeaderClaim`,
-  `writeIfChanged`, `resolveGrabbyAudioPath`, …) in a `node:20-bookworm`
-  docker with a scratch Prisma DB — no live system touched. Must be full
-  `bookworm` (slim lacks the `openssl` CLI the Prisma engine probes).
+  `writeIfChanged`, `resolveGrabbyAudioPath`, `folderCorruptionReason`,
+  `sidecarIsGrabbyAuthored`, the `DELETE /api/video/:id/grabby` handler via
+  `app.handle`, …) in a `node:20-bookworm` docker with a scratch Prisma DB — no
+  live system touched. Must be full `bookworm` (slim lacks the `openssl` CLI the
+  Prisma engine probes). §17 hands `folderCorruptionReason` name lists (healthy
+  grabby folder with a `.tr64k.mp3` + `.bak`, the old rule's 187 false positives,
+  a real 0/2-audio corruption); §18 drives the consume route against a stubbed
+  grabbytube on :8101 — which is why `run-scratch.sh` passes
+  `--add-host grabbytube:127.0.0.1` (the image has no such name and the route's
+  remote-first delete must resolve it).
 - **T3 — browser E2E**: open the SPA headless on the queue tab (default),
   paginate to the `🎉 End of queue` sentinel by scrolling the
   `↓ Scroll for more items` element (the `#loadMoreTrigger` in the template
@@ -66,6 +73,18 @@
   `window.Audio` (`window.__audios`) BEFORE the goto; a `tab.run`/evaluate after
   load is too late to observe the boot autoplay, and each headless SPA tab
   writes progress/watched — zero or unwatch the touched rows afterwards.
+- **T6 — autoplay ordering (pure, no browser, no network)**:
+  `node tests/autoplay-order.test.mjs` (~1 s, 38 assertions). Transpiles
+  `frontend/src/app/autoplay-order.ts` with the frontend's own `typescript`
+  (same recipe as T4) and drives `pickNextTrack(queue, mode, finished?)` on
+  literal queues: every mode × finished-position, ties (a grabby cluster band
+  shares one drawn timestamp), a shuffled queue giving the same pick as the
+  newest-first one, the rowless-finished case (a consumed track is still in the
+  queue the caller hands in), NaN `publishedAt` (never picked, never satisfies
+  a step, never wins a scan), and the no-finished page-load picks. The bug these
+  lock: a chosen mode was honoured only on finish → next; a skipped/broken
+  track, the post-refresh advance and the autoplay on page load each hard-coded
+  "the newest in the list".
 
 ## Workflow Reminders
 - Use `Task`/`explore` agents for complex searches.
@@ -79,6 +98,36 @@
   **after** publication (zero-holes and cross-file byte-merges under
   concurrent write load observed 2026-09-20; no sync software involved —
   suspected 9p/drvfs I/O layer). See ARCHITECTURE.md §5.5/§6.
+- **`cleanupCorruptedFolders()` counts the audio file by EXACT NAME, not by
+  extension** (`folderCorruptionReason(videoId, files)`, exported so T2 §17 can
+  hand it name lists): a healthy GrabbyTube track carries
+  `<id>.mp3.tr64k.mp3` (FrogRock's transcode cache for the radio broadcast —
+  every grabby track gets one, because tunester delivers 160k/44.1k/stereo and
+  the stream is 64k/mono/24kHz) and often `<id>.mp3.bak` (GrabbyTube's backup of
+  a replaced file). Counting `.mp3` suffixes read "Multiple .mp3 files" on those
+  folders and DELETED their DB rows (files preserved), so the item left the
+  queue, its watched/progress state went with the row, and the shufflebag re-seeded
+  it as fresh — "watched items come back forever". The rule is now: exactly one
+  `<id>.mp3`, exactly one `<id>.json`, ≤2 thumbnails, anything else tolerated
+  (transcodes, `.bak`, `.part`, `.vbrfix.tmp`, `.ffmeta`, raw `.webm`/`.m4a`).
+  Live tally 2026-11-17 (owner's cache, 1,832 folders): the old rule flagged
+  **187, the new one 0** — every one of the 187 carried exactly
+  `<id>.mp3` + `<id>.mp3.tr64k.mp3`, all 187 had ALREADY lost their row, and 186
+  of them are still listed in `shufflebag.json` (33 with `used: true`), so the
+  content comes back through distribution instead of being lost — as unwatched,
+  because the watched flag lived in the deleted row.
+- **`DELETE /api/video/:id/grabby` decides library-track-ness from the sidecar,
+  not from the DB row** (2026-11-17): the row is ALSO absent when something else
+  already consumed the track (the cleanup above, `updateIndexFile`'s defunct-MP3
+  filter, a delete made in the GrabbyTube UI, a second tab), while the caller's
+  `index.json` — regenerated only on a harvest — still lists it. Answering 404
+  `Video not found` there made the Delete key on a listed-but-rowless track alert
+  and do nothing, forever. The rule: `video && !video.isGrabby` → 400 (DrivePod's
+  own video, unchanged); no row AND no GrabbyTube `createdAt` marker on the folder
+  sidecar → 404; marker present → the consume lands (remote delete, bag prune,
+  `localRecords: 0`). Fail-closed on a remote failure is unchanged: 502 and
+  nothing local is touched. T2 §18 drives all six paths against a stubbed
+  grabbytube on :8101 (`--add-host grabbytube:127.0.0.1` in `run-scratch.sh`).
 - Frontend caps repeated load failures per track (`MAX_TRACK_PLAY_FAILURES`)
   and skips unplayable-but-present tracks instead of reloading forever.
 - **GrabbyTube tracks display the real artist via per-artist placeholder
@@ -356,14 +405,72 @@
   that poll is invisible to the cache, so autoplay could keep replaying a stale
   head and never surface a fresh item. Every `newest` advance now re-fetches first
   (cheap: `index.json` is byte-stable + no-cache, so it 304s when nothing changed)
-  and plays the head of the RE-derived queue, where the fresh item is finally
-  visible; the just-finished track stays out through `mergeIndexWithLocal`'s
-  `_localWatched` pin. A dead backend never hard-stops the queue: offline, or if
-  the refresh itself fails, it rolls to the cached head; only when the cache is
-  empty too does it defer via `indexFetchPending` (the existing resume path). The
-  `oldest`/`newer`/`older` modes are unchanged (they filter by the finished
-  track's timestamp and have no fresh-surface requirement). T2 cannot see the SPA;
-  this is covered by the typecheck and the T5 advance E2E recipe, not a unit test.
+  and plays the FRESHEST track still in the RE-derived queue, where the fresh item
+  is finally visible. That pick is `_nextLeft(queue, exclude)` —
+  `pickNextTrack(queue, 'newest', exclude)` with a list-order fallback for the one
+  non-empty-queue case it answers undefined on (every `publishedAt` unparseable) —
+  and `exclude` is the track being LEFT, dropped BY ID from the fresh fetch as well:
+  a manual ⏭️ with `skipMarksWatched` OFF leaves it unwatched, so the refresh still
+  lists it and a head-only pick would hand it straight back (a just-finished track
+  is pinned watched by `mergeIndexWithLocal`'s `_localWatched` anyway). A dead
+  backend never hard-stops the queue: offline, or if the refresh itself fails, it
+  rolls to the freshest the CACHE has; only when the cache is empty too does it
+  defer via `indexFetchPending` (the existing resume path).
+
+- **The manual ⏭️ is the SAME mode-aware advance, and there is no Previous**
+  (2026-11-17): `skipNext()` played `playlist[idx + 1]` — a neighbour in
+  newest-first LIST order — so it ignored `older`/`oldest`/`newer`, and under `off`
+  re-picked the track the user had just pressed Next away from as soon as the list
+  shifted. It now calls `advanceToNextTrack(left, manualNextMode(autoplayMode()))`:
+  the same `pickNextTrack` autoplay uses, with `off` → `older` (`manualNextMode`'s
+  comment: `off` forbids autoplay, not a button the user pressed, and one-step-older
+  is the only reading under which repeated Next walks the library instead of
+  stopping). The ⏮️ button and the `previoustrack` MediaSession handler are GONE —
+  the ← / → keys seek ∓10 s inside the current item, so a wrong Next is undone by
+  seeking or from the queue list, and no autoplay mode has a "backwards" step for a
+  Previous button to express; with no handler registered the OS's own ⏮️ is a rewind.
+  `skipMarksWatched` OFF is a user setting: the skipped track stays UNWATCHED and
+  therefore stays in the queue — the marking is what removes it, not the skipping.
+
+- **ALL FIVE autoplay modes are honoured on EVERY advance path** (2026-11-17,
+  `frontend/src/app/autoplay-order.ts` → `pickNextTrack(queue, mode, finished?)`):
+  the finish → next path was the only one that consulted the mode. Skipping a
+  defunct/unplayable track, the post-refresh fallback (`_loadIndexAndPlay`) and
+  the autoplay on page load each hard-coded `queue[0]` / `queue[len-1]` — newest
+  first, so `queue[0]` meant "newest" — and a user who chose `older` or `oldest`
+  got `newest` exactly when the queue hit trouble; a relative mode also lost its
+  reference track and restarted at the wrong END of the timeline, re-entering the
+  same broken region. Every path now routes through the one pure function, which
+  picks by TIME (never by list position, so a page slice gets the same answer),
+  resolves ties by scan order, excludes `finished` BY ID IN EVERY MODE (the
+  extremes included — that is what stops a manual ⏭️ landing back on the track it
+  left; not by strict `</>`, because same-timestamp cluster siblings must stay
+  pickable), and with NO finished track starts a direction mode at the end it
+  travels along (`older` at the OLDEST, so walking backwards has somewhere to
+  walk). `autoplayMode` is read in exactly the paths that advance the queue, and
+  `_playFreshest` re-reads it AFTER the fetch, so a Settings change in flight is
+  the one honoured. `newest` still refreshes first (bullet above); `off` still
+  stops autoplay. T6 covers the pick and `manualNextMode`; T2 cannot see the SPA,
+  so the wiring is covered by the typecheck + T5, and the consume path by the live
+  harness recorded in the changelog below (round 3).
+- **Consuming the playing track advances through `stopAndAdvance`, and the 404
+  branch is a success** (2026-11-17, `consumedGrabbyTrack()` in `app.component.ts`):
+  both the 🗑️ button and the Delete hotkey route the whole post-delete behavior
+  through one method. It snapshots `currentVideo()` BEFORE `removeLocalVideo()`
+  (that call nulls `currentVideo`), drops the item from `rawIndex`, and only then
+  — when THIS tab was playing this id — stops the element, clears the track and
+  advances under `autoplayMode()` via the shared `stopAndAdvance(left, mode)` the
+  manual ⏭️ uses. The bug this fixes: the handler called
+  `markAsWatchedAndPlayNext()` AFTER the removal, and that function returns on its
+  FIRST line when `currentVideo` is null, so Delete on the playing track marked
+  nothing, advanced nothing, blanked the player and left the deleted file audible
+  until it ran out — "it doesn't remove what I watched from the queue, and it
+  ignores my autoplay mode". Snapshots matter twice: `left` is what `pickNextTrack`
+  excludes, so a consume under `newer`/`older` continues from the track actually
+  being left, not from scratch. NEVER call `markAsWatchedAndPlayNext()` from a
+  consume: the row is gone, so a watched POST would only fire at a 404 (and the
+  retry queue would hammer it). A tab that was NOT playing this id leaves playback
+  in the other tab alone — it just loses the row from its own list.
 
 - For Git: only commit when user explicitly asks (follow Git Safety Protocol in tools).
 
@@ -428,3 +535,94 @@ row the authored index dropped. T2 gained section 16 (17 assertions over the rea
 compiled `initShuffleBag`/`distributeGrabbyItems`/`revertForeignGrabbyRows`;
 suite total 139). Deployed: both containers rebuilt + recreated, 464 rows back to
 normal (690 watched again, 1,114 normal + 388 grabby in the index), T1 PASS.
+Last updated: 2026-11-17 (three symptoms the owner reported — "watched items
+come back", "autoplay mode ignored", "Delete key alerts 'not found'" — were three
+independent bugs, all fixed here). (1) `cleanupCorruptedFolders()` counted the
+audio file by `.mp3` **suffix**, so FrogRock's radio transcode
+`<id>.mp3.tr64k.mp3` (one exists for every grabby track: tunester delivers
+160k/44.1k/stereo, the stream is 64k/mono/24kHz) read as "Multiple .mp3 files" on
+**187 of the owner's 1,832 folders**, each of which lost its DB row (files kept,
+so no data loss), its watched/progress state (which lives in the row), and its
+queue membership — while `initShuffleBag` re-seeded it as un-played, which is the
+"not remembering I watched it" loop. The verdict is now the exported pure
+`folderCorruptionReason(videoId, files)`: exactly one `<id>.mp3`, exactly one
+`<id>.json`, ≤2 thumbnails, everything else tolerated (transcodes, `.bak`,
+`.part`, `.vbrfix.tmp`, `.ffmeta`, raw `.webm`/`.m4a`, a `.json` under a foreign
+name — a live census found zero stray `.json` names, so nothing real depends on
+flagging one). All 187 had ALREADY lost their row; 186 of them are still listed in
+`shufflebag.json` (33 with `used: true`), so the content returns through
+distribution — as unwatched. One 6-hour container log holds 34
+`🚨 CORRUPTED … (🎵 grabby — preserving files)` lines, and the corruption branch only
+runs for a folder that HAS a row, so those are 34 rows `distributeGrabbyItems()`
+had just re-created and the cleanup ate again — the live churn. (2) Only the
+finish → next path read
+`autoplayMode`; skipping a defunct track, the unplayable give-up, the post-refresh
+advance and the page-load autoplay each hard-coded `queue[0]`/`queue[len-1]`, and
+since the queue is newest-first that IS `newest` — so `older`/`oldest` were
+overridden exactly when the queue hit trouble, and a relative mode lost its
+reference track and restarted at the wrong END of the timeline, re-entering the
+same broken region. All five paths now call the one pure
+`pickNextTrack(queue, mode, finished?)` in `frontend/src/app/autoplay-order.ts`
+(new T6, 38 assertions; picks by TIME not list position, ties by scan order,
+excludes `finished` BY ID so same-timestamp cluster siblings stay pickable, and
+with no finished track starts a direction mode at the end it travels along).
+(3) `DELETE /api/video/:id/grabby` answered 404 whenever the DB row was missing —
+but the row is ALSO missing when something else already consumed the track (the
+cleanup above, `updateIndexFile`'s defunct-MP3 filter, the GrabbyTube UI, a second
+tab) while the caller's `index.json` (regenerated only on a harvest) still lists
+it, so the Delete key alerted and did nothing forever; the folder's sidecar
+`createdAt` marker is the ownership record, so marker-present now lands the
+consume (remote delete + bag prune + `localRecords: 0`), 400 stays for a DrivePod
+row, 404 needs no row AND no marker, fail-closed 502 unchanged. T2 gained §17 (the
+verdict + the cleanup end-to-end) and §18 (all six consume paths against a stubbed
+grabbytube on :8101, hence `--add-host grabbytube:127.0.0.1` in `run-scratch.sh`):
+**185 assertions, exit 0**; T6 38/38; T1 PASS (700 queue, 379 marked grabby rows);
+frontend `tsc --noEmit` clean and `ng build` → `main-J3IPX4RB.js`, `APP_VERSION`
+1.10.0 → 1.11.0. Deployed through the listen hub (vendored `stack/drivepod/`, clean
+3-way merge onto the pin, patch set byte-unchanged).
+(2026-11-17, second round) The owner's "it's not respecting my choice of autoplay
+mode" was a SECOND, still-unfixed instance of the same bug: the manual ⏭️
+(`skipNext`, reached by the button and by `nexttrack` on a head unit) played
+`playlist[idx + 1]` — a neighbour in newest-first LIST ORDER, not what
+`older`/`oldest`/`newer` ask for — and under `off` re-picked the track just skipped
+once the list shifted. Now `advanceToNextTrack(left, manualNextMode(mode))`, i.e.
+the same `pickNextTrack` autoplay uses, `off` mapping to `older`;
+`pickNextTrack`'s extremes ('newest'/'oldest') skip a `finished` track too, which is
+what makes "never return what the user just pressed Next away from" hold in all five
+modes, and `_playFreshest` takes that track as `exclude` and drops it from the fresh
+fetch (with `skipMarksWatched` OFF the left track is still UNWATCHED, so the refresh
+still lists it). New `_nextLeft` is the one "freshest still playable" answer, used
+for the offline and failed-refresh rolls too. The ⏮️ button and the `previoustrack`
+handler are removed: ← / → already seek ∓10 s inside the item, so Previous had no
+mode-consistent meaning and the owner uses the arrow keys instead. T6 38 → 43
+assertions (4b/4c = extremes skip what is being left / play it when nothing is; §11 =
+`manualNextMode` mapping and the manual walks), T2 185/exit 0, T1 PASS, T4 53 pass,
+`tsc --noEmit` clean, `ng build` → `main-T2WQJLFW.js`, `APP_VERSION` 1.11.0 → 1.12.0.
+(2026-11-17, third round) The owner reported the app STILL not remembering
+watched tracks, still not removing watched items from the queue, still ignoring
+the autoplay mode, and the Delete key occasionally alerting "not found". The
+404-alert half was already fixed server-side (round 1) — but the DEPLOYED
+bundle carried neither that frontend branch nor round 2: the vendored tree in
+the listen hub had been re-copied to the `23b03a9` pin, which predates both, so
+the hub image served `main-Q75CKKAZ.js` reporting `APP_VERSION 1.13.0` from a
+tree whose round-1 backend fix was present while its frontend was 265 lines
+behind upstream. Re-vendored the whole set from `23b03a9` + these commits
+(clean 3-way merge, hub patch set byte-unchanged) and redeployed. The remaining
+"autoplay mode ignored / watched not removed" half was a third instance of the
+ordering bug, this time in the consume handler: `markAsWatchedAndPlayNext()`
+was called AFTER `removeLocalVideo()` had nulled `currentVideo`, and that
+function's first line returns on a null `currentVideo` — so pressing Delete on
+the track playing here marked nothing, advanced nothing and blanked the player,
+while the deleted file stayed audible to its end (its stream socket was already
+open). New `consumedGrabbyTrack()` snapshots the playing item first and routes
+the advance through `stopAndAdvance(left, mode)`, the helper `skipNext` now
+shares, so the 🗑️ button, the Delete key and the head-unit Next all stop →
+clear → advance under the stored mode, and only the tab that owns playback
+touches the element. T6 43/43, T2 185/exit 0, T1 PASS, T4 53 pass. The
+production Angular build (its own strict typecheck — the host frontend tree has
+no `node_modules`, so `ng build`/`tsc` run in the listen image's
+`frontend-builder` stage) → `main-J5K7G6VO.js` reporting `APP_VERSION
+1.14.0`. Deployed through the listen hub: vendored `stack/drivepod/`
+updated, image rebuilt, container recreated, then re-driven live in headless
+Chromium against `https://listen.example.com/l/owner/` (autoplay modes + the
+Delete key on a fixture row, both below).
