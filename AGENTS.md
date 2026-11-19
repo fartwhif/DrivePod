@@ -28,15 +28,17 @@
   exported seams (`cleanRssItems`, `parseYtDlpDuration`,
   `applyTodayMidnightRule`, `isFilteredOutByDuration`, `readMp3HeaderClaim`,
   `writeIfChanged`, `resolveGrabbyAudioPath`, `folderCorruptionReason`,
-  `sidecarIsGrabbyAuthored`, the `DELETE /api/video/:id/grabby` handler via
-  `app.handle`, …) in a `node:20-bookworm` docker with a scratch Prisma DB — no
-  live system touched. Must be full `bookworm` (slim lacks the `openssl` CLI the
-  Prisma engine probes). §17 hands `folderCorruptionReason` name lists (healthy
-  grabby folder with a `.tr64k.mp3` + `.bak`, the old rule's 187 false positives,
-  a real 0/2-audio corruption); §18 drives the consume route against a stubbed
-  grabbytube on :8101 — which is why `run-scratch.sh` passes
-  `--add-host grabbytube:127.0.0.1` (the image has no such name and the route's
-  remote-first delete must resolve it).
+  `sidecarIsGrabbyAuthored`, `readSessionState` / `sessionGateOpen`, the
+  `DELETE /api/video/:id/grabby` handler via `app.handle`, …) in a
+  `node:20-bookworm` docker with a scratch Prisma DB — no live system touched.
+  Must be full `bookworm` (slim lacks the `openssl` CLI the Prisma engine probes).
+  §17 hands `folderCorruptionReason` name lists (healthy grabby folder with a
+  `.tr64k.mp3` + `.bak`, the old rule's 187 false positives, a real 0/2-audio
+  corruption); §18 drives the consume route against a stubbed grabbytube on
+  :8101 — which is why `run-scratch.sh` passes `--add-host grabbytube:127.0.0.1`
+  (the image has no such name and the route's remote-first delete must resolve
+  it); §19 flips `COOKIE_SESSION_STATE` + writes state files and reads the live
+  `/api/harvest-status` on the boot listener :3000 (gate + badge from one read).
 - **T3 — browser E2E**: open the SPA headless on the queue tab (default),
   paginate to the `🎉 End of queue` sentinel by scrolling the
   `↓ Scroll for more items` element (the `#loadMoreTrigger` in the template
@@ -664,3 +666,20 @@ neighbour picks in both directions, and the direction-dependent dead end), T2
 185/exit 0, T1 PASS, T4 53 pass, `tsc --noEmit` clean, production `ng build` →
 `main-<hash>.js` reporting `APP_VERSION 1.15.0` (bundle hash below), re-vendored
 into the listen hub at this pin and redeployed.
+Last updated: 2026-11-19 (the harvest tab's "session status unknown" badge was a
+real gate failure, not a display gap). `sessionGateOpen()` and
+`/api/harvest-status` both read a HARDCODED `/shared-cookies/session-state.json`
+— a compose mount that only exists in the standalone ytcookies deployment, so on
+a host where the jar is relocated (the listen hub gives every partition its own
+`COOKIES_FILE`) both readers ENOENT: the badge said "unknown" forever AND the
+gate silently never fired — 93 consecutive harvest rounds against a dead session
+while the vault's own file said `up`. Now: exported `readSessionState()` is the
+single reader for gate + badge (they can no longer disagree), the path comes from
+`COOKIE_SESSION_STATE` (unset ⇒ the old mount, so standalone behavior is
+byte-identical), and a missing/torn/>30-min file is explicitly NOT a verdict
+(`fresh: false` ⇒ badge "unknown", gate open — a vault that stopped running must
+not hold harvest paused on its last word). T2 §19 (16 assertions) drives both
+directions through the live route on the boot listener :3000: unset ⇒ the mount IS
+the source of truth (live session harvests, dead one closes the gate and the badge
+says so), set ⇒ my file wins over a disagreeing mount and the mount's absence
+changes nothing; whitespace-only treated as unset. 202 assertions, exit 0.

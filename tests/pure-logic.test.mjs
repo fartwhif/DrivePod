@@ -1363,6 +1363,135 @@ exit 0`);
   fs.rmSync(BAGF, { force: true });
 }
 
+// ── 19. the cookie session gate reads the file THIS process's jar has ──
+// The hub merge deleted the `/shared-cookies` mount: each partition's vault jar
+// lives at its own path, with its liveness file next to it, named by
+// COOKIE_SESSION_STATE. A hardcoded mount path then ENOENTs, the catch reports
+// "unknown", and the badge and the harvest gate agree on a number that is
+// really "we never looked": the gate never closed for any of 93 harvest rounds
+// while the vault's own file said `up`. So: the path is env-driven, ONE reader
+// feeds both consumers, and `fresh` says whether a verdict was read at all.
+{
+  const SF = path.join(DATA_DIR, 'gate-session-state.json');
+  const nowSec = () => Math.floor(Date.now() / 1000);
+  const STALE = 31 * 60;                 // just past the 30 min probe window
+  const put = (body) => fs.writeFileSync(SF, typeof body === 'string' ? body : JSON.stringify(body));
+  const savedEnv = process.env.COOKIE_SESSION_STATE;
+
+  const probe = () => {
+    const st = server.readSessionState();
+    return { ...st, gate: server.sessionGateOpen() };
+  };
+  const readRoute = async () => {
+    const r = await fetch('http://127.0.0.1:3000/api/harvest-status');
+    return { status: r.status, body: await r.json() };
+  };
+
+  try {
+    process.env.COOKIE_SESSION_STATE = SF;
+
+    // ── no verdict ⇒ nothing gates (no vault, or its container is down) ──
+    fs.rmSync(SF, { force: true });
+    t('gate: a missing state file gates nothing and reports unknown',
+      probe().gate === true && probe().state === 'unknown' && probe().fresh === false);
+    put('not json at all');
+    t('gate: a torn state file gates nothing and reports unknown',
+      probe().gate === true && probe().state === 'unknown' && probe().fresh === false);
+    // A vault that stopped writing is itself gone: its last verdict is stale,
+    // so it must not hold harvest paused forever.
+    put({ state: 'down', ts: nowSec() - STALE });
+    t('gate: a stale "down" is not a verdict — harvest keeps running',
+      probe().gate === true && probe().fresh === false);
+    // A verdict with no usable timestamp is not a verdict either.
+    put({ state: 'down' });
+    t('gate: "down" with no timestamp is not a verdict',
+      probe().gate === true && probe().fresh === false);
+
+    // ── fresh verdicts ──
+    put({ state: 'up', ts: nowSec() });
+    t('gate: a live session harvests',
+      probe().gate === true && probe().state === 'up' && probe().fresh === true);
+    put({ state: 'down', ts: nowSec() });
+    const dead = probe();
+    t('gate: a session the vault PROCLAIMS DEAD closes the gate (the enforcement)',
+      dead.gate === false && dead.state === 'down' && dead.fresh === true, JSON.stringify(dead));
+
+    // ── the badge and the gate are the same read, from the same file ──
+    const route = await readRoute();
+    t('route: 200 and still the harvest fields beside the session',
+      route.status === 200 && typeof route.body.isRunning === 'boolean'
+      && Array.isArray(route.body.activeItems), JSON.stringify(route.status));
+    t('badge agrees with the gate: a dead session is shown as a fresh "down"',
+      route.body.session?.state === 'down' && route.body.session?.fresh === true
+      && route.body.session?.ts !== null, JSON.stringify(route.body.session));
+    t('so the harvest tab renders "session dead — harvest paused", not "unknown"',
+      route.body.session?.fresh === true && route.body.session?.state !== 'up');
+
+    put({ state: 'up', ts: nowSec() });
+    const upRoute = await readRoute();
+    t('badge: a live session is shown live, and the gate is open',
+      upRoute.body.session?.state === 'up' && upRoute.body.session?.fresh === true
+      && server.sessionGateOpen() === true, JSON.stringify(upRoute.body.session));
+
+    // ── unset ⇒ the mount fallback is READ (that is a standalone deployment) ──
+    // §15 created `/shared-cookies/session-state.json` on purpose (a fresh
+    // `down`, to hold the 5-min cron out of its integration window). With the
+    // env unset, that file is what the gate and the badge must read — proof the
+    // fallback path is live, not swallowed. If the harness could not create the
+    // dir (read-only mount), the honest answer is "unknown" and nothing gates.
+    let mountUsable = false;
+    const MOUNT = '/shared-cookies/session-state.json';
+    try {
+      fs.mkdirSync('/shared-cookies', { recursive: true });
+      fs.writeFileSync(MOUNT, JSON.stringify({ state: 'up', ts: nowSec() }));
+      mountUsable = true;
+    } catch { /* not our filesystem to write */ }
+
+    delete process.env.COOKIE_SESSION_STATE;
+    if (mountUsable) {
+      const onMount = probe();
+      t('unset ⇒ the mount IS the source of truth: a live session there harvests',
+        onMount.state === 'up' && onMount.fresh === true && onMount.gate === true,
+        JSON.stringify(onMount));
+      fs.writeFileSync(MOUNT, JSON.stringify({ state: 'down', ts: nowSec() }));
+      const deadMount = probe();
+      t('unset ⇒ a dead session on the mount closes the gate (today\'s shape)',
+        deadMount.state === 'down' && deadMount.gate === false, JSON.stringify(deadMount));
+      const mountRoute = await readRoute();
+      t('unset ⇒ and the badge reports it, so the tab is never stuck on "unknown"',
+        mountRoute.body.session?.state === 'down' && mountRoute.body.session?.fresh === true,
+        JSON.stringify(mountRoute.body.session));
+
+      // The hub requirement: one partition's jar must not be judged by another
+      // partition's (or the shared mount's) verdict.
+      process.env.COOKIE_SESSION_STATE = SF;
+      put({ state: 'up', ts: nowSec() });
+      const mine = probe();
+      t('set ⇒ MY file wins over a mount that disagrees (tenant isolation)',
+        mine.state === 'up' && mine.gate === true, JSON.stringify(mine));
+      fs.rmSync(MOUNT, { force: true });   // the hub: no shared mount at all
+      t('set ⇒ and the mount\'s absence changes nothing', probe().gate === true);
+      const hubRoute = await readRoute();
+      t('set ⇒ the badge reads my file, not the missing mount',
+        hubRoute.body.session?.state === 'up' && hubRoute.body.session?.fresh === true,
+        JSON.stringify(hubRoute.body.session));
+      fs.writeFileSync(MOUNT, JSON.stringify({ state: 'down', ts: nowSec() }));
+    } else {
+      const none = probe();
+      t('unwritable mount ⇒ honest "unknown", and nothing gates',
+        none.state === 'unknown' && none.fresh === false && none.gate === true,
+        JSON.stringify(none));
+    }
+
+    process.env.COOKIE_SESSION_STATE = '   ';
+    t('whitespace-only is treated as unset', probe().state === (mountUsable ? 'down' : 'unknown'));
+  } finally {
+    if (savedEnv === undefined) delete process.env.COOKIE_SESSION_STATE;
+    else process.env.COOKIE_SESSION_STATE = savedEnv;
+    fs.rmSync(SF, { force: true });
+  }
+}
+
 await prisma.$disconnect();
 console.log(fail === 0 ? `\nT2 PASS — ${pass} assertions\n` : `\nT2 FAIL — ${fail}/${pass + fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);

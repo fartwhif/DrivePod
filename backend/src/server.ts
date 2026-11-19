@@ -2355,19 +2355,50 @@ export async function ignoreVideo(videoInfo: {
 // (worse for keeping a session alive) and every write-back refreshes the
 // file's mtime, delaying ytcookies' re-seed after a re-sign-in. Missing or
 // stale file (ytcookies container down) means "don't gate".
-const SESSION_STATE_FILE = '/shared-cookies/session-state.json';
+// COOKIE_SESSION_STATE relocates the state file to wherever THIS process's
+// cookie jar lives (a multi-tenant host gives each partition its own jar, and
+// the exporter writes each jar's liveness beside it); unset ⇒ the compose
+// mount, i.e. every standalone deployment. Reading a hardcoded mount that
+// does not exist is not "unknown", it is a silently unenforced gate.
+export interface SessionState { state: string; ts: number | null; fresh: boolean }
+
+function sessionStateFile(): string {
+  return (process.env.COOKIE_SESSION_STATE || '').trim() || '/shared-cookies/session-state.json';
+}
+
 const SESSION_STATE_MAX_AGE_MS = 30 * 60 * 1000; // probes run every ~10.5 min
 let lastSessionGateSkipLog = 0;
 
-function sessionGateOpen(): boolean {
+/**
+ * The vault's own verdict about its session, read on every call (the path and
+ * the age window are env facts, so a reconfiguration takes effect without a
+ * restart). ONE reader for both consumers — the harvest gate below and the
+ * harvest tab's badge — because a badge that reads "unknown" while the gate
+ * quietly never fires is exactly the failure this function exists to prevent.
+ * `fresh` distinguishes a verdict from the absence of one: a file with no
+ * usable timestamp (missing, torn, or older than the probe interval) means
+ * nothing gated, and the badge says "session status unknown".
+ */
+export function readSessionState(file: string = sessionStateFile()): SessionState {
   try {
-    const parsed = JSON.parse(fs.readFileSync(SESSION_STATE_FILE, 'utf-8'));
-    if (typeof parsed?.ts !== 'number') return true;
-    if (Date.now() - parsed.ts * 1000 > SESSION_STATE_MAX_AGE_MS) return true; // ts is epoch seconds
-    return parsed.state === 'up';
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const ts: number | null = typeof parsed?.ts === 'number' ? parsed.ts : null;
+    return {
+      state: typeof parsed?.state === 'string' ? parsed.state : 'unknown',
+      ts,
+      fresh: ts !== null && Date.now() - ts * 1000 <= SESSION_STATE_MAX_AGE_MS,
+    };
   } catch {
-    return true;
+    // No state file at all (no vault in this deployment, or its container is
+    // down): not a verdict, so nothing gates.
+    return { state: 'unknown', ts: null, fresh: false };
   }
+}
+
+/** Harvest may run unless the vault said "down" and said it RECENTLY. */
+export function sessionGateOpen(): boolean {
+  const session = readSessionState();
+  return !session.fresh || session.state === 'up';
 }
 
 
@@ -2704,20 +2735,10 @@ async function harvestAndPurge() {
 // ====================== API ROUTES ======================
 
 // === HARVEST STATUS ===
+// The same reader the harvest gate uses, so the badge can never disagree
+// with what harvest actually did.
 app.get('/api/harvest-status', (_, res) => {
-  let session = { state: 'unknown', ts: null as number | null, fresh: false };
-  try {
-    const parsed = JSON.parse(fs.readFileSync(SESSION_STATE_FILE, 'utf-8'));
-    const ts: number | null = typeof parsed?.ts === 'number' ? parsed.ts : null;
-    session = {
-      state: typeof parsed?.state === 'string' ? parsed.state : 'unknown',
-      ts,
-      fresh: ts !== null && Date.now() - ts * 1000 <= SESSION_STATE_MAX_AGE_MS,
-    };
-  } catch {
-    // no state file (ytcookies down): report unknown, don't fail the request
-  }
-  res.json({ ...harvestStatus, session });
+  res.json({ ...harvestStatus, session: readSessionState() });
 });
 
 app.get('/api/config', async (_, res) => {

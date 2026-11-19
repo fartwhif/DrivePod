@@ -109,7 +109,7 @@ container sides are the neutral constants that `.env` (`CACHE_DIR`, `DATA_DIR`,
 |----------------------|----------------------------------|--------------------------------------------|
 | `./data`             | `/data` (`DATA_DIR`)             | SQLite DB + temp `cookies.txt`             |
 | `./cache`            | `/cache` (`CACHE_DIR`)           | MP3s, thumbnails, index.json, rss/ cache   |
-| `../ytcookies/data`  | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape)      |
+| `../ytcookies/data`  | `/shared-cookies` (RO in effect) | live YouTube cookie export (Netscape) + the vault's `session-state.json` (§5.3) |
 | `/lib/modules`       | same (ro)                        | WireGuard kernel modules                   |
 
 Stale absolute `audioPath` DB rows from an earlier host layout are repaired on
@@ -267,6 +267,24 @@ Two sources, one precedence (`effectiveCookiesFile()`):
 The DB `cookies` value is also what `getBaseYtDlpCommand()` reads, but the file
 precedence above is what actually gets passed to yt-dlp.
 
+**Liveness beside the jar — `COOKIE_SESSION_STATE`.** The vault publishes
+`session-state.json` (`{state: "up"|"down", ts: <epoch s>, ua}`) next to the jar
+it exports, and `readSessionState()` is the ONLY reader of it: the harvest gate
+(`sessionGateOpen()`, §6 step 1) and the harvest tab's session badge (`GET
+/api/harvest-status`) share it, so a badge can never disagree with what harvest
+did. The path comes from `COOKIE_SESSION_STATE` and falls back to
+`/shared-cookies/session-state.json` when unset — because that fallback is a
+compose mount, a deployment that relocates the jar (a multi-tenant host gives
+every partition its own jar + state file) MUST name the file, or both readers
+ENOENT and report "unknown". A missing/torn/older-than-30-min file is NOT a
+verdict: `fresh: false` means the badge says "session status unknown" and the
+gate stays open. That is deliberate — a vault that stopped writing has stopped
+running, and its last word must not hold harvest paused forever. Reading a
+mount that does not exist is not a neutral default: the gate silently never
+fired for 93 consecutive harvest rounds while the vault's own file said `up`.
+T2 §19 locks both directions (unset ⇒ the mount is honoured, set ⇒ my file wins
+over a disagreeing mount).
+
 ### 5.4 yt-dlp command construction
 
 `getBaseYtDlpCommand()` (single source of truth for every yt-dlp invocation):
@@ -416,7 +434,13 @@ unbounded error-reload loop after the fixed build was live on the server).
 
 Runs every 5 minutes and once at boot. Full sequence:
 
-1. **Re-entry guards** (`isHarvesting` / `isImporting`), reset `harvestStatus`.
+1. **Re-entry guards** (`isHarvesting` / `isImporting`), then the **cookie-session
+   gate** (`sessionGateOpen()`, §5.3): a vault verdict of `down` written inside
+   the last 30 min ends the round here — BEFORE `isHarvesting` is set and before
+   any cleanup or download — so a dead session is never burned on cookieless
+   yt-dlp runs (those also refresh the jar's mtime, delaying the vault's re-seed
+   after a re-sign-in). Throttled log: `⏸️ Cookie session dead … skipping harvest
+   round`. Then `harvestStatus` is reset.
 2. **`cleanupCorruptedFolders()`** (full consistency pass):
    - Folder with **no** DB record: if its `{id}.json` is GrabbyTube-authored
      (`createdAt`, §3.2) it's a library track → skip (`🎵 GrabbyTube item
@@ -870,7 +894,7 @@ referenced in older docs does not exist.
 
 | Method | Path | Behavior |
 |---|---|---|
-| GET | `/api/harvest-status` | live `harvestStatus` object |
+| GET | `/api/harvest-status` | live `harvestStatus` object + `session` (the §5.3 state file: `state`, `ts`, `fresh`) |
 | GET | `/api/config` | all config keys, parsed (see §10.1 shape) |
 | POST | `/api/config` | partial update; only explicitly-listed fields persisted |
 | POST | `/api/cookies` | multipart `cookies` file → stored in DB |
@@ -941,7 +965,7 @@ except `HttpClient` subscriptions. Dark, mobile-first, car-optimized UI.
 | Tab | Content |
 |---|---|
 | 🚶 Queue | paged list (PAGE_SIZE 20, IntersectionObserver infinite scroll, 400 px rootMargin) of unwatched non-ignored videos newest-first; thumbnail, channel, "x ago", duration, progress bar, 🔒 protect toggle, YouTube link (deep-links at the current scrubber second), ▶ play |
-| 📡 Harvest | live panel polling `/api/harvest-status` every 4 s while the tab is open: running badge, per-channel action (Ignore Sweep / Fetching RSS / Downloading / Transcoding), counters |
+| 📡 Harvest | live panel polling `/api/harvest-status` every 4 s while the tab is open: running badge, session badge (green `session live` / red `session dead — harvest paused` / grey `session status unknown`), per-channel action (Ignore Sweep / Fetching RSS / Downloading / Transcoding), counters |
 | ⚙️ Settings | all §10.1 controls; channel list with rename, 🟢/⏸️ active toggle, per-channel min/max duration editor, ↑↑ ↑ ↓ ↓↓ reorder, delete; cookies upload/clear; low-bandwidth, autoplay mode, skip-marks-watched; grabby mix toggle + ratio slider (1–20); **Purge All** (confirm dialog) |
 | 📥 Import | paste box (mixed channel/video inputs), 10-minute HTTP timeout, per-item added/skipped/failed results; 409 → "Harvest or import already running" |
 | 🔒 Protected | protected videos; lock/unlock; play |
@@ -1319,6 +1343,7 @@ Repo is normalized to **LF** (commit `2e7c3de`; `.gitattributes`
 | Grabby items wiped by a purge | any new delete path missing `isGrabby:false` (skill's safety rule) |
 | SQLite 2570 disk I/O error | Windows process holding `data/database.db` open (drvfs); recover via `.dump` → restore → `PRAGMA integrity_check` (skill `sqlite-corruption-recovery`) |
 | Watched tracks flicker back in | the `_localWatched` guard in `mergeIndexWithLocal` was dropped |
+| Harvest tab says `session status unknown` forever | both readers ENOENT: the vault writes `session-state.json` beside the jar, but `COOKIE_SESSION_STATE` was never set to that path (relocated jar → readers still aim at `/shared-cookies/`, §5.3). Grey badge = nothing is gating |
 | Playback dies mid-item: no badge, no error, only a new tab fixes it | half-open media socket — the backend answers every NEW request (`HEAD /api/config` → 200) so `backendOnline` never flips and no outage path runs, while the one `/api/stream` connection keeps delivering nothing. Caught since 2026-11-11 by the §12.3 liveness watchdog (badge + new-request reload + resume where the listener stopped); a track that never plays again is skipped after 3 loads |
 
 ---
