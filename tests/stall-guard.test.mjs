@@ -35,6 +35,7 @@ const {
   MAX_STALL_RECOVERIES,
   MEDIA_ERROR,
   mediaErrorIsTrackDefect,
+  mediaErrorIsTransportError,
   mediaEventTrackId,
   playRejectIsTrackDefect,
   READY_STATE_FED,
@@ -414,9 +415,34 @@ console.log('\nwhich element signals say the FILE is broken');
   // MEDIA_ERR_SRC_NOT_SUPPORTED with a NotSupportedError play rejection —
   // code 4 is the engine's answer for "what I selected is not playable",
   // which is a defect of the file we served it.
-  t('DECODE, NETWORK and SRC_NOT_SUPPORTED are file defects',
-    at([MEDIA_ERROR.DECODE, MEDIA_ERROR.NETWORK, MEDIA_ERROR.SRC_NOT_SUPPORTED]
-      .map(mediaErrorIsTrackDefect)) === at([true, true, true]));
+  t('DECODE and SRC_NOT_SUPPORTED are file defects',
+    at([MEDIA_ERROR.DECODE, MEDIA_ERROR.SRC_NOT_SUPPORTED]
+      .map(mediaErrorIsTrackDefect)) === at([true, true]));
+  // NETWORK means the FETCH died: a dead Wi-Fi association, a NAT that dropped
+  // the connection mid-song, a phone out of coverage, a half-open socket. The
+  // MP3 on disk is byte-perfect in every one of those cases, and a file cannot
+  // be guilty of the link it was fetched over. Charging it was the reported
+  // unrecoverable state: two blips inside one listening session hit
+  // MAX_TRACK_PLAY_FAILURES, which marks the track WATCHED — and watched is
+  // precisely what takes it out of the queue for good, long after the
+  // connection came back and the file would have played fine.
+  t('NETWORK is never a file defect', mediaErrorIsTrackDefect(MEDIA_ERROR.NETWORK) === false);
+  // …but it is still an error on a TERMINAL element: an errored media element
+  // reads as `paused`, so the liveness watchdog (which vetoes on `paused`)
+  // never picks it up and the player sits silent forever with a healthy
+  // backend and a healthy file. It has to be RECOVERED — as a transport
+  // failure, out of the watchdog's reload budget, which audible progress
+  // clears, rather than out of the file's failure counter.
+  t('NETWORK is the transport-error class', mediaErrorIsTransportError(MEDIA_ERROR.NETWORK) === true);
+  t('the file defects, ABORTED and the silence shapes are never transport errors',
+    at([MEDIA_ERROR.DECODE, MEDIA_ERROR.SRC_NOT_SUPPORTED, MEDIA_ERROR.ABORTED, null, undefined, 0, NaN]
+      .map(mediaErrorIsTransportError))
+      === at([false, false, false, false, false, false, false]));
+  // The classes are disjoint: nothing may be both a file verdict and a reload
+  // trigger, or a genuinely corrupt file gets re-fetched forever.
+  t('no signal is both a file defect and a transport error',
+    [1, 2, 3, 4, 5, null, undefined, 0, NaN].map(c =>
+      !(mediaErrorIsTrackDefect(c) && mediaErrorIsTransportError(c))).every(Boolean));
   // ABORTED is the element dropping a selection WE replaced (a newer src, a
   // load(), a stop). It says nothing about the file: on the wire, pressing
   // through a track mid-load produced code 4 under the abandoned track's

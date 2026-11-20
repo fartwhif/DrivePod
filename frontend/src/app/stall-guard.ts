@@ -118,14 +118,40 @@ export function mediaEventTrackId(currentSrc: string, src: string): string | nul
 }
 
 /** Does this `error` event say something is wrong with the FILE?
+ *
+ *  `MEDIA_ERR_NETWORK` is deliberately NOT in this set, and that exclusion is
+ *  the whole point: it means the FETCH died, which is the one failure a file on
+ *  disk cannot be guilty of. A dead Wi-Fi association, a NAT that dropped the
+ *  connection mid-song, a phone out of coverage and a half-open socket all
+ *  answer with it while the MP3 is byte-perfect. Charging it to the file let two
+ *  such blips inside one listening session mark an unfinished track WATCHED and
+ *  drop it from the queue for good — permanently unrecoverable after the link
+ *  came back, because "watched" is precisely what takes a track out of the queue.
+ *  (A network error that recurs on a healthy link is still not left unhandled:
+ *  see `mediaErrorIsTransportError` — it is recovered, just paid for out of the
+ *  watchdog's reload budget, which audible progress clears, instead of the
+ *  file's permanent-looking failure counter.)
+ *
  *  ABORTED never does (it is the element dropping a selection we replaced);
  *  `null` (no MediaError attached — the shape of `emptied`/`abort`) never
  *  does. Silence from an abandoned selection is judged by the liveness
- *  watchdog, which keys on the track actually loaded. */
+ *  watchdog, which keys on the track actually loaded.
+ *
+ *  DECODE (the bytes arrived and will not play) and SRC_NOT_SUPPORTED (what the
+ *  element settled on is not playable) are the two codes a corrupt cache file
+ *  actually answers with, so they are the two that may spend its budget. */
 export function mediaErrorIsTrackDefect(code: number | null): boolean {
   return code === MEDIA_ERROR.DECODE
-    || code === MEDIA_ERROR.NETWORK
     || code === MEDIA_ERROR.SRC_NOT_SUPPORTED;
+}
+
+/** True for the one code that says "the transport died, not the file". Such an
+ *  error still has to be RECOVERED — the element is in a terminal error state,
+ *  and an errored element reads as `paused`, so the liveness watchdog alone
+ *  would never pick it up — but the retry it deserves is a reload, not a
+ *  verdict on the file. */
+export function mediaErrorIsTransportError(code: number | null): boolean {
+  return code === MEDIA_ERROR.NETWORK;
 }
 
 /** Is this `play()` rejection evidence about the FILE?

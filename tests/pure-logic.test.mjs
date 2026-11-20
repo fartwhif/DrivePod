@@ -1492,6 +1492,111 @@ exit 0`);
   }
 }
 
+// ── 20. a sticky cookie-file failure must not strand the harvest lock ──
+// `harvestAndPurge`'s `finally` opened with `await deleteTempCookiesFile()`,
+// whose body was a bare `fs.existsSync` + `fs.unlinkSync`. A throw from a
+// `finally` REPLACES whatever the try/catch was doing — including the very next
+// lines of that same `finally` that set `isHarvesting = false` — and node-cron
+// swallows the rejection (`Task.execute` emits `task-failed`, nobody listens),
+// so nothing crashed: the flag just stayed true for the life of the process.
+// Every later 5-min round logged "Harvest already running — skipping", the
+// import route refused on the mirror lock, and the queue never moved again
+// although the disk had recovered seconds after the fault.
+//
+// The fault is reproduced without chmod games: `cookies.txt` is made a
+// DIRECTORY, so the unlink fails on every attempt. Nothing else in the round
+// touches it — the DB `cookies` config is empty, so `writeTempCookiesFile`
+// returns before its `writeFileSync` — which is what makes the log evidence
+// unambiguous: exactly two "Could not remove" warnings (one from the try's
+// best-effort call, one from the `finally`'s) and NO "Unexpected error in
+// harvest" line means the finally's delete RAN, was caught, and fell through
+// to the release.
+{
+  const COOKIES = path.join(DATA_DIR, 'cookies.txt');
+  const MOUNT = '/shared-cookies/session-state.json';
+  const realLog = console.log;
+  const realErr = console.error;
+  const realWarn = console.warn;
+
+  // The cleanup warnings are `console.warn`, so the capture has to take all
+  // three streams: catching only log/error read "no warning" while the round
+  // had warned twice, and the round-1 count assertion would have failed on
+  // the harness rather than on the code.
+  const capture = async (fn) => {
+    const lines = [];
+    const rec = (...a) => lines.push(a.join(' '));
+    console.log = rec; console.error = rec; console.warn = rec;
+    let err = null;
+    try { await fn(); } catch (e) { err = e; } finally { console.log = realLog; console.error = realErr; console.warn = realWarn; }
+    return { lines, err };
+  };
+  const count = (lines, needle) => lines.filter(l => l.includes(needle)).length;
+
+  // The lock must be free before the fault goes in, and the gate must be OPEN,
+  // or the round returns at its first lines and the whole section is vacuous.
+  // §19 left a fresh `down` on that mount on purpose (to prove the gate closes);
+  // the hub shape has no mount at all, so removing it is the honest precondition.
+  fs.rmSync(MOUNT, { force: true });
+  await prisma.config.upsert({ where: { key: 'cookies' }, update: { value: '' }, create: { key: 'cookies', value: '' } });
+  await prisma.channel.updateMany({ where: {}, data: { active: false } });
+  t('§20 precondition: the session gate is open (else a round never reaches the finally)',
+    server.sessionGateOpen() === true);
+  for (let i = 0; i < 40 && server.harvestLockHeld(); i++) await new Promise(r => setTimeout(r, 100));
+  t('§20 precondition: no harvest holds the lock before the fault',
+    server.harvestLockHeld() === false);
+
+  fs.rmSync(COOKIES, { recursive: true, force: true });
+  fs.mkdirSync(COOKIES, { recursive: true });
+
+  // ── the hazard is real on this filesystem: an unguarded unlink DOES throw ──
+  // Without this, "the guard fixed it" would be unfalsifiable — a platform that
+  // happily unlinked a directory would make the end-to-end assertions pass with
+  // or without the catch.
+  let rawCode = null;
+  try { fs.unlinkSync(COOKIES); } catch (e) { rawCode = e?.code ?? String(e); }
+  t('unlinkSync on an unremovable cookies.txt really throws (the hazard, not a fiction)',
+    rawCode !== null && ['EISDIR', 'EPERM', 'ENOTEMPTY', 'EACCES'].includes(String(rawCode)),
+    `code=${rawCode}`);
+  let rej = null;
+  try { await server.deleteTempCookiesFile(); } catch (e) { rej = e?.message; }
+  t('deleteTempCookiesFile never rejects (it runs in the harvest finally)',
+    rej === null, `rej=${rej}`);
+
+  // ── round 1: the fault is live ──
+  const r1 = await capture(() => server.harvestAndPurge());
+  t('a harvest round does not reject when its finally cannot clean up',
+    r1.err === null, `err=${r1.err?.message}`);
+  t('round 1: the round actually started (gate open, lock free)',
+    count(r1.lines, '=== HARVEST START ===') === 1 && !count(r1.lines, 'already running'),
+    r1.lines.join('\n').slice(0, 400));
+  t('round 1: the unlink failure happened twice — once in the try, once in the finally',
+    count(r1.lines, 'Could not remove') === 2,
+    `warns=${count(r1.lines, 'Could not remove')}`);
+  t('round 1: the round itself hit no other error (so the 2nd warning IS the finally)',
+    count(r1.lines, 'Unexpected error in harvest') === 0, r1.lines.filter(l => l.includes('🚨')).join('\n'));
+  t('round 1: the finally completed and announced the finish',
+    count(r1.lines, '=== HARVEST FINISHED ===') === 1, r1.lines.slice(-3).join('\n'));
+  t('round 1: the harvest lock was RELEASED (the bug kept it true forever)',
+    server.harvestLockHeld() === false);
+  const badge1 = await (await fetch('http://127.0.0.1:3000/api/harvest-status')).json();
+  t('round 1: and the badge stopped saying "running" for a round that ended',
+    badge1.isRunning === false && badge1.activeItems.length === 0, JSON.stringify(badge1).slice(0, 200));
+
+  // ── round 2: connectivity/disk has returned; is the NEXT round allowed to run? ──
+  // This is the only question the bug is about. Pre-fix, the flag was still true,
+  // so this logged "already running — skipping" and did nothing — permanently.
+  fs.rmSync(COOKIES, { recursive: true, force: true });
+  const r2 = await capture(() => server.harvestAndPurge());
+  t('recovered: the next round RUNS (was "Harvest already running — skipping" forever)',
+    count(r2.lines, '=== HARVEST START ===') === 1 && !count(r2.lines, 'already running'),
+    r2.lines.join('\n').slice(0, 400));
+  t('recovered: a clean round reports no cleanup warnings',
+    count(r2.lines, 'Could not remove') === 0 && count(r2.lines, 'Unexpected error in harvest') === 0);
+  t('recovered: the lock is free again for the cron',
+    server.harvestLockHeld() === false);
+
+
+}
 await prisma.$disconnect();
 console.log(fail === 0 ? `\nT2 PASS — ${pass} assertions\n` : `\nT2 FAIL — ${fail}/${pass + fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);

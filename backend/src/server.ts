@@ -288,12 +288,28 @@ async function writeTempCookiesFile() {
   return true;
 }
 
-async function deleteTempCookiesFile() {
-  if (fs.existsSync(TEMP_COOKIES_FILE)) {
-    fs.unlinkSync(TEMP_COOKIES_FILE);
-    console.log(`🗑️ Temporary cookies.txt deleted`);
+export async function deleteTempCookiesFile() {
+  // Best-effort by contract: this runs in the harvest `finally`, and a throw from
+  // a `finally` REPLACES whatever the try/catch was about to do — including the
+  // lines further down that same block that release `isHarvesting`. A sticky
+  // EACCES / EBUSY / EROFS here (the same class of mount this repo already
+  // documents corrupting files after publication) would strand the harvest lock
+  // for the whole life of the process, because node-cron swallows the rejection.
+  try {
+    if (fs.existsSync(TEMP_COOKIES_FILE)) {
+      fs.unlinkSync(TEMP_COOKIES_FILE);
+      console.log(`🗑️ Temporary cookies.txt deleted`);
+    }
+  } catch (err: unknown) {
+    console.warn(`⚠️ Could not remove ${TEMP_COOKIES_FILE}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
+
+/** The harvest lock, readable from outside the module: T2 §20 drives a harvest
+ *  to a dead end and then asks whether the NEXT one is still allowed to run. */
+export function harvestLockHeld(): boolean { return isHarvesting; }
+/** Import's mirror of the same lock (the import route refuses while either is held). */
+export function importLockHeld(): boolean { return isImporting; }
 
 
 // === HELPERS ===
@@ -2403,7 +2419,12 @@ export function sessionGateOpen(): boolean {
 
 
 // === HARVESTER ===
-async function harvestAndPurge() {
+/**
+ * One full harvest round. Exported because the cron has no route and swallows
+ * rejections: T2 §20 needs to drive a round from outside and then ask the only
+ * question the lock fix is about — is the NEXT round still allowed to run?
+ */
+export async function harvestAndPurge() {
   if (isHarvesting) {
     console.log(`⏳ [${logTimestamp()}] Harvest already running — skipping`);
     return;
@@ -2421,22 +2442,32 @@ async function harvestAndPurge() {
     return;
   }
 
-  isHarvesting = true;
-
-  harvestStatus = {
-    isRunning: true,
-    startTime: new Date().toISOString(),
-    activeItems: [],
-    processedVideos: 0,
-    totalVideosThisRun: 0,
-    channelsProcessed: 0,
-    totalChannels: 0,
-    lastUpdate: new Date().toISOString()
-  };
-
-  console.log(`\n🔄 [${logTimestamp()}] === HARVEST START ===`);
-
   try {
+    // The lock is taken as the FIRST act inside the try so that from the moment
+    // it exists, the `finally` that releases it is already armed. Taking it here
+    // and entering the try on a later line left a window — and, more importantly,
+    // the release sits in a `finally` whose own first statement was an unguarded
+    // `fs.unlinkSync` (see `deleteTempCookiesFile`): a throw from THAT line
+    // propagated out of the function before `isHarvesting = false` ever ran.
+    // node-cron swallows the rejection (`Task.execute` emits `task-failed` and
+    // nothing listens), so the process stayed up and the flag stayed true: every
+    // later 5-min harvest logged "already running — skipping" forever, with the
+    // import route refusing for the same reason, i.e. a queue frozen permanently
+    // after a one-second disk/socket hiccup.
+    isHarvesting = true;
+
+    harvestStatus = {
+      isRunning: true,
+      startTime: new Date().toISOString(),
+      activeItems: [],
+      processedVideos: 0,
+      totalVideosThisRun: 0,
+      channelsProcessed: 0,
+      totalChannels: 0,
+      lastUpdate: new Date().toISOString()
+    };
+
+    console.log(`\n🔄 [${logTimestamp()}] === HARVEST START ===`);
     await cleanupCorruptedFolders();
     await backfillChannelOrders();
 

@@ -6,6 +6,7 @@ import {
   evaluateStall,
   MAX_STALL_RECOVERIES,
   mediaErrorIsTrackDefect,
+  mediaErrorIsTransportError,
   mediaEventTrackId,
   playRejectIsTrackDefect,
   PlaybackPhase,
@@ -15,6 +16,7 @@ import {
   stallResumeTarget,
   streamTrackId
 } from './stall-guard';
+import { classifyFailure, Outbox, type OpType } from './retry-policy';
 import { AutoplayMode, manualNextMode, manualPrevMode, pickNextTrack } from './autoplay-order';
 import { Title } from '@angular/platform-browser';
 
@@ -157,7 +159,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    // SKIP MARKS WATCHED: treat skip-next as if the track finished playing
    skipMarksWatched = signal(false);
 
-  private readonly APP_VERSION = '1.16.0';   // ← bumped for currentSrc error attribution
+  private readonly APP_VERSION = '1.17.0';   // ← bumped for the outbox + non-defect media errors
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched'>('queue');
   protectedPlaylist = signal<Video[]>([]);
@@ -206,12 +208,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private harvestPollInterval: any = null;
   private playlistRefreshInterval: any = null;
 
-  // Network resilience: operation queue with exponential-backoff retry
-  private pendingVideoOps: Array<{ videoId: string; type: 'watched' | 'progress'; payload?: any }> = [];
-  private retryTimer: any = null;
-  private retryAttempts = 0;
-  private readonly MAX_RETRY_ATTEMPTS = 10;
-  private readonly BASE_RETRY_DELAY = 2000;
+  // Network resilience: the watched/progress outbox. The policy — per-op attempt
+  // counts, per-op backoff, and "an op leaves only when a retry cannot change the
+  // answer" — is the pure module `retry-policy.ts`; this owns the clock.
+  private readonly outbox = new Outbox();
+  private outboxTimer: any = null;
 
   // Active connectivity probe: pings backend every 3s while ops are pending
   private connectivityProbeTimer: any = null;
@@ -421,12 +422,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.stopHarvestPolling();
     if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
     if (this.playlistRefreshInterval) clearInterval(this.playlistRefreshInterval);
-    if (this.retryTimer) clearTimeout(this.retryTimer);
+    clearTimeout(this.outboxTimer);
     if (this.connectivityProbeTimer) clearInterval(this.connectivityProbeTimer);
     this.connectivityProbeTimer = null;
     this._stopAlwaysOnProbe();
     this._clearPlayRetry();
-    this.pendingVideoOps = [];
+    this.outbox.clear();
     this._dropInProgress = false;
     this._wasPlayingBeforeDrop = false;
     this._stallLoadOutstanding = false;
@@ -619,6 +620,19 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     for (const v of [...oldQueue, ...oldProtected, ...oldWatched]) {
       oldMap.set(v.videoId, { progress: v.progress, watched: v.watched });
     }
+    // An op whose row is gone from the library has no row to write to, and it
+    // would sit at the head of the outbox until this tab reloaded: the consume,
+    // the auto-purge and the defunct-MP3 filter all delete rows a caller's stale
+    // index still lists. A NON-EMPTY fetch is the only evidence worth pruning on —
+    // an empty or failed read proves nothing about which rows exist, the same rule
+    // `reconcileShuffleBag`'s index-absence guard applies server-side.
+    if (data.length > 0) {
+      const present = new Set(data.map(v => v.videoId));
+      for (const gone of this.outbox.pruneNotIn(present)) {
+        if (gone.type === 'watched') this._localWatched.delete(gone.videoId);
+        console.log(`Outbox dropped ${gone.type} for ${gone.videoId}: no longer in the library`);
+      }
+    }
 
     return data.map(v => {
       const local = oldMap.get(v.videoId);
@@ -754,61 +768,73 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.http.patch(`${this.apiUrl}/player/current`, { videoId }).subscribe({ error: () => {} });
   }
 
-  // === Network resilience: operation queue with retry ===
+  // === Network resilience: the watched/progress outbox ===
 
-  private queueOperation(op: { videoId: string; type: 'watched' | 'progress'; payload?: any }): void {
-    // For progress, keep only the latest per videoId (dedup)
-    if (op.type === 'progress') {
-      this.pendingVideoOps = this.pendingVideoOps.filter(
-        existing => existing.videoId !== op.videoId || existing.type !== 'progress'
-      );
-    }
-    // For watched, skip if already queued
-    if (op.type === 'watched' && this.pendingVideoOps.some(e => e.videoId === op.videoId && e.type === 'watched')) {
+  /**
+   * Queue a watched/progress mark the server does not have yet.
+   *
+   * The policy lives in `retry-policy.ts` — per-op attempt counts, per-op backoff,
+   * and "an op leaves only when a retry cannot change the answer" — so this owns
+   * nothing but the clock and the probe. Positional args: `type` is already a
+   * checked union and the payload needs no wrapper object.
+   */
+  private queueOperation(videoId: string, type: OpType, payload?: unknown): void {
+    if (!this.outbox.enqueue(videoId, type, payload)) return;
+    this.startConnectivityProbe();
+    this._armOutboxClock();
+  }
+
+  /** Wait exactly as long as the HEAD op's own history says — never another op's,
+   *  which is what made a freshly queued op inherit a stranger's delay. */
+  private _armOutboxClock(): void {
+    clearTimeout(this.outboxTimer);
+    this.outboxTimer = null;
+    if (this.outbox.isEmpty) {
+      this.stopConnectivityProbe();
       return;
     }
-    this.pendingVideoOps.push(op);
-    this.startConnectivityProbe();
-    this.scheduleRetry();
+    this.outboxTimer = setTimeout(() => this.flushOutbox(), this.outbox.nextDelayMs());
   }
 
-  private scheduleRetry(): void {
-    if (this.retryTimer) clearTimeout(this.retryTimer);
-    const delay = Math.min(this.BASE_RETRY_DELAY * Math.pow(2, this.retryAttempts), 60000);
-    this.retryTimer = setTimeout(() => this.flushPendingOps(), delay);
-  }
-
-  private flushPendingOps(): void {
-    if (this.pendingVideoOps.length === 0) {
-      this.retryAttempts = 0;
+  /** Attempt the head op, once. */
+  private flushOutbox(): void {
+    clearTimeout(this.outboxTimer);
+    this.outboxTimer = null;
+    const op = this.outbox.head();
+    if (!op) {
       this.stopConnectivityProbe();
       return;
     }
 
-    const op = this.pendingVideoOps[0];
-    this.pendingVideoOps.shift();
-
-    let req: any;
-    if (op.type === 'watched') {
-      req = this.http.post(`${this.apiUrl}/video/${op.videoId}/watched`, {});
-    } else {
-      req = this.http.patch(`${this.apiUrl}/video/${op.videoId}/progress`, op.payload || {});
-    }
+    const req = op.type === 'watched'
+      ? this.http.post<unknown>(`${this.apiUrl}/video/${op.videoId}/watched`, {})
+      : this.http.patch<unknown>(`${this.apiUrl}/video/${op.videoId}/progress`, (op.payload as object) ?? {});
 
     req.subscribe({
       next: () => {
-        this.retryAttempts = 0;
-        this.flushPendingOps();
+        this.outbox.succeed(op.videoId);
+        // Ops are independent, so a success is followed by the next one at once:
+        // the only wait ever owed is the one a failure earned.
+        if (this.outbox.isEmpty) this._armOutboxClock();
+        else this.flushOutbox();
       },
-      error: () => {
-        this.retryAttempts++;
-        if (this.retryAttempts >= this.MAX_RETRY_ATTEMPTS) {
-          console.error(`Gave up on ${op.type} for ${op.videoId} after ${this.MAX_RETRY_ATTEMPTS} attempts`);
-          this.flushPendingOps();
+      error: (err: unknown) => {
+        const status = err instanceof HttpErrorResponse ? err.status : null;
+        const kind = classifyFailure(status);
+        if (kind === 'permanent') {
+          // The server judged THIS op and said no: the row is gone, the payload
+          // was rejected, the session expired. Re-sending the same bytes cannot
+          // overturn a verdict, so this op leaves and the ones behind it get their
+          // own turn — the head-of-line starvation the single shared counter
+          // created, along with losing ops on a count.
+          const gone = this.outbox.drop(op.videoId);
+          if (gone?.type === 'watched') this._localWatched.delete(op.videoId);
+          console.error(`Outbox dropped ${op.type} for ${op.videoId}: server answered ${status} (retrying cannot change that)`);
         } else {
-          this.pendingVideoOps.unshift(op);
-          // Probe handles retries now; don't re-schedule here
+          const delay = this.outbox.recordFailure(op.videoId, kind);
+          console.warn(`${op.type} for ${op.videoId} failed (status ${status}) — retrying in ${delay}ms`);
         }
+        this._armOutboxClock();
       }
     });
   }
@@ -866,9 +892,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
             this._resumePlaybackRetry();
             if (resumeAudio) this.recoverAudioPlayback();
           }
-          if (this.pendingVideoOps.length > 0) {
-            this.retryAttempts = 0;
-            this.flushPendingOps();
+          // A reachable backend IS the answer to a transport-blocked op's
+          // question, so that op's backoff is void — but only when the head op is
+          // the one waiting on reachability. An op that was ANSWERED with a status
+          // keeps its backoff: proving the server is up proves nothing about that
+          // verdict, and flushing on every probe turned "backend answers HEAD with
+          // 200 while its POSTs fail" into a flat 3 s hammering loop.
+          if (!this.outbox.isEmpty && this.outbox.headBlockedOnTransport()) {
+            this.flushOutbox();
           }
           if (this.indexFetchPending) {
             this.backendOnline = true;
@@ -901,38 +932,26 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  /**
+   * The booster probe: while something is still owed the backend, keep asking
+   * every PROBE_INTERVAL instead of only when the outbox's own clock comes due.
+   *
+   * Delegates to `_doConnectivityProbe` so the two probes share ONE reachability
+   * verdict — including its 401-is-up rule, which this version lacked: a 401 from
+   * `/api/config` made this probe fall through its whole recovery block, so the
+   * path that ONLY this probe ran (`window.online` → `handleOnline`) logged
+   * "Connection restored" while the always-on probe kept counting failures and the
+   * stall watchdog kept being told the network was down. Delegation also drops a
+   * second, unconditional outage recovery: this probe reset `_dropInProgress` and
+   * called `recoverAudioPlayback()` on a FIRST success, even with zero recorded
+   * failures — i.e. on a probe that proved nothing.
+   */
   private probeBackend(): void {
-    if (this.pendingVideoOps.length === 0 && !this.indexFetchPending) {
+    if (this.outbox.isEmpty && !this.indexFetchPending) {
       this.stopConnectivityProbe();
       return;
     }
-
-    // Use fetch for a lightweight HEAD request -- include token so it doesn't 401
-    const probeHeaders: Record<string, string> = {};
-    fetch(`${this.apiUrl}/config`, { method: 'HEAD', headers: probeHeaders })
-      .then(res => {
-        if (res.ok) {
-          console.log('Connection restored via probe -- flushing pending operations');
-          const resumeAudio = this._dropInProgress && this._wasPlayingBeforeDrop;
-          this.retryAttempts = 0;
-          this._consecutiveProbeFails = 0;
-          this._dropInProgress = false;
-          this._wasPlayingBeforeDrop = false;
-          this.flushPendingOps();
-          // Restore audio if it was interrupted
-          this._resumePlaybackRetry();
-          if (resumeAudio) this.recoverAudioPlayback();
-          // Flush deferred index fetch
-          if (this.indexFetchPending) {
-            this.backendOnline = true;
-            this.indexFetchPending = false;
-            this.loadIndex();
-          }
-        }
-      })
-      .catch(() => {
-        // Still offline, probe will retry in PROBE_INTERVAL
-      });
+    this._doConnectivityProbe();
   }
 
   private handleOnline(): void {
@@ -941,7 +960,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     console.log('OS reports network online -- probing backend');
     // If the track was paused when the connection dropped, it must stay paused.
     const resumeAudio = this._dropInProgress && this._wasPlayingBeforeDrop;
-    this.retryAttempts = 0;
     this._dropInProgress = false;
     this._wasPlayingBeforeDrop = false;
     this.probeBackend();
@@ -1016,12 +1034,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         console.log(`Superseded load on ${owner} (error code ${code ?? 'none'}) -- not a file defect`);
         return;
       }
-      // An ABORTED error on the track that is STILL current is the element
-      // having given up on our load of it. That is not proof of a corrupt
-      // file (so it must not spend the failure counter), but it can be a
-      // vanished one, so the existence probe still runs — it just cannot
-      // charge or reload anything.
-      this._handleAudioError(owner, defect);
+      // An error on the track that is STILL current still has to be RECOVERED: the
+      // element is in a terminal error state, and an errored element reads as
+      // `paused`, which the liveness watchdog vetoes on — so nothing else would
+      // ever pick it up. WHICH budget it pays from is decided inside the handler
+      // from `code` (file defect / dead transport / a load we replaced), so this
+      // caller cannot drift a flag into the wrong verdict; the existence probe
+      // runs in all three cases because a vanished file is one of the answers.
+      this._handleAudioError(owner, code);
     };
 
     // Silent starvation: a connection that dies without an RST (dead Wi-Fi,
@@ -1111,7 +1131,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }).subscribe({
       error: () => {
         // Queue for retry if offline
-        this.queueOperation({ videoId: video.videoId, type: 'progress', payload: { progress: progressInt } });
+        this.queueOperation(video.videoId, 'progress', { progress: progressInt });
       }
     });
   }
@@ -1287,7 +1307,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.applyLocalVideoChange(finishedVideoId, { watched: true });
 
     // Queue the watched mark for retry if needed
-    this.queueOperation({ videoId: finishedVideoId, type: 'watched' });
+    this.queueOperation(finishedVideoId, 'watched');
 
     // Also try immediately (fire-and-forget -- retry handles the rest)
     this.http.post(`${this.apiUrl}/video/${finishedVideoId}/watched`, {})
@@ -1724,22 +1744,30 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   /**
-   * Called from audio.onerror. The HEAD probe decides what the FILE is, the
-   * caller's `defect` flag (from the element's own error code) decides what
-   * may be charged for it:
+   * Called from audio.onerror with the element's own error CODE. The HEAD probe
+   * decides what the FILE is; the code decides what may be charged for it:
    *  - 404: the file is gone (purged mid-play, harvest deleted it) — drop it
    *    from the queue and advance, whatever brought the error here.
-   *  - file present AND the element blaming the file (DECODE / NETWORK /
-   *    SRC_NOT_SUPPORTED): spend one recovery of this track's budget and
-   *    reload it.
+   *  - file present AND the element blaming the file (DECODE / SRC_NOT_SUPPORTED):
+   *    spend one recovery of this track's failure budget and reload it.
+   *  - file present and the TRANSPORT dead (NETWORK): the fetch failed, which is
+   *    the one thing a file sitting on disk cannot be guilty of, so the file's
+   *    counter is not touched — but a reload is still mandatory (see the caller),
+   *    paid out of the watchdog's reload budget instead, which audible progress
+   *    clears.
    *  - file present and the element NOT blaming it (`ABORTED`: it dropped the
    *    load we ourselves replaced): nothing is proven about the file, so
    *    charge nothing and reload nothing — a reload here would re-point `src`
    *    back at a track the user may already have left, and a charge is what
    *    skipped playable files. The liveness watchdog owns this attempt.
+   *
+   * Both classes are derived from `code` HERE rather than passed in as a flag, so
+   * a caller cannot bring a verdict out of sync with the signal it came from.
    */
-  private _handleAudioError(videoId: string, defect = true): void {
+  private _handleAudioError(videoId: string, code: number | null): void {
     if (this.currentVideo()?.videoId !== videoId) return;
+    const defect = mediaErrorIsTrackDefect(code);
+    const transport = mediaErrorIsTransportError(code);
 
     const headers: Record<string, string> = {};
 
@@ -1748,6 +1776,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         if (res.status === 404) {
           console.warn(`Audio error: track ${videoId} is defunct -- skipping`);
           this._skipDefunctTrack(videoId);
+        } else if (transport) {
+          // The fetch died and the file is there. Reload it over a NEW request,
+          // out of the watchdog's budget: charging this against the file is what
+          // marked a half-heard track WATCHED — and watched is what takes a track
+          // out of the queue for good, long after the Wi-Fi came back.
+          if (res.ok) this._recoverFromTransportError(videoId);
+          else console.log(`Audio network error on ${videoId} and the probe itself answered ${res.status} -- leaving it to the outage machinery`);
         } else if (!defect) {
           console.log(`Audio error on ${videoId}: element dropped our load, file is present -- leaving the attempt to the watchdog`);
         } else if (res.ok) {
@@ -1763,6 +1798,28 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         }
       })
       .catch(() => {});
+  }
+
+  /**
+   * Recover a track whose stream fetch died (MEDIA_ERR_NETWORK) while the backend
+   * answered 200 for that very file. It is the same fresh-request reload the
+   * liveness watchdog issues and it spends the SAME budget —
+   * `MAX_STALL_RECOVERIES` reloads since the last audible progress, which any
+   * audible advance clears — so a link that keeps flapping keeps the track alive
+   * (every recovery buys more audible playback and resets the count), while a
+   * stream that never delivers again is skipped after a bounded number of tries
+   * instead of being re-fetched forever. The file's own failure counter is never
+   * touched: a file cannot be guilty of the transport it was served over.
+   */
+  private _recoverFromTransportError(videoId: string): void {
+    if (this.currentVideo()?.videoId !== videoId) return;
+    if (this._stallRecoveries >= MAX_STALL_RECOVERIES) {
+      console.warn(`Transport died on ${videoId} across ${MAX_STALL_RECOVERIES} reloads with the backend reachable -- skipping`);
+      this._skipDefunctTrack(videoId);
+      return;
+    }
+    this._stallRecoveries++;
+    this._reloadCurrentTrack(`Audio network error on ${videoId} (file present, backend reachable)`);
   }
 
   /**
@@ -1792,7 +1849,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.updatePageTitle(null);
     this.playlist.update(current => current.filter(v => v.videoId !== videoId));
 
-    this.queueOperation({ videoId, type: 'watched' });
+    this.queueOperation(videoId, 'watched');
     this.http.post(`${this.apiUrl}/video/${videoId}/watched`, {})
       .subscribe({ error: () => {} });
 

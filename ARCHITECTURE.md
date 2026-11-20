@@ -56,15 +56,16 @@ drivepod/
 ├── .env / .env.example        # deployment env (not committed; .env has real keys)
 ├── AGENTS.md / INTELLIGENCE.md / ARCHITECTURE.md / README.md
 ├── backend/
-│   ├── src/server.ts          # ALL of the backend (3,646 lines, single file)
+│   ├── src/server.ts          # ALL of the backend (3,701 lines, single file)
 │   ├── prisma/schema.prisma   # 3 models: Channel, Video, Config
 │   └── package.json           # express, prisma, rss-parser, node-cron, multer, ...
 ├── frontend/src/app/
-│   ├── app.component.ts       # ALL of the UI logic (2,244 lines, one component)
+│   ├── app.component.ts       # ALL of the UI logic (2,464 lines, one component)
 │   ├── autoplay-order.ts      # pure queue-advance pick (see §12.3)
-│   ├── stall-guard.ts         # pure playback-liveness decision (see §12.3)
+│   ├── stall-guard.ts         # pure playback-liveness + error-attribution decision (see §12.3)
+│   ├── retry-policy.ts        # pure watched/progress outbox policy (see §12.5)
 │   ├── app.routes.ts          # single route '' → AppComponent (no auth routes)
-│   ├── app.component.html     # 836-line template, 6 tabs, Tailwind
+│   ├── app.component.html     # 842-line template, 6 tabs, Tailwind
 │   └── root.component.ts      # <router-outlet />
 ├── cache/                     # mounted volume — see §8 (videos, index.json, rss/)
 ├── data/                      # mounted volume — database.db, cookies.txt (temp)
@@ -228,15 +229,19 @@ string; parsed at the read site). See §10 for the full live key table.
 
 ## 5. Backend (`backend/src/server.ts`)
 
-Single file, ~2,500 lines, structured top-to-bottom: constants → helpers →
+Single file, 3,701 lines, structured top-to-bottom: constants → helpers →
 cleanup → shufflebag → discovery → download → harvest → API routes → startup.
 
 ### 5.1 Global state & concurrency
 
 ```
-isHarvesting  — set during harvestAndPurge(); re-entry skipped
-isImporting   — set during POST /api/import; harvest skips while true
-                (POST /api/import 409s if isHarvesting; harvest skips if isImporting)
+isHarvesting  — set during harvestAndPurge(); re-entry skipped. Taken as the FIRST
+                act inside the try, so the `finally` that releases it is armed the
+                moment it exists, and NOTHING in that `finally` may throw (see the
+                bullets below). Readable as `harvestLockHeld()`.
+isImporting   — set during POST /api/import; harvest skips while true. `importLockHeld()`
+                is its mirror (exported only for the tests). POST /api/import 409s if
+                isHarvesting; harvest skips if isImporting.
 UseAlternateListGetterMethod — flipped every harvest run (see §7.2)
 harvestStatus — plain object polled by GET /api/harvest-status
 ```
@@ -244,6 +249,21 @@ harvestStatus — plain object polled by GET /api/harvest-status
 The harvest/import lock exists because an unlocked import's in-progress cache
 folder would be treated as an orphan by `cleanupCorruptedFolders()` and deleted
 mid-download.
+
+**Why the release is armored** (fixed 2026-11-20): the harvest `finally` used to
+begin with `deleteTempCookiesFile()`, whose `fs.unlinkSync` was unguarded. A throw
+from a `finally` REPLACES whatever the try/catch was about to do — including the
+later lines of that same block that set `isHarvesting = false` — and node-cron
+swallows the rejection (`Task.execute` emits `task-failed`; nothing listens), so
+the process stayed up and the flag stayed `true`: every later 5-minute harvest
+logged `Harvest already running — skipping` forever and `POST /api/import` 409'd
+for the same reason. A one-second EACCES/EBUSY/EROFS on the cookies mount (the
+same class of mount this repo already documents corrupting files *after*
+publication) therefore froze the queue permanently, with no log line pointing at
+it. `deleteTempCookiesFile` now catches and warns, and `harvestAndPurge` takes the
+lock as its first statement inside the `try`; T2 §20 drives a real round to that
+dead end (`cookies.txt` replaced by a directory, so `unlinkSync` really throws) and
+then proves the NEXT round runs.
 
 ### 5.2 Config access
 
@@ -441,6 +461,13 @@ Runs every 5 minutes and once at boot. Full sequence:
    yt-dlp runs (those also refresh the jar's mtime, delaying the vault's re-seed
    after a re-sign-in). Throttled log: `⏸️ Cookie session dead … skipping harvest
    round`. Then `harvestStatus` is reset.
+
+   Neither guard has an early return after the lock exists: `isHarvesting = true`
+   is the first statement inside the `try`, so the `finally` that clears it is
+   already armed the moment the lock is held, and every step of that `finally` is
+   non-throwing (§5.1). Before 2026-11-20 the lock was set several lines *before*
+   the `try` and the `finally` opened with an unguarded `unlinkSync` — a throw
+   there froze the harvest for the life of the process.
 2. **`cleanupCorruptedFolders()`** (full consistency pass):
    - Folder with **no** DB record: if its `{id}.json` is GrabbyTube-authored
      (`createdAt`, §3.2) it's a library track → skip (`🎵 GrabbyTube item
@@ -1011,12 +1038,16 @@ current position, progress time labels.
    the file — no probe, no reload, no charge; a reload would re-point `src` at
    the track being left and wipe the pick. Any other or absent name → probe
    again; on persistent failure stop the player and `advanceToNextTrack()`.
-3. `audio.onerror` → **attribute** (`mediaEventTrackId`), **classify**
-   (`mediaErrorIsTrackDefect`), then the same HEAD probe: 404 → skip
-   (the file really is gone, whatever brought the error here); file present +
-   defect → charge one recovery and reload; file present + not a defect (the
-   element dropped a load WE replaced) → nothing, the watchdog owns that
-   attempt.
+3. `audio.onerror` → **attribute** (`mediaEventTrackId`), then hand the element's
+   own **code** to `_handleAudioError`, which **classifies it there**
+   (`mediaErrorIsTrackDefect` / `mediaErrorIsTransportError`) and runs the same
+   HEAD probe: 404 → skip (the file really is gone, whatever brought the error
+   here); file present + the code blames the FILE → charge one recovery of the
+   file's budget and reload; file present + `MEDIA_ERR_NETWORK` → reload over a
+   NEW request paid from the watchdog's budget, file counter untouched; file
+   present + the element not blaming it → nothing, the watchdog owns that attempt.
+   Both verdicts are derived from `code` inside the handler rather than passed in
+   as a flag, so no caller can bring one out of sync with the signal it came from.
 
 **Every media signal is attributed by `currentSrc`, not by `src`**
 (`mediaEventTrackId(audio.currentSrc, audio.src)`, `stall-guard.ts`; T4 drives
@@ -1049,6 +1080,22 @@ is NOT a silent marker: the element re-selects it against the document and
 ~1.1 s later fires its own code-4 `error` naming the OLD `currentSrc` under the
 page URL — attribution plus "not the current track ⇒ ignore" is what keeps that
 teardown from charging or reloading the track that replaced it.
+
+**`MEDIA_ERR_NETWORK` (2) is not a defect, and that exclusion is load-bearing**
+(fixed 2026-11-20): it is the one code that says *the fetch died*, which is the one
+failure a file sitting on disk cannot be guilty of — a dead Wi-Fi association, a NAT
+that dropped the connection mid-song, a phone out of coverage, and the half-open
+socket of the 2026-11-11 incident all answer with it while the MP3 is byte-perfect.
+Charging it to the file let two such blips inside one listening session spend
+`MAX_TRACK_PLAY_FAILURES` and mark an unfinished track **watched**, which is exactly
+what takes it out of the queue for good: the link came back minutes later and the
+track never did. It is still recovered, because an errored element reads as `paused`
+and the liveness watchdog vetoes on `paused` — nothing else would ever pick it up —
+but the retry it deserves is the watchdog's **fresh-request reload**, paid from
+`MAX_STALL_RECOVERIES`, which any audible progress clears. So a flapping link keeps
+the track alive (each recovery buys more audible playback and resets the count),
+while a stream that never delivers again is skipped after 3 reloads with the backend
+reachable, never re-fetched forever.
 
 **Autoplay on load**: first successful `loadIndex()` triggers
 `_attemptInitialAutoplay()`. The saved `currentVideoId` wins whenever it is still
@@ -1183,22 +1230,33 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   while the page is hidden but audible (lockscreen, car head-unit).
 - Only watchdog-issued loads (`_stallLoadOutstanding`) may be retried, so a
   playback blocked by the autoplay policy is never reloaded forever.
+- A `MEDIA_ERR_NETWORK` reload from `_handleAudioError` is a **watchdog-issued
+  fresh load too** (`recoverStalledPlayback(reason: 'reconnecting',
+  resumeFromElement: false)`): the errored element is paused with a dead buffer, so
+  its `currentTime` is the position it FAILED at and must not become the resume
+  point (that is what `resumeFromElement: false` is for, exactly as for the
+  buffer-starvation reload). Audible progress clears `MAX_STALL_RECOVERIES` just as
+  it does for a wedge, so a flapping link is not a death sentence for the track, and
+  a reload that yields 0 B is the only case where the count is spent with nothing
+  heard — 3 of those with the backend reachable stops and advances (§12.6).
 - UI: the `playbackPhase` signal drives a `role="status" aria-live="polite"`
   badge — `⏳ Buffering…` / `⏳ Reconnecting…` — the only visible sign any of
   this happened (`idle` renders nothing; silent starvation used to render nothing
   at all, which is why "the app just stopped and nothing said why").
-- Test: `node tests/stall-guard.test.mjs` (64 assertions, no browser and no
+- Test: `node tests/stall-guard.test.mjs` (68 assertions, no browser and no
   network: the pure decision plus both resume clocks, the `streamTrackId`
   track-ownership rule and the `mediaEventTrackId` / `mediaErrorIsTrackDefect` /
-  `playRejectIsTrackDefect` error-attribution rules, driven on simulated ticks —
-  including the `readyState 4` stale buffer, a load that never answers, the
-  give-up cadence, scrubbing/paused/frozen-tab immunity, the advance cases (a
-  longer next track never inherits the finished track's position, a next track
-  resumes at its own saved progress, a same-track re-load keeps its live
+  `mediaErrorIsTransportError` / `playRejectIsTrackDefect` error-attribution rules,
+  driven on simulated ticks — including the `readyState 4` stale buffer, a load that
+  never answers, the give-up cadence, scrubbing/paused/frozen-tab immunity, the
+  advance cases (a longer next track never inherits the finished track's position, a
+  next track resumes at its own saved progress, a same-track re-load keeps its live
   position), and the measured element shapes: an aborted selection is owned by
   `currentSrc` not by the new `src`, a teardown error still names the track the
   element last selected, code 4 is a defect while code 1 and no-code silence are
-  not, and `AbortError`/`NotAllowedError` play rejections are not.)
+  not, `AbortError`/`NotAllowedError` play rejections are not, and code 2 — the one
+  code a file on disk cannot cause — reloads from the watchdog's budget instead of
+  spending the file's.)
 
 ### 12.4 Progress persistence
 
@@ -1211,23 +1269,58 @@ after every connectivity-probe verdict, so it needs no timer of its own):
 
 ### 12.5 Network resilience (the car-environment design)
 
-- **Operation queue**: `{videoId, type: 'watched'|'progress'}` — progress
-  dedupes to latest per video; watched dedupes per video. Exponential backoff
-  2 s × 2^n cap 60 s, max 10 attempts, then dropped (logged).
-- **Always-on probe**: `HEAD /api/config` every 5 s. 3 consecutive failures =
-  unreachable → `_snapshotPlaybackStateOnDrop()` records
-  `_wasPlayingBeforeDrop` (from `audio.paused`/`audio.error` + currentVideo).
-- **On recovery**: flush pending ops; resume any pending playback retry
-  immediately; reload audio **only if it was playing before the drop**
-  (`recoverAudioPlayback()` — a paused track stays paused). Explicit play
-  intents (play button, head-unit play, replay-from-start) set
+- The policy is the pure module `retry-policy.ts` (`Outbox`, `classifyFailure`,
+  `retryDelayMs`); **T7** `node tests/retry-policy.test.mjs` (53 assertions, no
+  browser, no network, no build) drives it. Wiring in `app.component.ts` keeps the
+  signals honest in the same tick: `markAsWatched` / `saveProgress` enqueue AND patch
+  `rawIndex`, and `_localWatched` pins a watched id out of every derived queue until
+  the server says `persisted`, so an accepted-but-unproven mark never flips back.
+- **Operation queue**: `{videoId, type: 'watched'|'progress'}` — progress dedupes to
+  latest per video, watched dedupes per video (a repeated press is ONE op, and the
+  un-press of a still-queued watched mark CANCELS it rather than queueing a
+  contradicting op that FIFO order could deliver last). Backoff 2 s × 2^n capped at
+  60 s, **counted per op**, never across the queue.
+- **Only a verdict ends an op.** `classifyFailure(status)` separates *the server did
+  not answer* (`null`/0 = transport, plus 408/429/5xx → `retryable`: retry, at worst
+  one request/minute forever) from *the server answered no* (any other 4xx →
+  `permanent`: drop, logged). A transport failure is indistinguishable from the
+  network being down, so it can never burn an op: the old shared
+  `MAX_RETRY_ATTEMPTS = 10` counter let a ~30 s Wi-Fi flap outlasting the budget
+  silently discard the WHOLE backlog of watched marks — every remaining op then got
+  a single try — and one permanently-404ing op at the head of the FIFO starved every
+  op behind it for the life of the tab while their `_localWatched` pins hid them from
+  a queue the server still listed.
+- **A probe success cuts the wait only if a transport failure set it.** Each op
+  records `blockedOn`, and `Outbox.headBlockedOnTransport()` is what lets a probe
+  flush ahead of `retryDelayMs(head.attempts)`: HEAD answering 200 proves
+  reachability, which is exactly the question a transport failure left open. An HTTP
+  status is an ANSWER, so proving the server reachable proves nothing about it —
+  otherwise "HEAD 200 but POST 500" becomes a flat 3 s hammering loop instead of a
+  backoff.
+- **Two probes, one verdict.** *Always-on*: `HEAD /api/config` every 5 s
+  (`ALWAYS_ON_PROBE_INTERVAL`) — that is the outage machinery. *On demand*
+  (`probeBackend()`, `PROBE_INTERVAL` 3 s): armed by `outbox.enqueue()` and
+  self-stopped only when nothing is owed (`isEmpty && !indexFetchPending`), so a
+  backlog left by a drop is driven to an answer instead of parked until the next
+  press. Both run `_doConnectivityProbe()`, which counts `_consecutiveProbeFails`
+  and at **3** calls `_snapshotPlaybackStateOnDrop()` (recording
+  `_wasPlayingBeforeDrop` from `audio.paused`/`audio.error` + currentVideo); 200 or
+  **401** clears the count and runs the recovery paths, any other status keeps
+  counting. The watchdog tick runs AFTER the verdict, because a probe failure is
+  what hands a dead stream to the outage machinery.
+- **On recovery** (the count dropping to 0, so once per outage rather than once per
+  probe): resume any pending playback retry immediately; reload audio **only if it
+  was playing before the drop** (`recoverAudioPlayback()` — a paused track stays
+  paused); flush the outbox when the head op is transport-blocked (bullet above);
+  lift `indexFetchPending` and refetch. The outage snapshot is CONSUMED during
+  recovery so the second spurious path (`window.online`) cannot double-trigger it.
+  Explicit play intents (play button, head-unit play, replay-from-start) set
   `_wasPlayingBeforeDrop=true` so they resume too.
-- `window.online` is treated as unreliable (fires on NIC-up, not
-  internet-up) — it only triggers a probe.
-- **Index fetch deferral**: failed `loadIndex()` sets `backendOnline=false`;
-  the 2-min poll and autoplay fetches defer (`indexFetchPending`) until the
-  probe confirms reachability. Failed fetches never overwrite in-memory state
-  with browser cache.
+- `window.online` is treated as unreliable (fires on NIC-up, not internet-up) — it
+  only triggers a probe.
+- **Index fetch deferral**: failed `loadIndex()` sets `backendOnline=false`; the
+  2-min poll and autoplay fetches defer (`indexFetchPending`) until the probe confirms
+  reachability. Failed fetches never overwrite in-memory state with browser cache.
 - **UI/network decoupling rule**: state transitions (track end, skip, hide)
   update signals synchronously; the HTTP call is fire-and-forget + queued.
 
@@ -1261,9 +1354,11 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   fallback-classify the whole string as a "channel ID". Fix when touched.
 - Stream URL sends `?bitrate=…` and `-mono` suffix that the backend ignores
   (§11) — cosmetic; the file is what the file is.
-- `probeBackend()`'s recovery branch doesn't handle the 401-as-reachable case
-  the way `_doConnectivityProbe()` does (harmless now — there is no auth —
-  but don't copy that pattern if auth returns).
+- ~~`probeBackend()`'s recovery branch doesn't handle the 401-as-reachable case~~
+  — gone as of 2026-11-20: it now only decides whether the demand probe is still
+  owed (`outbox.isEmpty && !indexFetchPending` ⇒ stop) and delegates the request to
+  `_doConnectivityProbe()`, so there is exactly ONE reachable-or-not verdict in the
+  client (the 401-as-reachable rule can no longer be missed in one of two places).
 - `initializeCurrentVideo()` is unused (initial autoplay is handled by
   `_attemptInitialAutoplay`).
 - Dead code: nothing auth-related exists client-side anymore; the skill's
@@ -1414,6 +1509,14 @@ headers), and the always-on probe must send it too.
     matching mistakes FrogRock's `<id>.mp3.tr64k.mp3` and GrabbyTube's
     `<id>.mp3.bak` for duplicate audio, and destroying a grabby row destroys its
     watched state. T2 §17 is the gate.
+15. **A transient network failure may never become a permanent local verdict**
+    (2026-11-20): an op is dropped only when the SERVER answered it with a status
+    (§12.5), a stream error charges the FILE only when the code blames the file
+    (§12.3), and a harvest's `finally` may not throw (§5.1/§6-1). Each of those
+    three had a latch that outlived the outage: ops discarded on a shared attempt
+    count, `MEDIA_ERR_NETWORK` marking a half-heard track watched, and a
+    `deleteTempCookiesFile` throw that left `isHarvesting` true for the life of the
+    process. T2 §20, T4 and T7 are the gates.
 
 ---
 

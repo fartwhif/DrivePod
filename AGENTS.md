@@ -39,6 +39,12 @@
   (the image has no such name and the route's remote-first delete must resolve
   it); §19 flips `COOKIE_SESSION_STATE` + writes state files and reads the live
   `/api/harvest-status` on the boot listener :3000 (gate + badge from one read).
+  §20 is the unrecoverable-state test: it makes `cookies.txt` an unremovable path
+  (an `unlinkSync` on it provably throws ON THIS filesystem — asserted, or "the guard
+  fixed it" would be unfalsifiable), runs `harvestAndPurge()`, and demands the round
+  neither rejects nor strand the lock — then the ROUND AFTER IT must actually run,
+  which is the only question that matters, because `isHarvesting` stayed true forever
+  and every later cron logged "Harvest already running — skipping".
 - **T3 — browser E2E**: open the SPA headless on the queue tab (default),
   paginate to the `🎉 End of queue` sentinel by scrolling the
   `↓ Scroll for more items` element (the `#loadMoreTrigger` in the template
@@ -54,7 +60,7 @@
   `UPDATE Video SET watched=0, progress=0` (the index self-heals on the
   next harvest, seconds later).
 - **T4 — frontend playback logic (pure, no browser, no network)**:
-  `node tests/stall-guard.test.mjs` (~1 s, 64 assertions). Compiles
+  `node tests/stall-guard.test.mjs` (~1 s, 68 assertions). Compiles
   `frontend/src/app/stall-guard.ts` and drives the watchdog decision on simulated
   ticks: the `readyState 4` stale-buffer case (the real freeze), a load that never
   answers, scrubbing / paused / frozen-tab immunity, the 3-reload give-up cadence,
@@ -64,8 +70,10 @@
   predecessor's position bug — and the error-attribution rules (`mediaEventTrackId`
   prefers the element's actual selection `currentSrc` over the `src` attribute,
   `mediaErrorIsTrackDefect` / `playRejectIsTrackDefect` decide whether a signal
-  implicates the FILE at all), all driven on the shapes measured from the deployed
-  chromium on 2026-11-17. No live system, no DB, no build.
+  implicates the FILE at all, `mediaErrorIsTransportError` names the one class that
+  implicates the PATH instead — and the suite asserts no signal is in both classes),
+  all driven on the shapes measured from the deployed chromium on 2026-11-17. No live
+  system, no DB, no build.
 - **T5 — advance/resume browser E2E recipe** (headless Chromium + `--autoplay-policy=no-user-gesture-required`):
   open the app, tag a short (≤150 s) queue row by id, click it (a trusted click
   is what grants playback permission), then either await its `ended` event or
@@ -80,17 +88,29 @@
   load is too late to observe the boot autoplay, and each headless SPA tab
   writes progress/watched — zero or unwatch the touched rows afterwards.
 - **T6 — autoplay ordering (pure, no browser, no network)**:
-  `node tests/autoplay-order.test.mjs` (~1 s, 38 assertions). Transpiles
+  `node tests/autoplay-order.test.mjs` (~1 s, 49 assertions). Transpiles
   `frontend/src/app/autoplay-order.ts` with the frontend's own `typescript`
   (same recipe as T4) and drives `pickNextTrack(queue, mode, finished?)` on
   literal queues: every mode × finished-position, ties (a grabby cluster band
   shares one drawn timestamp), a shuffled queue giving the same pick as the
   newest-first one, the rowless-finished case (a consumed track is still in the
   queue the caller hands in), NaN `publishedAt` (never picked, never satisfies
-  a step, never wins a scan), and the no-finished page-load picks. The bug these
-  lock: a chosen mode was honoured only on finish → next; a skipped/broken
+  a step, never wins a scan), the no-finished page-load picks, and `manualNextMode`
+  / `manualPrevMode` (§11–12: the `off` → `older` mapping, the neighbour picks in
+  both directions, and a Next then Previous returning the origin track). The bug
+  these lock: a chosen mode was honoured only on finish → next; a skipped/broken
   track, the post-refresh advance and the autoplay on page load each hard-coded
   "the newest in the list".
+- **T7 — outbox policy (pure, no browser, no network, no build)**:
+  `node tests/retry-policy.test.mjs` (~1 s, 53 assertions). Transpiles
+  `frontend/src/app/retry-policy.ts` with the frontend's own `typescript` (same
+  recipe as T4/T6) and drives `Outbox` over a scripted outcome stream: per-op attempt
+  budgets (a 30 s blip must not drain 5 queued watched marks — one SHARED
+  `retryAttempts` counter ended all retrying after ten failures anywhere in the
+  process's life), per-op backoff (a freshly queued mark starts at 2 s, never at a
+  stranger's 34 s), 4xx = permanent (a retry cannot change the answer) vs 5xx/transport
+  = retryable, `persisted` as the ONLY way an op leaves, and a `retryDelayMs` ceiling
+  so a 4 h outage costs ~13 attempts, not 13 000.
 
 ## Workflow Reminders
 - Use `Task`/`explore` agents for complex searches.
@@ -134,8 +154,20 @@
   `localRecords: 0`). Fail-closed on a remote failure is unchanged: 502 and
   nothing local is touched. T2 §18 drives all six paths against a stubbed
   grabbytube on :8101 (`--add-host grabbytube:127.0.0.1` in `run-scratch.sh`).
-- Frontend caps repeated load failures per track (`MAX_TRACK_PLAY_FAILURES`)
-  and skips unplayable-but-present tracks instead of reloading forever.
+- **A transient failure may never be charged to the file it merely streamed**
+  (2026-11-20): `MAX_TRACK_PLAY_FAILURES` (`trackPlayFailures`) counts only signals
+  that blame the FILE — `mediaErrorIsTrackDefect(code)` answers yes for DECODE and
+  SRC_NOT_SUPPORTED, NO for `MEDIA_ERR_NETWORK` (2), the one code a file sitting on
+  disk cannot cause. Two Wi-Fi blips inside one listening session used to spend the
+  cap and mark an unfinished track **watched**, which is what removes it from the
+  queue for good: connectivity came back minutes later, the track never did. A
+  network error is still RECOVERED — an errored element reads as `paused` and the
+  liveness watchdog vetoes on `paused`, so nothing else would ever pick it up — but
+  it reloads via `recoverStalledPlayback(..., resumeFromElement: false)` on the
+  watchdog's `MAX_STALL_RECOVERIES` budget, which any audible progress clears. T4
+  locks the classification; the unbounded-reload risk that exclusion opens is closed
+  by the give-up branch (3 fresh loads with the backend answering → `Playback never
+  resumed on <id> after 3 reloads — skipping`).
 - **GrabbyTube tracks display the real artist via per-artist placeholder
   channels** (`channelId` = `UCGrabbyTube` + base64url(author), `title` =
   artist; bare `UCGrabbyTube` when no author). The SPA/head unit render
@@ -683,3 +715,40 @@ directions through the live route on the boot listener :3000: unset ⇒ the moun
 the source of truth (live session harvests, dead one closes the gate and the badge
 says so), set ⇒ my file wins over a disagreeing mount and the mount's absence
 changes nothing; whitespace-only treated as unset. 202 assertions, exit 0.
+Last updated: 2026-11-20 (the audit for "a transient network problem left the app
+broken AFTER the network came back" found three latches, all fixed here). (1)
+**Backend:** `harvestAndPurge`'s `finally` began with `deleteTempCookiesFile()`, whose
+unguarded `fs.unlinkSync` threw on a path it cannot unlink (a directory, an unwritable
+mount, a borrowed jar) and ABORTED the rest of the `finally`, so `isHarvesting = false`
+never ran — the lock was held for the life of the process and every later cron logged
+"Harvest already running — skipping" while the container stayed Up and `/api/config`
+answered 200. `deleteTempCookiesFile` now catches + warns and `harvestAndPurge` takes
+the lock down in a nested `finally`, so nothing between the lock and its release can
+strand it; exported `harvestLockHeld()` is the seam. T2 §20 (14 assertions) falsifies
+the hazard on the scratch filesystem first (an unguarded `unlinkSync` DOES throw there),
+then requires the ROUND AFTER the fault to run — pre-fix it logged "already running".
+(2) **Frontend outbox:** one shared `retryAttempts` counter fed both the give-up
+decision and the backoff, so a Wi-Fi flap a little longer than the ~30 s budget hit
+`MAX_RETRY_ATTEMPTS` and discarded EVERY queued watched mark — the marks the user made
+during the outage, plus the ones still owed from before it, so the queue refilled with
+finished items after reconnect. New pure `frontend/src/app/retry-policy.ts` owns the
+policy: a per-op budget (a fresh mark always gets its full 10 attempts), a per-op
+backoff (a just-queued op starts at 2 s, never at a stranger's 34 s), `classifyFailure`
+(a 4xx answer means a retry cannot change the result — drop it; transport/5xx/408/429
+means retry), `persisted` as the ONLY exit, and a `retryDelayMs` ceiling so a 4 h outage
+costs ~13 attempts instead of 13 000. The probe's flush is scheduled by the SAME clock
+as `retryDelayMs` (a reachable backend no longer hammers POSTs every 3 s while its
+earliest owed op is 30 s away). T7 (53 assertions) drives the real module on scripted
+outcome streams. (3) **`MEDIA_ERR_NETWORK` charged the file** for a path failure:
+`_handleAudioError` counted every error toward `MAX_TRACK_PLAY_FAILURES` and, on
+reaching the cap, POSTed `watched=true` — so two 20 s blips mid-episode permanently
+removed an unfinished track from the queue, and it could not come back. `stall-guard`
+splits the signal classes (`mediaErrorIsTrackDefect` vs `mediaErrorIsTransportError`,
+no signal is in both; code 2 is the one code a file on disk cannot cause, so it is a
+PATH verdict) and `app.component` keeps transport errors OUT of the file's budget while
+still RECOVERING them — an errored element reads as `paused` and the liveness watchdog
+vetoes on `paused`, so "do nothing" is a freeze, not a wait: the reload goes
+`recoverStalledPlayback(…, resumeFromElement: false)` on the watchdog's own
+`MAX_STALL_RECOVERIES` budget, cleared by any audible progress, and the 3-attempt give-up
+branch bounds the reload loop T4's classification opens. T2 216 assertions exit 0,
+T4 68, T6 49, T7 53, T1 PASS, production `ng build` clean (its own strict typecheck).
