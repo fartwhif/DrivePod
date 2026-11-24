@@ -45,6 +45,14 @@
   neither rejects nor strand the lock — then the ROUND AFTER IT must actually run,
   which is the only question that matters, because `isHarvesting` stayed true forever
   and every later cron logged "Harvest already running — skipping".
+  §21 drives the torn-bytes rule through the REAL seams (`readShuffleBag`,
+  `writeShuffleBag`, `loadGrabbyIndex`, `initShuffleBag`, `pullFromShuffleBag`,
+  `syncBagForWatched`): a truncated `shufflebag.json` must read `unreadable` and
+  change NOTHING on disk, a `missing` one must seed, byte-identical rewrites must
+  not touch mtime, and a torn `grabby-index.json` must make `initShuffleBag` keep
+  the bag it has instead of writing `[]` (the old answer threw away the whole
+  rotation, and `syncBagForWatched`'s un-watch re-add pruned it to one entry
+  because its throw landed after the array was already emptied in memory).
 - **T3 — browser E2E**: open the SPA headless on the queue tab (default),
   paginate to the `🎉 End of queue` sentinel by scrolling the
   `↓ Scroll for more items` element (the `#loadMoreTrigger` in the template
@@ -102,7 +110,7 @@
   track, the post-refresh advance and the autoplay on page load each hard-coded
   "the newest in the list".
 - **T7 — outbox policy (pure, no browser, no network, no build)**:
-  `node tests/retry-policy.test.mjs` (~1 s, 53 assertions). Transpiles
+  `node tests/retry-policy.test.mjs` (~1 s, 66 assertions). Transpiles
   `frontend/src/app/retry-policy.ts` with the frontend's own `typescript` (same
   recipe as T4/T6) and drives `Outbox` over a scripted outcome stream: per-op attempt
   budgets (a 30 s blip must not drain 5 queued watched marks — one SHARED
@@ -110,7 +118,13 @@
   process's life), per-op backoff (a freshly queued mark starts at 2 s, never at a
   stranger's 34 s), 4xx = permanent (a retry cannot change the answer) vs 5xx/transport
   = retryable, `persisted` as the ONLY way an op leaves, and a `retryDelayMs` ceiling
-  so a 4 h outage costs ~13 attempts, not 13 000.
+  so a 4 h outage costs ~13 attempts, not 13 000. The last two sections drive
+  `beginAttempt`/`settleAttempt` (one flight, whoever asks; a dropped mid-flight op
+  cannot wedge the one behind it; `clear()` releases the claim) and model the app's
+  own clocks — head-op timer + 3 s booster probe + 5 s always-on probe, one reset then
+  100 s of unanswered POSTs — against the pre-single-flight policy, asserting the
+  peak-concurrency bound (≤ Chrome's 6-per-origin pool) and that an unanswered flight
+  charges its op ZERO attempts.
 
 ## Workflow Reminders
 - Use `Task`/`explore` agents for complex searches.
@@ -168,6 +182,53 @@
   locks the classification; the unbounded-reload risk that exclusion opens is closed
   by the give-up branch (3 fresh loads with the backend answering → `Playback never
   resumed on <id> after 3 reloads — skipping`).
+- **A connectivity probe must ALWAYS answer** (2026-11-23): `_doConnectivityProbe`
+  wraps its `HEAD /api/config` in an `AbortController` (`PROBE_TIMEOUT_MS` 4.5 s) and
+  refuses to start while one is outstanding (`_probeInFlight`). A bare `fetch` on a
+  **half-open** socket (dead Wi-Fi association, NAT-dropped flow, phone out of
+  coverage) settles for NOTHING for minutes — no response, no error — and both
+  consumers of that promise assumed it settles: the 3 s and 5 s intervals piled
+  request after request (E2E A/B against a black-hole port: 6 HEADs stacked, 0 ever
+  answered, `_consecutiveProbeFails` stuck below 3, so the `Backend unreachable`
+  verdict and the outage snapshot never happened), and `_runStallCheck()` — the
+  playback liveness watchdog — runs on that promise's continuations, so a hung probe
+  meant NO TICK AT ALL: the exact silent-socket failure `stall-guard.ts` exists for
+  became "no watchdog" instead of "reload the stream". Both guards are load-bearing
+  (deadline = a verdict always; single-flight = exactly one, because queued
+  continuations would each move the failure count), a timeout counts as unreachability,
+  and teardown clears the deadline so a late abort can't settle onto a dead element.
+- **The outbox keeps ONE POST in flight** (2026-11-23): `flushOutbox()` claims the head
+  op through `Outbox.beginAttempt()`, which refuses to hand one out while a flight is
+  outstanding. Three clocks reach that flush (the head op's backoff timer, the 3 s
+  booster probe, the 5 s always-on probe) and a POST over a half-open socket answers
+  nothing for minutes, so an unguarded flush queued a FRESH request for the same op on
+  every tick — T7's model of these clocks measures **57 unanswered POSTs for ONE owed
+  mark, 48 of them outstanding at once** against the 6 connections Chromium allows per
+  origin, which stalls the `index.json` poll AND the audio stream on that host — and 19
+  deaths were verdicts the subscription reported, so the op climbed its own backoff to
+  the 60 s ceiling on phantom attempts (20 charged, 2 earned).
+  The outstanding
+  flight owns the next step (its own answer calls `settleAttempt()` and
+  `_armOutboxClock()` re-arms), so an early return from `flushOutbox()` is a wait, not
+  a stall; `clear()` releases the claim because teardown drops the subscription, so
+  neither callback runs. NEVER reintroduce a bare `outbox.claimNext()` + `post()` that
+  skips the claim. T7's "unanswered request" section is the gate.
+- **Unreadable JSON is never a verdict** (2026-11-23): `shufflebag.json` is read via
+  `readShuffleBag()` and written via `writeShuffleBag()`, `grabby-index.json` via
+  `loadGrabbyIndex()` — a tri-state read (`missing` | `unreadable` | `ok`) where
+  `missing` means "seed it" and `unreadable` means **change nothing on disk**.
+  NEVER reintroduce `JSON.parse(readFileSync(SHUFFLEBAG_JSON_PATH))` or a bare
+  `writeFileSync` on it: every consumer used to sit INSIDE that throw, so one
+  truncated file (the in-place write's own truncate-then-kill window, or this cache
+  mount's documented post-publication corruption) 500'd `PATCH /video/:id/watched`
+  after the row was already marked (the outbox retried into the same 500 forever),
+  aborted the harvest's distribution, and threw inside `pullFromShuffleBag` before
+  its exhaustion re-init — so no later run could heal it. The worst instance:
+  `initShuffleBag` answered a torn GRABBY index by writing `[]`, discarding the
+  rotation and every `used` mark on bytes nobody could read. A bag may only be
+  replaced by a derivation from an index it actually read; `writeShuffleBag` is
+  sibling-temp + rename + no-op-on-identical, like `index.json`/`progress.json`.
+  T2 §21 is the gate.
 - **GrabbyTube tracks display the real artist via per-artist placeholder
   channels** (`channelId` = `UCGrabbyTube` + base64url(author), `title` =
   artist; bare `UCGrabbyTube` when no author). The SPA/head unit render
@@ -752,3 +813,57 @@ vetoes on `paused`, so "do nothing" is a freeze, not a wait: the reload goes
 `MAX_STALL_RECOVERIES` budget, cleared by any audible progress, and the 3-attempt give-up
 branch bounds the reload loop T4's classification opens. T2 216 assertions exit 0,
 T4 68, T6 49, T7 53, T1 PASS, production `ng build` clean (its own strict typecheck).
+
+Last updated: 2026-11-23 (review of the playback/networking surface found three ways a
+dead link leaves state damaged behind it, all fixed here). (1) **The connectivity
+probe could stop answering.** `_doConnectivityProbe` fetched `HEAD /api/config` with
+no deadline and no in-flight guard, and a half-open TCP connection (Wi-Fi association
+dead, NAT dropped the flow, phone out of coverage) never answers and never errors —
+so the 3 s / 5 s intervals stacked requests while `setInterval` kept firing (measured
+against a black-hole port on the OLD bundle: 6 HEADs arrived at 5 s intervals,
+outstanding grew 0→5, ZERO ever settled, so `_consecutiveProbeFails` never reached 3,
+`Backend unreachable` never logged, and no outage snapshot was taken), and because
+`_runStallCheck()` is scheduled at the end of that promise, the playback liveness
+watchdog got **no tick for the whole stall** — the silent-socket case
+`stall-guard.ts` was written for turned into "no watchdog". Now: `AbortController` +
+`PROBE_TIMEOUT_MS` 4.5 s (a timeout IS unreachability, so it feeds the same failure
+path), a single `_probeInFlight` flag shared by both probes (their continuations would
+otherwise all land at once and each move the failure count), one `settle()` path so the
+flag/timer/tick cannot diverge, and teardown drops the deadline. Re-measured on the NEW
+bundle: outstanding never exceeded 1, every request aborted 4.50 s after arrival, verdict
+on the 3rd settle ~20 s after load (arrivals 6.14/11.14/16.14 s, each closed 4.50 s later).
+The OLD run also showed why single-flight matters beyond the failure COUNT: arrivals
+STOPPED at six while the interval kept firing — Chrome caps six concurrent connections per
+origin, so the stacked HEADs held the whole pool and a page-side `fetch` of a DIFFERENT path
+never completed either: every `index.json` poll, outbox POST and stream on that origin
+stalls behind one hung probe. (2) **A torn shared-cache JSON file was acted on as if it were an
+answer.** `shufflebag.json` was `JSON.parse(readFileSync(...))` inside every consumer
+and `writeFileSync`-truncated in place, so a kill mid-write — or this mount's
+documented post-publication corruption — 500'd `PATCH /video/:id/watched` *after* the
+row was marked (outbox retried into the same 500 forever), aborted the harvest's
+distribution, and threw inside `pullFromShuffleBag` before its exhaustion re-init, so
+nothing could recover it without a restart; a torn `grabby-index.json` made
+`initShuffleBag` write `[]` (rotation + all `used` marks gone) and
+`syncBagForWatched`'s un-watch re-add prune the bag to one entry. Now
+`readJsonFile`/`readShuffleBag`/`loadGrabbyIndex` return `missing` | `unreadable` |
+`ok`, `unreadable` may not change anything on disk, and `writeShuffleBag` uses
+sibling-temp + rename + skip-if-identical like `index.json`/`progress.json`. T2 §21
+(16 assertions, total 232) drives the tri-state through the real seams. (3) **The outbox
+queued a fresh POST for the same op on every reachable tick.** `flushOutbox()` took the
+head op and posted it with NO in-flight guard, and three clocks reach it — the head op's
+own backoff timer, the 3 s booster probe (armed by `enqueue`) and the 5 s always-on probe.
+A POST over the same half-open socket answers nothing for minutes, so every tick that
+found the backend reachable queued a NEW request for that ONE owed mark: modelling the
+app's own clocks (one reset, then 100 s of silence) gives **57 unanswered POSTs**, peaking
+at **48** outstanding against an origin Chrome gives **six** connections to — which stalls
+the `index.json` poll and the audio stream on that host exactly as the hung probe does —
+and 19 of those died at the client deadline, each death a verdict the subscription
+reports, so the op climbed to **20 attempts** it never earned.
+Now `beginAttempt()` hands out the head op ONLY while nothing is outstanding, the
+outstanding flight settles from its own answer and `_armOutboxClock()` re-arms, and
+`clear()` releases the claim (teardown drops the subscription, so neither callback would
+ever run). T7 53 → 66 assertions (the new `beginAttempt` section plus the
+measured-concurrency section, which runs the OLD policy on the same clock model: 57
+requests, peak 48 outstanding, 20 attempts charged on one mark). T2 exit 0 / 232 assertions, T4 68,
+T6 49, T7 66, T1 PASS (700 queue, 379 marker-carrying grabby rows), production `ng build`
+clean (its own strict typecheck) → `main-6XSBBORF.js`, `APP_VERSION 1.18.0`.

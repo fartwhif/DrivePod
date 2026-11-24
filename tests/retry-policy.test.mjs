@@ -461,5 +461,156 @@ console.log('\nthe whole retry loop, end to end');
     `attempts=${d.attempts} ticks=${d.ticks} elapsed=${d.now}ms`);
 }
 
+// ── 8. ONE request at a time ─────────────────────────────────────────────────
+// An attempt is an HTTP request, and a request over a half-open connection
+// (Wi-Fi association dead, NAT dropped the flow, phone out of coverage) answers
+// NOTHING and errors NOTHING for minutes. Nothing used to record that an attempt
+// was in progress, so every clock that can flush — the op's own backoff, the 3 s
+// booster probe, the 5 s always-on probe — started a FRESH POST for the same head
+// op, and when the pile finally answered, every continuation charged the SAME op
+// an attempt it never earned.
+console.log('\nbeginAttempt: one flight, whoever asks');
+{
+  const o = new Outbox();
+  t('nothing is claimed when nothing is owed',
+    o.beginAttempt() === null && o.attemptInFlight === false);
+
+  o.enqueue('a', 'watched');
+  o.enqueue('b', 'watched');
+  const first = o.beginAttempt();
+  t('the claim hands out the head op and marks the flight outstanding',
+    first?.videoId === 'a' && first?.type === 'watched' && o.attemptInFlight === true,
+    `claimed=${at(first)} inFlight=${o.attemptInFlight}`);
+
+  // 33 flush triggers is ~100 s of the 3 s booster probe: exactly the window a
+  // half-open socket stays silent for, measured against a black-hole port.
+  let denied = 0;
+  for (let i = 0; i < 33; i++) if (o.beginAttempt() === null) denied++;
+  t('33 clocks asking during one unanswered request start 33 attempts: zero',
+    denied === 33 && o.attemptInFlight === true && o.size === 2,
+    `denied=${denied} size=${o.size}`);
+
+  o.settleAttempt();
+  o.recordFailure('a', 'transport');
+  t('once the answer lands the head op is claimable again',
+    o.beginAttempt()?.videoId === 'a' && o.snapshot()[0].attempts === 1,
+    `next=${at(o.snapshot().map(x => [x.videoId, x.attempts]))}`);
+  o.settleAttempt();
+
+  // A verdict removes the op that is IN FLIGHT (a 404, or a prune against a
+  // freshly read index). The flight still has to be settled by its own answer,
+  // and the op behind it must not inherit a phantom claim.
+  const o2 = new Outbox();
+  o2.enqueue('x', 'watched'); o2.enqueue('y', 'watched');
+  o2.beginAttempt();
+  o2.drop('x');
+  o2.settleAttempt();
+  t('a dropped mid-flight op cannot wedge the one behind it',
+    o2.beginAttempt()?.videoId === 'y' && o2.size === 1,
+    `next=${at(o2.snapshot().map(x => x.videoId))}`);
+  o2.settleAttempt();
+
+  // Teardown is the one path where NEITHER callback ever runs (Angular cancels
+  // the subscription when the component dies), so forgetting the ops has to
+  // forget the claim too or the queue is mute for its whole life.
+  const o3 = new Outbox();
+  o3.enqueue('z', 'watched');
+  o3.beginAttempt();
+  o3.clear();
+  o3.enqueue('z2', 'watched');
+  const o3Claimed = o3.beginAttempt();
+  t('a rebuilt outbox is not wedged by the flight the old tab abandoned',
+    o3Claimed?.videoId === 'z2', `claim=${at(o3Claimed)}`);
+  const o4 = new Outbox();
+  o4.settleAttempt();
+  t('settling without an outstanding attempt is inert', o4.attemptInFlight === false);
+}
+
+// The same clocks this app really runs, against a flight that answers NOTHING:
+// a POST over a half-open connection (Wi-Fi association dead, NAT dropped the
+// flow, phone out of coverage) sits for minutes without resolving and without
+// erroring. The seed is one delivered transport failure — a reset is instant,
+// which is what sets `blockedOn` and lets the probes flush at all — then the
+// link goes silent for HANG_MS. `legacy` is the shipped-before caller, which
+// asked the outbox for the head op instead of CLAIMING it, so every probe tick
+// that found the backend reachable started another request for the same op.
+console.log('\nthe unanswered request, measured in POSTs');
+{
+  const HANG_MS = 100000;      // how long one flight stays silent
+  const WINDOW = 140000;       // what we watch
+  const PROBE_MS = 3000;       // booster probe while an op is owed
+  const ALWAYS_MS = 5000;      // always-on probe
+  const CONNECTIONS_PER_ORIGIN = 6;   // Chrome's per-origin HTTP/1.1 pool
+  const sim = (legacy) => {
+    const o = new Outbox();
+    o.enqueue('m', 'watched');
+    o.recordFailure('m', 'transport');      // the reset that came before the hang
+    const flight = [];                      // unanswered requests, FIFO by answer time
+    let issued = 0, delivered = 0, peak = 0, probeTicks = 0, now = 0;
+    let timer = now + retryDelayMs(o.snapshot()[0].attempts);   // _armOutboxClock
+    const probeAt = (step) => Math.ceil((now + 1) / step) * step;
+    while (true) {
+      const next = Math.min(flight.length ? flight[0].until : Infinity, timer,
+        probeAt(PROBE_MS), probeAt(ALWAYS_MS));
+      if (next > WINDOW) break;
+      now = next;
+      if (flight.length && flight[0].until <= now) {
+        // Each request dies at the CLIENT — our own timeout, not a server
+        // answer. One subscription ends, so one attempt is charged and the
+        // answer re-arms the caller's clock.
+        while (flight.length && flight[0].until <= now) {
+          flight.shift(); delivered++;
+          if (!legacy) o.settleAttempt();
+          o.recordFailure('m', 'transport');
+          timer = now + retryDelayMs(o.snapshot()[0]?.attempts ?? 10);
+        }
+        peak = Math.max(peak, issued - delivered);
+        continue;
+      }
+      const isProbe = now % PROBE_MS === 0 || now % ALWAYS_MS === 0;
+      if (isProbe) probeTicks++;
+      // A probe flushes only what its own answer proves: the head op's last
+      // failure said "could not reach the server" and this probe reached it.
+      if (isProbe && !o.headBlockedOnTransport()) continue;
+      // flushOutbox clears its timer at the top of EVERY call, so a flush that
+      // starts a request leaves the caller owning no clock: the answer re-arms
+      // it. Before the claim there was nothing to tell the next tick that a
+      // request was already out, so it started one too.
+      timer = Infinity;
+      const claim = legacy ? o.head() : o.beginAttempt();
+      if (!claim) continue;
+      issued++;
+      flight.push({ until: now + HANG_MS });
+      peak = Math.max(peak, issued - delivered);
+    }
+    peak = Math.max(peak, issued - delivered);
+    return { issued, delivered, peak, probeTicks, owed: o.snapshot().map(x => [x.videoId, x.attempts]) };
+  };
+  const neu = sim(false);
+  const old = sim(true);
+  t('a flight that answers nothing for 100 s costs ONE request and one connection',
+    neu.issued === 2 && neu.peak === 1 && neu.delivered === 1,
+    `issued=${neu.issued} outstanding=${neu.peak} delivered=${neu.delivered}`);
+  t('…and the probe ticks that fired inside the silence started attempts: zero',
+    neu.probeTicks > 30 && neu.issued === neu.delivered + 1,
+    `probeTicks=${neu.probeTicks} issued=${neu.issued}`);
+  t('…the retry that follows waits for the answer instead of racing it',
+    at(neu.owed) === at([['m', 2]]), `owed=${at(neu.owed)}`);
+  // Control: identical clocks, identical silence, no claim. One POST per probe
+  // tick, every one of them unanswered, so far more requests sit against this
+  // origin than Chrome gives it connections — which is how the retry queue
+  // starved the index.json poll and the audio stream that share the host — and
+  // each death is charged to the op, so its backoff climbs on phantom verdicts.
+  t('…where an unguarded flush queued 57 POSTs for the ONE owed mark',
+    old.issued > 30 && old.issued > neu.issued * 15,
+    `issued=${old.issued}`);
+  t('…48 of them outstanding at once against an origin with 6 connections',
+    old.peak > CONNECTIONS_PER_ORIGIN && neu.peak <= CONNECTIONS_PER_ORIGIN,
+    `legacy peak=${old.peak} fixed peak=${neu.peak}`);
+  t('…and the client timeouts charged that mark phantom attempts it never earned',
+    old.delivered > 5 && old.owed[0][1] > 5 && neu.owed[0][1] === 2,
+    `legacy owed=${at(old.owed)} (of ${old.issued} requests, ${old.delivered} died at the client) fixed owed=${at(neu.owed)}`);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

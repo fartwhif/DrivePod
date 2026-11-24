@@ -103,6 +103,8 @@ export interface OutboxOp {
  */
 export class Outbox {
   private ops: OutboxOp[] = [];
+  /** One request at a time (see `beginAttempt`). Cleared by every settle. */
+  private attemptOutstanding = false;
 
   get size(): number {
     return this.ops.length;
@@ -110,6 +112,39 @@ export class Outbox {
 
   get isEmpty(): boolean {
     return this.ops.length === 0;
+  }
+
+  /**
+   * Claim the right to attempt the head op, or null when no attempt may start.
+   *
+   * SINGLE-FLIGHT is not an optimization: an attempt is an HTTP request, and a
+   * request over a half-open connection (dead Wi-Fi, NAT-dropped flow) answers
+   * NOTHING and errors NOTHING for minutes. Every clock that can flush — the
+   * outbox's own timer, the 3 s booster probe, the 5 s always-on probe — would
+   * otherwise start a FRESH POST for the same head op while the last one was
+   * still outstanding, and nothing records that an attempt is in progress, so
+   * nothing stopped them. Over a 100 s stall that is a POST every 3 s for the
+   * same op, and HTTP/1.1 gives one origin SIX connections: the outbox's own
+   * pile-up starves the `index.json` poll and the audio stream on the same
+   * host, i.e. the retry queue becomes the outage the app is trying to recover
+   * from. The caller settles the claim on the answer — or the queue forgets it
+   * wholesale on teardown — so a claim can never wedge the queue.
+   */
+  beginAttempt(): OutboxOp | null {
+    if (this.attemptOutstanding) return null;
+    const op = this.ops[0] ?? null;
+    if (op) this.attemptOutstanding = true;
+    return op;
+  }
+
+  /** True while a claimed attempt is still awaiting its answer. */
+  get attemptInFlight(): boolean {
+    return this.attemptOutstanding;
+  }
+
+  /** The answer arrived (success, failure or verdict): the flight is over. */
+  settleAttempt(): void {
+    this.attemptOutstanding = false;
   }
 
   /** The op an attempt would target next (the head — ops are independent, so
@@ -212,5 +247,9 @@ export class Outbox {
   /** Forget everything (a re-login or a full reload starts a clean outbox). */
   clear(): void {
     this.ops = [];
+    // A request cancelled mid-flight (the component was destroyed, so neither
+    // callback ever ran) must not leave the queue permanently unable to start
+    // one: forgetting the ops also forgets the claim on them.
+    this.attemptOutstanding = false;
   }
 }

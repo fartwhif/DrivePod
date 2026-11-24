@@ -1597,6 +1597,205 @@ exit 0`);
 
 
 }
+
+// ── 21. torn shufflebag.json / grabby-index.json — bytes nobody may act on ──
+// Both files live on the shared cache mount and JSON.parse(readFileSync(...))
+// sat UNGUARDED inside every consumer: a torn shufflebag.json 500'd the
+// watched toggle (AFTER the row was already marked — so the outbox retried
+// into the same 500 forever), aborted the harvest's distribution, and threw
+// inside pullFromShuffleBag BEFORE its exhaustion re-init, so nothing ever
+// healed it and the mix stayed dead until a container restart. A torn
+// grabby-index.json let initShuffleBag write [], throwing away the whole
+// rotation plus every `used` mark on bytes nobody could read — and
+// syncBagForWatched's un-watch re-add pruned the bag down to one entry
+// because the throw landed AFTER it had emptied the array in memory.
+// The rule now: `missing` and `unreadable` are DIFFERENT verdicts, a torn
+// read proves nothing and may never overwrite, and only a bounded
+// rebuild-from-the-catalog (the bag is derived entirely from the index) is
+// allowed to replace torn bytes.
+{
+  const BAGF = path.join(CACHE_DIR, 'shufflebag.json');
+  const BAGTMP = path.join(CACHE_DIR, 'shufflebag.tmp.json');
+  const GIDX = path.join(CACHE_DIR, 'grabby-index.json');
+  const TORN = '[{"videoId":"t21A","used":false}, {"videoI';   // a truncated write
+  const mkFile = (vid) => {
+    const dir = path.join(CACHE_DIR, vid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${vid}.mp3`), Buffer.alloc(1024, 0x41));
+  };
+  const t21Track = (vid) => {
+    mkFile(vid);
+    return { videoId: vid, title: `T ${vid}`, author: '', duration: 900, audioPath: `${vid}/${vid}.mp3`,
+      createdAt: new Date(Date.now() - 86400000).toISOString() };
+  };
+  const putFile = (p, s) => fs.writeFileSync(p, s);
+  const seedCatalog = (...vids) => putFile(GIDX, JSON.stringify(vids.map(t21Track), null, 2));
+  const seedBag = (entries) => putFile(BAGF, JSON.stringify(entries, null, 2));
+  const putRow21 = async (vid, watched = false) => {
+    await prisma.video.upsert({
+      where: { videoId: vid },
+      update: { watched },
+      create: { videoId: vid, channelId: 'UCGrabbyTube', title: `R ${vid}`,
+        publishedAt: new Date(Date.now() - 3600000), audioPath: `/cache/${vid}/${vid}.mp3`, duration: 900, isGrabby: true, watched }
+    });
+  };
+  const readRoute21 = async (verb, vid, body) => {
+    const r = await fetch(`http://127.0.0.1:3000/api/video/${vid}/watched`,
+      { method: verb, headers: { 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: r.status, body: await r.json().catch(() => null) };
+  };
+  const runQuiet21 = async (fn) => {
+    const real = { log: console.log, warn: console.warn, error: console.error };
+    const lines = [];
+    const rec = (...a) => lines.push(a.join(' '));
+    let err = null;
+    let val;
+    console.log = rec; console.warn = rec; console.error = rec;
+    try { val = await fn(); } catch (e) { err = e; }
+    finally { console.log = real.log; console.warn = real.warn; console.error = real.error; }
+    return { lines, err, val };
+  };
+  const has21 = (lines, needle) => lines.some(l => l.includes(needle));
+
+  const chan21 = 'UCt21Host';
+  await prisma.channel.upsert({ where: { channelId: chan21 }, update: { active: true },
+    create: { channelId: chan21, title: 't21 Host', order: 1, active: true } });
+  await prisma.video.deleteMany({ where: { videoId: { startsWith: 't21' } } });
+  for (const [k, v] of Object.entries({ grabbyMixEnabled: 'true', grabbyMixRatio: '1', grabbyClusterMaxSize: '7' })) await setCfg(k, v);
+  const cleanup21 = async () => {
+    await prisma.video.deleteMany({ where: { videoId: { startsWith: 't21' } } });
+    await prisma.channel.delete({ where: { channelId: chan21 } }).catch(() => {});
+    for (const p of [BAGF, BAGTMP, GIDX]) fs.rmSync(p, { force: true });
+  };
+
+  try {
+    // ── falsifiability: these torn bytes really do throw on THIS harness ──
+    // Every "the guard caught it" assertion below would also pass if the
+    // fixture were secretly parseable, so the raw parse has to throw first.
+    // Pre-fix that exception is what 500'd the toggle (the route's own catch
+    // turned it into `success:false`) and what made pull reject mid-harvest.
+    let parseThrew = false;
+    try { JSON.parse(TORN); } catch { parseThrew = true; }
+    t('§21 precondition: the torn fixture really fails JSON.parse (the hazard, not a fiction)', parseThrew);
+
+    // ── a torn bag HEALS: the rebuild-from-catalog path ──
+    // The bag is derived entirely from grabby-index.json, so an init is the
+    // repair; pre-fix the parse threw BEFORE this re-init could run, so the
+    // condition was permanent until a container restart.
+    fs.rmSync(BAGF, { force: true });
+    seedCatalog('t21A', 't21B');
+    putFile(BAGF, TORN);
+    const heal = await runQuiet21(() => server.pullFromShuffleBag(1));
+    const healed = (() => { try { return JSON.parse(fs.readFileSync(BAGF, 'utf-8')); } catch { return null; } })();
+    const healIds = new Set((healed || []).map(e => e.videoId));
+    t('torn bag + readable catalog: pull REBUILDS the bag from the catalog (the heal)',
+      heal.err === null && Array.isArray(heal.val) && heal.val.length === 1 && Array.isArray(healed),
+      `err=${heal.err?.message} pull=${JSON.stringify(heal.val)} bag=${fs.readFileSync(BAGF, 'utf-8').slice(0, 40)}`);
+    t('torn bag + readable catalog: the rebuild is logged (an operator can see the heal happen)',
+      has21(heal.lines, 'Bag unreadable') && has21(heal.lines, 'Initializing shufflebag'));
+    t('torn bag + readable catalog: every playable catalog item is in the new bag',
+      healIds.size === 2 && healIds.has('t21A') && healIds.has('t21B'), JSON.stringify(healed));
+    t('torn bag + readable catalog: the atomic write consumed its temp sibling', !fs.existsSync(BAGTMP));
+
+    // ── a torn bag with a torn catalog proves nothing and changes nothing ──
+    putFile(BAGF, TORN);
+    putFile(GIDX, TORN);
+    const both = await runQuiet21(() => server.pullFromShuffleBag(3));
+    t('torn bag + torn catalog: pulls 0 and leaves BOTH files byte-identical',
+      both.err === null && both.val.length === 0
+      && fs.readFileSync(BAGF, 'utf-8') === TORN && fs.readFileSync(GIDX, 'utf-8') === TORN,
+      `err=${both.err?.message} pull=${JSON.stringify(both.val)}`);
+    t('torn bag + torn catalog: the rebuild pass is BOUNDED (no recursion)',
+      has21(both.lines, 'still unreadable after the rebuild'), both.lines.join(' | '));
+    const rc21 = await runQuiet21(async () => server.reconcileShuffleBag(['t21A'], new Set(['t21A'])));
+    t('torn bag: reconcile returns zero, does not throw, and does not rewrite',
+      rc21.err === null && rc21.lines.length === 1 && rc21.lines[0].includes('proves nothing')
+      && JSON.stringify(rc21.val) === JSON.stringify({ returned: 0, dropped: 0, absent: 0 })
+      && fs.readFileSync(BAGF, 'utf-8') === TORN, JSON.stringify({ err: rc21.err?.message, val: rc21.val, lines: rc21.lines }));
+    let threwSync = false;
+    try { server.syncBagForWatched('t21A', true); } catch { threwSync = true; }
+    t('torn bag: syncBagForWatched does not throw and preserves the bytes',
+      !threwSync && fs.readFileSync(BAGF, 'utf-8') === TORN);
+
+    // ── the user-facing half: the watched toggle answers 200, not 500 ──
+    // Pre-fix the row WAS already marked watched when the parse threw, so the
+    // route answered 500 over a change that had landed — the outbox retried a
+    // settled op into the same torn file, each retry re-writing the row.
+    await putRow21('t21W1');   // mkFile first: updateIndexFile DROPS a grabby row whose MP3 is gone
+    mkFile('t21W1');
+    putFile(BAGF, TORN);
+    const wRes = await readRoute21('POST', 't21W1');
+    const wRow = await prisma.video.findUnique({ where: { videoId: 't21W1' } });
+    t('torn bag: marking watched answers 200 and the torn file survives untouched',
+      wRes.status === 200 && wRes.body?.success === true && fs.readFileSync(BAGF, 'utf-8') === TORN,
+      JSON.stringify(wRes));
+    t('torn bag: the watched mark itself still lands in the DB', wRow?.watched === true);
+
+    // ── distribution never burns rotation state on an unknown catalog ──
+    // The bag is only ever pruned against a catalog this process could READ;
+    // pullFromShuffleBag is what marks entries `used`, and it is never reached.
+    seedCatalog('t21A', 't21B');
+    seedBag([{ videoId: 't21A', used: false }, { videoId: 't21B', used: false }]);
+    const distBytes = TORN;
+    putFile(BAGF, distBytes);
+    putFile(GIDX, TORN);
+    await prisma.video.create({
+      data: { videoId: 't21Normal', channelId: chan21, title: 'Normal podcast',
+        publishedAt: new Date(Date.now() - 7200000), audioPath: '/cache/t21Normal/t21Normal.mp3', duration: 900 }
+    });
+    mkFile('t21Normal');
+    await prisma.video.deleteMany({ where: { isGrabby: true } });   // an empty band: the run must reach the index read
+    const grabbyBefore = await prisma.video.count({ where: { isGrabby: true } });
+    const dist = await runQuiet21(() => server.distributeGrabbyItems());
+    const grabbyAfter = await prisma.video.count({ where: { isGrabby: true } });
+    t('torn grabby-index: distribute places nothing and BURNS no used-marks',
+      dist.err === null && has21(dist.lines, 'grabby-index.json unreadable — no distribution this run')
+      && fs.readFileSync(BAGF, 'utf-8') === distBytes && grabbyAfter === grabbyBefore,
+      `err=${dist.err?.message} grabbyRows=${grabbyBefore}->${grabbyAfter}`);
+
+    // ── init: an unreadable catalog must NOT become an empty catalog ──
+    // The old code's worst loss: writing [] on a read that proved nothing
+    // deleted the whole rotation plus every `used` mark.
+    seedBag([{ videoId: 't21A', used: true }, { videoId: 't21B', used: true }]);
+    putFile(GIDX, TORN);
+    const init = await runQuiet21(() => server.initShuffleBag());
+    t('torn grabby-index: initShuffleBag leaves the bag UNTOUCHED — never a blanking []',
+      init.err === null && has21(init.lines, 'shufflebag.json left untouched')
+      && fs.readFileSync(BAGF, 'utf-8') === JSON.stringify([{ videoId: 't21A', used: true }, { videoId: 't21B', used: true }], null, 2),
+      `err=${init.err?.message} bag=${fs.readFileSync(BAGF, 'utf-8').slice(0, 80)}`);
+
+    // ── un-watch with a torn catalog: the tail-insert waits for the heal ──
+    // Pre-fix the throw landed AFTER `bag.splice(at,1)` emptied the in-memory
+    // array, and the writeFileSync at the end of the function persisted the
+    // pruning: the rotation collapsed to whatever was left.
+    await putRow21('t21W2', true);
+    mkFile('t21W2');
+    putFile(GIDX, TORN);
+    const uBytes = fs.readFileSync(BAGF, 'utf-8');
+    const uRes = await readRoute21('PATCH', 't21W2', { watched: false });
+    const uRow = await prisma.video.findUnique({ where: { videoId: 't21W2' } });
+    t('torn grabby-index: un-watch answers 200, flips the row, and does not prune the bag',
+      uRes.status === 200 && uRow?.watched === false && fs.readFileSync(BAGF, 'utf-8') === uBytes,
+      JSON.stringify(uRes));
+
+    // ── the chain that used to corrupt: sync on torn index + torn bag ──
+    putFile(BAGF, TORN);
+    let threwChain = false;
+    try { server.syncBagForWatched('t21W2', false); } catch { threwChain = true; }
+    t('torn index + torn bag: the un-watch chain neither throws nor rewrites either file',
+      !threwChain && fs.readFileSync(BAGF, 'utf-8') === TORN && fs.readFileSync(GIDX, 'utf-8') === TORN);
+
+    // ── a missing bag is a different verdict from a torn one ──
+    fs.rmSync(BAGF, { force: true });
+    seedCatalog('t21A');
+    const miss = await runQuiet21(() => server.pullFromShuffleBag(2));
+    t('missing bag (first boot): pulls 0 and says so — no rebuild storm',
+      miss.err === null && miss.val.length === 0 && has21(miss.lines, 'No shufflebag file'), JSON.stringify({ err: miss.err?.message, lines: miss.lines }));
+  } finally {
+    await cleanup21();
+  }
+}
 await prisma.$disconnect();
 console.log(fail === 0 ? `\nT2 PASS — ${pass} assertions\n` : `\nT2 FAIL — ${fail}/${pass + fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);

@@ -159,7 +159,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
    // SKIP MARKS WATCHED: treat skip-next as if the track finished playing
    skipMarksWatched = signal(false);
 
-  private readonly APP_VERSION = '1.17.0';   // ← bumped for the outbox + non-defect media errors
+  private readonly APP_VERSION = '1.18.0';   // ← bumped for the hung-probe fix (HEAD timeout + single-flight)
 
   activeTab = signal<'queue' | 'harvest' | 'settings' | 'import' | 'protected' | 'watched'>('queue');
   protectedPlaylist = signal<Video[]>([]);
@@ -221,6 +221,20 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   // Index fetch reachability: track whether backend is online for index polling
   private backendOnline = true;
   private indexFetchPending = false;
+
+  // Probe hygiene for `_doConnectivityProbe` — BOTH probes delegate to it. A
+  // half-open TCP connection (dead Wi-Fi, NAT drop, phone out of coverage)
+  // answers NOTHING and never errors, so a bare `fetch` sits for the browser's
+  // multi-minute connect timeout. Two real bugs follow: `setInterval` piles a
+  // fresh request onto every stalled one, and `_runStallCheck()` runs on this
+  // promise's continuations — so while a probe hangs the stall watchdog gets no
+  // tick at all and a dead stream is never reloaded. Timeout + single-flight.
+  private readonly PROBE_TIMEOUT_MS = 4500;
+  private _probeInFlight = false;
+  private _probeTimeoutTimer: number | null = null;
+  /** Set by `cleanup()`: a probe continuation already dispatched from a dead
+   *  component must not decide anything about a detached audio element. */
+  private _destroyed = false;
 
   // Playback retry state (HEAD probe before play)
   private _playRetryTimer: any = null;
@@ -412,6 +426,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private cleanup() {
+    // First thing, so nothing still in flight can act on a torn-down player:
+    // every async path (probe verdict, stall tick, play retry) checks it.
+    this._destroyed = true;
     // Stop audio player
     this.audio.pause();
     this.audio.src = '';
@@ -426,6 +443,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     if (this.connectivityProbeTimer) clearInterval(this.connectivityProbeTimer);
     this.connectivityProbeTimer = null;
     this._stopAlwaysOnProbe();
+    // A probe still outstanding at teardown: drop its deadline (an abort that
+    // fires after the component is gone would settle onto a dead element), and
+    // `_destroyed` stops any continuation already dispatched from it.
+    if (this._probeTimeoutTimer) {
+      clearTimeout(this._probeTimeoutTimer);
+      this._probeTimeoutTimer = null;
+    }
+    this._probeInFlight = false;
     this._clearPlayRetry();
     this.outbox.clear();
     this._dropInProgress = false;
@@ -796,13 +821,21 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.outboxTimer = setTimeout(() => this.flushOutbox(), this.outbox.nextDelayMs());
   }
 
-  /** Attempt the head op, once. */
+  /** Attempt the head op, once — and never a second time while one is out. */
   private flushOutbox(): void {
     clearTimeout(this.outboxTimer);
     this.outboxTimer = null;
-    const op = this.outbox.head();
+    // Three clocks can reach this method: the op's own backoff timer, the 3 s
+    // booster probe and the 5 s always-on probe. A POST over a half-open
+    // connection answers nothing for minutes, so without a claim each tick
+    // would start ANOTHER one for the same op — a new request every 3 s for the
+    // whole stall, on a browser pool of six connections per origin, which is
+    // enough to starve the `index.json` poll and the audio stream too. The
+    // outstanding attempt owns the next step: it settles itself and re-arms the
+    // clock from its own verdict, so an early return here is a wait, not a stall.
+    const op = this.outbox.beginAttempt();
     if (!op) {
-      this.stopConnectivityProbe();
+      if (this.outbox.isEmpty) this.stopConnectivityProbe();
       return;
     }
 
@@ -812,6 +845,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     req.subscribe({
       next: () => {
+        this.outbox.settleAttempt();
         this.outbox.succeed(op.videoId);
         // Ops are independent, so a success is followed by the next one at once:
         // the only wait ever owed is the one a failure earned.
@@ -819,6 +853,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         else this.flushOutbox();
       },
       error: (err: unknown) => {
+        // The answer landed (whatever it said), so the flight is over and the
+        // re-armed clock below is allowed to claim the next attempt.
+        this.outbox.settleAttempt();
         const status = err instanceof HttpErrorResponse ? err.status : null;
         const kind = classifyFailure(status);
         if (kind === 'permanent') {
@@ -875,10 +912,49 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this._wasPlayingBeforeDrop = !!this.currentVideo() && (!this.audio.paused || this.audio.error !== null);
   }
 
-  /** Lightweight HEAD probe to check if backend is reachable. */
+  /**
+   * Lightweight HEAD probe to check if backend is reachable — and the ONLY
+   * place the outage verdict is computed, so BOTH the 3 s booster probe and the
+   * 5 s always-on probe (and therefore the playback stall watchdog, whose tick
+   * runs at the end of every verdict) share one answer.
+   *
+   * Two guards, because a bare `fetch` to a half-open socket is not a promise
+   * that settles:
+   *  - `signal` + PROBE_TIMEOUT_MS: a connection that answers nothing (Wi-Fi
+   *    association dead, NAT dropped the flow, phone out of coverage) produces
+   *    neither a response nor an error for minutes. Without a deadline the
+   *    watchdog tick that lives on THIS promise would simply never run again,
+   *    i.e. the one failure mode stall-guard.ts exists for (a silent socket)
+   *    turned into "no watchdog at all" instead of "reload the stream".
+   *  - single-flight: while one probe is outstanding, the interval handler
+   *    would otherwise queue another every 3-5 s for the whole life of the
+   *    stall, and their continuations would all land at once and each increment
+   *    or reset the failure count.
+   * A timeout IS unreachability, so it feeds the same failure path.
+   */
   private _doConnectivityProbe(): void {
+    if (this._probeInFlight) return;
+    this._probeInFlight = true;
+
+    const ctrl = new AbortController();
+    this._probeTimeoutTimer = setTimeout(() => ctrl.abort(), this.PROBE_TIMEOUT_MS);
+
+    // One settle path so the in-flight flag, the timer and the watchdog tick
+    // cannot diverge between the ways this promise can end.
+    const settle = (): void => {
+      this._probeInFlight = false;
+      if (this._probeTimeoutTimer) {
+        clearTimeout(this._probeTimeoutTimer);
+        this._probeTimeoutTimer = null;
+      }
+      // Watchdog tick, after the verdict: a HEAD failure is what hands recovery
+      // to the outage machinery, so it must be known before the tick decides
+      // whether a reload is due.
+      this._runStallCheck();
+    };
+
     const probeHeaders: Record<string, string> = {};
-    fetch(`${this.apiUrl}/config`, { method: 'HEAD', headers: probeHeaders })
+    fetch(`${this.apiUrl}/config`, { method: 'HEAD', headers: probeHeaders, signal: ctrl.signal })
       .then(res => {
         if (res.ok || res.status === 401) {
           if (this._consecutiveProbeFails > 0) {
@@ -910,10 +986,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           this._consecutiveProbeFails++;
           if (this._consecutiveProbeFails === 3) this._snapshotPlaybackStateOnDrop();
         }
-        // Watchdog tick, after the verdict: a HEAD failure is what
-        // hands recovery to the outage machinery, so it must be known
-        // before the tick decides whether a reload is due.
-        this._runStallCheck();
+        // Verdict recorded, so the watchdog tick runs as the LAST act of a
+        // settled probe: it always sees this request's reachability answer, and
+        // it runs exactly once per request whether the answer was up or down.
+        settle();
       })
       .catch(() => {
         this._consecutiveProbeFails++;
@@ -921,7 +997,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
           console.warn('Backend unreachable (3 consecutive probe failures)');
           this._snapshotPlaybackStateOnDrop();
         }
-        this._runStallCheck();
+        settle();
       });
   }
 
@@ -1903,6 +1979,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   /** One watchdog tick, run after every connectivity probe verdict. */
   private _runStallCheck(): void {
+    // A verdict already in flight when the component went away must not drive
+    // a reload on a detached element: pause/src/load have run, the phase is
+    // 'idle', and a `recover` here would re-arm a load nothing owns.
+    if (this._destroyed) return;
     const video = this.currentVideo();
     const now = Date.now();
     // A resumed tab runs the shortened budget (its clock is stale by

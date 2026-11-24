@@ -663,6 +663,38 @@ a duration ratio, so the player is never silent.
   `initShuffleBag` set-asides any watched grabby row, a watched row pulled mid-run
   is pruned rather than reconditioned, and the
   `/api/video/:id/watched` hooks (`syncBagForWatched`) add or drop entries directly.
+  **Read through `readShuffleBag()` and written through `writeShuffleBag()`, never
+  bare `JSON.parse(readFileSync(...))` / `writeFileSync`** — see the torn-bytes rule
+  below.
+
+**Torn bytes are not a verdict** (fixed 2026-11-23). `readJsonFile` returns a
+tri-state — `missing` | `unreadable` | `ok` — and the two failure kinds get
+**opposite answers**, because "there is no file" is a fact to act on while "the
+bytes are wrong" says nothing about the catalog:
+
+| read | meaning | what a caller may do |
+|---|---|---|
+| `missing` | the file does not exist | seed it (the bag is derived from the index) |
+| `unreadable` | bytes present, unparseable / not an array | **change nothing on disk** |
+| `ok` | parsed | normal handling (malformed *entries* still tolerated: a missing `used` reads unused) |
+
+Before this, every consumer sat INSIDE the `JSON.parse` throw, so one truncated
+`shufflebag.json` (kill between truncate and close — the in-place
+`writeFileSync` did exactly that — or this cache mount's documented
+post-publication corruption) 500'd `PATCH /api/video/:id/watched` *after* the row
+was already marked (so the outbox retried into the same 500 forever), aborted the
+harvest's distribution, and threw inside `pullFromShuffleBag` BEFORE its
+exhaustion re-init, i.e. nothing could ever heal it short of a container restart.
+A torn `grabby-index.json` was worse: `initShuffleBag` answered it by writing `[]`
+— wiping the rotation plus every `used` mark on bytes nobody could read — and
+`syncBagForWatched`'s un-watch re-add pruned the bag to ONE entry, because its
+`isGrabbyAuthored` throw landed *after* it had emptied the array in memory.
+`loadGrabbyIndex()` now returns `null` (= catalog UNKNOWN) on unreadable bytes, and
+the bag is only ever replaced by a bounded rebuild-from-the-catalog.
+`writeShuffleBag` writes sibling temp + rename and skips byte-identical rewrites,
+the same discipline `index.json`/`progress.json` already used, which removes the
+truncation these readers exist to survive. T2 §21 is the gate.
+
 - **`resolveGrabbyAudioPath(videoId, audioPath)`** — the single resolver
   for grabby file paths: returns the literal path (absolute as-is, relative
   joined to CACHE_DIR) when the file exists, else the canonical
@@ -1270,7 +1302,7 @@ after every connectivity-probe verdict, so it needs no timer of its own):
 ### 12.5 Network resilience (the car-environment design)
 
 - The policy is the pure module `retry-policy.ts` (`Outbox`, `classifyFailure`,
-  `retryDelayMs`); **T7** `node tests/retry-policy.test.mjs` (53 assertions, no
+  `retryDelayMs`); **T7** `node tests/retry-policy.test.mjs` (66 assertions, no
   browser, no network, no build) drives it. Wiring in `app.component.ts` keeps the
   signals honest in the same tick: `markAsWatched` / `saveProgress` enqueue AND patch
   `rawIndex`, and `_localWatched` pins a watched id out of every derived queue until
@@ -1297,6 +1329,23 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   status is an ANSWER, so proving the server reachable proves nothing about it —
   otherwise "HEAD 200 but POST 500" becomes a flat 3 s hammering loop instead of a
   backoff.
+- **ONE request in flight, whoever asks for it** (`Outbox.beginAttempt()` /
+  `settleAttempt()` / `attemptInFlight`). Three clocks can reach `flushOutbox()`: the
+  head op's own backoff timer, the 3 s booster probe and the 5 s always-on probe. A
+  POST over a half-open socket answers nothing for minutes, so a claim-free flush
+  started a FRESH request for the SAME head op on every tick that found the backend
+  reachable — T7's model of the app's own clocks (one reset, then 100 s of silence)
+  issues **57 unanswered POSTs** against one mark, **48** of them queued at once against
+  an origin Chrome gives **six** connections to, which stalls every `index.json` poll and
+  audio stream on that host too (the same pool exhaustion the hung probe shows from the
+  other side) — and 19 of those died at the client deadline, each death a verdict the
+  subscription reports, so the op climbed to **20 attempts** on requests the server never
+  saw. `beginAttempt()` hands out the head op ONLY if
+  nothing is outstanding; the outstanding flight owns the next step (it settles from
+  its own answer and `_armOutboxClock()` re-arms), so `flushOutbox()` returning early
+  is a wait, not a stall. `clear()` releases the claim, because teardown is the one
+  path where neither callback runs (Angular drops the subscription), and a stale
+  claim would leave a rebuilt outbox mute for its whole life.
 - **Two probes, one verdict.** *Always-on*: `HEAD /api/config` every 5 s
   (`ALWAYS_ON_PROBE_INTERVAL`) — that is the outage machinery. *On demand*
   (`probeBackend()`, `PROBE_INTERVAL` 3 s): armed by `outbox.enqueue()` and
@@ -1308,6 +1357,32 @@ after every connectivity-probe verdict, so it needs no timer of its own):
   **401** clears the count and runs the recovery paths, any other status keeps
   counting. The watchdog tick runs AFTER the verdict, because a probe failure is
   what hands a dead stream to the outage machinery.
+- **Every probe carries a deadline and only one is in flight at a time** (fixed
+  2026-11-23, `PROBE_TIMEOUT_MS` 4.5 s + `_probeInFlight`). A bare `fetch` to a
+  **half-open** TCP connection (Wi-Fi association dead, NAT dropped the flow, phone
+  out of coverage) is not a promise that settles: it answers nothing and errors
+  nothing for the browser's multi-minute connect timeout. The E2E A/B against a
+  black-hole port showed exactly that — six HEAD requests stacked at 5 s intervals,
+  none ever answered, so `_consecutiveProbeFails` never reached 3, the
+  `Backend unreachable` verdict never fired, and no outage snapshot was ever taken:
+  the interval kept firing, but the sixth stacked request held the last slot in the
+  origin's connection pool, so nothing after it even reached the server.
+  Worse, `_runStallCheck()` runs on this promise's continuations (§12.3): while a
+  probe hangs, the playback stall watchdog gets **no tick at all**, so the one
+  failure mode `stall-guard.ts` exists for (a socket that answers nothing) became
+  "no watchdog" instead of "reload the stream". Both halves are load-bearing: the
+  `signal` guarantees a verdict, the single-flight flag guarantees exactly one —
+  without it the queued continuations all land at once and each moves the failure
+  count. A timeout IS unreachability, so it feeds the same failure path. Measured
+  after the fix: outstanding never exceeded 1, every request aborted by the client
+  4.50 s after arrival (arrivals 6.14 / 11.14 / 16.14 s), verdict on the 3rd settle
+  ~20 s after load. The pre-fix run also showed what the stacked requests cost
+  beyond the failure count: **arrivals stopped at six while the interval kept
+  firing** — Chrome allows six concurrent connections per origin, so the hung HEADs
+  occupied the entire pool and a page-side `fetch` of a DIFFERENT path on that
+  origin never completed either. One hung probe therefore stalls every
+  `index.json` poll, every outbox POST and the audio stream itself. Teardown drops
+  the deadline so an abort cannot settle onto a dead element.
 - **On recovery** (the count dropping to 0, so once per outage rather than once per
   probe): resume any pending playback retry immediately; reload audio **only if it
   was playing before the drop** (`recoverAudioPlayback()` — a paused track stays
@@ -1517,6 +1592,13 @@ headers), and the always-on probe must send it too.
     count, `MEDIA_ERR_NETWORK` marking a half-heard track watched, and a
     `deleteTempCookiesFile` throw that left `isHarvesting` true for the life of the
     process. T2 §20, T4 and T7 are the gates.
+16. **Unreadable bytes are never a verdict** (2026-11-23): a shared-cache JSON
+    read distinguishes `missing` (act: seed) from `unreadable` (change nothing on
+    disk), and a bag/catalog rebuild may only be triggered by a bounded
+    derivation from a file it CAN read (§9). A connectivity probe always answers:
+    deadline + single-flight, so a half-open socket cannot starve the outage verdict
+    or the watchdog tick that hangs off it (§12.5). T2 §21 is the gate for the
+    first half; the second is proven by the black-hole-port A/B recorded there.
 
 ---
 

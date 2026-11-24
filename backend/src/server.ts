@@ -47,6 +47,7 @@ const PROGRESS_JSON_PATH = path.join(CACHE_DIR, 'progress.json');
 const PROGRESS_TEMP_PATH = path.join(CACHE_DIR, 'progress.tmp.json');
 const GRABBY_INDEX_PATH = path.join(CACHE_DIR, 'grabby-index.json');
 const SHUFFLEBAG_JSON_PATH = path.join(CACHE_DIR, 'shufflebag.json');
+const SHUFFLEBAG_TEMP_PATH = path.join(CACHE_DIR, 'shufflebag.tmp.json');
 const GRABBY_CHANNEL_ID = 'UCGrabbyTube';
 
 const prisma = new PrismaClient();
@@ -530,6 +531,78 @@ interface ShuffleBagEntry {
 }
 
 /**
+ * One tri-state JSON read, shared by every reader of the two `cache/` files
+ * whose bytes this process cannot guarantee: `shufflebag.json` (written here,
+ * but read from a route, a 5-min cron and the boot chain) and
+ * `grabby-index.json` (written by GrabbyTube across a shared mount).
+ *
+ * `JSON.parse(readFileSync(...))` throwing is NOT a nothing-happens failure.
+ * Every consumer sat INSIDE that throw, so one bad read 500'd the watched
+ * toggle, aborted the harvest's distribution, and aborted the boot chain
+ * before the artist backfill — and nothing on a later run could heal it,
+ * because every heal path needed a successful parse of the same bytes. A
+ * truncated file (a kill between truncate and close, or this cache mount's
+ * documented post-publication corruption) is exactly the failure that never
+ * recovers by itself.
+ *
+ * `missing` and `unreadable` are kept apart because the right answer differs:
+ * "there is no file" is a fact to act on (write the bag, treat the catalog as
+ * empty), while "the bytes are wrong" says nothing about the catalog and must
+ * not be allowed to change anything on disk.
+ */
+type JsonRead =
+  | { kind: 'ok'; data: unknown }
+  | { kind: 'missing' }
+  | { kind: 'unreadable'; error: string };
+
+function readJsonFile(file: string, label: string): JsonRead {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return { kind: 'missing' };
+    const error = e?.message ?? String(e);
+    console.warn(`⚠️ [${label}] ${file} unreadable (${error}) — this read proves nothing`);
+    return { kind: 'unreadable', error };
+  }
+  try {
+    return { kind: 'ok', data: JSON.parse(raw) };
+  } catch (e: any) {
+    const error = e?.message ?? String(e);
+    console.warn(`⚠️ [${label}] ${file} is not valid JSON (${error}) — this read proves nothing`);
+    return { kind: 'unreadable', error };
+  }
+}
+
+/** shufflebag.json as entries. `unreadable` never means "empty": a bag rebuilt
+ * from bytes we cannot interpret would wipe the rotation and re-draw the items
+ * the user has already heard. Malformed ENTRIES are tolerated as before (a
+ * missing `used` reads as unused); only a non-array is a verdict of "torn". */
+type BagRead =
+  | { kind: 'ok'; entries: ShuffleBagEntry[] }
+  | { kind: 'missing' }
+  | { kind: 'unreadable'; error: string };
+
+function readShuffleBag(): BagRead {
+  const r = readJsonFile(SHUFFLEBAG_JSON_PATH, 'ShuffleBag');
+  if (r.kind !== 'ok') return r;
+  if (!Array.isArray(r.data)) {
+    console.warn(`⚠️ [ShuffleBag] shufflebag.json is ${typeof r.data}, not an array — this read proves nothing`);
+    return { kind: 'unreadable', error: `not an array (${typeof r.data})` };
+  }
+  return { kind: 'ok', entries: r.data as ShuffleBagEntry[] };
+}
+
+/** Persist the bag the way index.json/progress.json are persisted — sibling
+ * temp + rename, and no write at all when the bytes are identical. That also
+ * removes the truncation the readers above exist to survive: the old
+ * writeFileSync truncated the file in place, so a kill mid-write is what
+ * produced the unreadable bag in the first place. */
+function writeShuffleBag(entries: ShuffleBagEntry[]): void {
+  writeIfChanged(SHUFFLEBAG_JSON_PATH, SHUFFLEBAG_TEMP_PATH, JSON.stringify(entries, null, 2), 'shufflebag.json');
+}
+
+/**
  * GrabbyTube tracks are grouped under per-artist placeholder channels:
  * channelId = 'UCGrabbyTube' + base64url(artist), title = artist. The SPA /
  * car head unit already display "channel name = artist", so grabby tracks
@@ -579,6 +652,10 @@ async function ensureGrabbyArtistChannel(artist: string): Promise<string> {
  */
 async function backfillGrabbyArtistChannels(): Promise<void> {
   const grabbyMap = loadGrabbyIndex();
+  if (grabbyMap === null) {
+    console.log(`⏭️ [GrabbyArtists] grabby-index.json unreadable — skipping the artist backfill`);
+    return;
+  }
   if (grabbyMap.size === 0) return;
   const rows = await prisma.video.findMany({
     where: { isGrabby: true },
@@ -624,9 +701,17 @@ export async function initShuffleBag(): Promise<void> {
     create: { channelId: GRABBY_CHANNEL_ID, title: 'GrabbyTube', order: 999999, active: false }
   });
 
-  if (!fs.existsSync(GRABBY_INDEX_PATH)) {
+  const grabbyIndex = loadGrabbyIndex();
+  if (grabbyIndex === null) {
+    // An unparseable catalog is NOT an empty one: writing [] here would throw
+    // away the whole rotation (and every `used` mark) on bytes we cannot read.
+    // The file stays as it is and the next initialization reads it again.
+    console.log(`⏭️ [ShuffleBag] grabby-index.json unreadable — shufflebag.json left untouched`);
+    return;
+  }
+  if (grabbyIndex.size === 0 && !fs.existsSync(GRABBY_INDEX_PATH)) {
     console.log(`⚠️ [ShuffleBag] No ${GRABBY_INDEX_PATH} found — shufflebag disabled`);
-    fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify([], null, 2));
+    writeShuffleBag([]);
     return;
   }
 
@@ -647,7 +732,7 @@ export async function initShuffleBag(): Promise<void> {
   );
   const valid: ShuffleBagEntry[] = [];
   let playedSkipped = 0;
-  for (const item of loadGrabbyIndex().values()) {
+  for (const item of grabbyIndex.values()) {
     const mp3Path = resolveGrabbyAudioPath(item.videoId, item.audioPath);
     if (!fs.existsSync(mp3Path)) {
       console.log(`   🗑️ [ShuffleBag] Skipping defunct item: ${item.videoId} (no MP3)`);
@@ -663,7 +748,7 @@ export async function initShuffleBag(): Promise<void> {
     [valid[i], valid[j]] = [valid[j], valid[i]];
   }
 
-  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(valid, null, 2));
+  writeShuffleBag(valid);
   console.log(`✅ [ShuffleBag] Initialized with ${valid.length} valid items (shuffled${playedSkipped ? `, ${playedSkipped} played-and-set-aside` : ''})`);
 }
 
@@ -671,13 +756,24 @@ export async function initShuffleBag(): Promise<void> {
  * Pull N unused items from the shufflebag. Reinitializes when exhausted.
  * Returns the pulled items (marks them as used).
  */
-async function pullFromShuffleBag(count: number, reinitialized = false): Promise<ShuffleBagEntry[]> {
-  if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) {
+export async function pullFromShuffleBag(count: number, reinitialized = false): Promise<ShuffleBagEntry[]> {
+  const read = readShuffleBag();
+  if (read.kind === 'missing') {
     console.log(`⚠️ [ShuffleBag] No shufflebag file — pulling 0 items`);
     return [];
   }
-
-  const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
+  if (read.kind === 'unreadable') {
+    // A torn bag IS recoverable, and this is the only reader on a schedule: the
+    // bag is derived entirely from grabby-index.json, so an initialization
+    // rebuilds it. The parse used to throw BEFORE the exhaustion re-init below,
+    // so nothing ever healed it — the mix stayed dead until a container
+    // restart. Bounded by `reinitialized`: this is the second and last pass.
+    console.log(`🔁 [ShuffleBag] Bag unreadable (${read.error}) — ${reinitialized ? 'still unreadable after the rebuild — pulling 0 items' : 'rebuilding it from the catalog'}`);
+    if (reinitialized) return [];
+    await initShuffleBag();
+    return pullFromShuffleBag(count, true);
+  }
+  const bag = read.entries;
 
   const unused = bag.filter(e => !e.used);
   if (unused.length === 0) {
@@ -697,7 +793,7 @@ async function pullFromShuffleBag(count: number, reinitialized = false): Promise
     entry.used = true;
   }
 
-  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(bag, null, 2));
+  writeShuffleBag(bag);
   console.log(`🎵 [ShuffleBag] Pulled ${pulled.length} items (${bag.filter(e => e.used).length} used / ${bag.length} total)`);
   return pulled;
 }
@@ -738,10 +834,13 @@ export function reconcileShuffleBag(
   returnIds: string[], indexIds: Set<string>, pruneIds: string[] = []
 ): { returned: number; dropped: number; absent: number } {
   const none = { returned: 0, dropped: 0, absent: 0 };
-  if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) return none;
+  const read = readShuffleBag();
+  // missing: nothing to reconcile. unreadable: logged, and the file is left
+  // EXACTLY as it is, so a later run can still act on the bag.
+  if (read.kind !== 'ok') return none;
   const back = new Set(returnIds);
   const played = new Set(pruneIds);
-  const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
+  const bag = read.entries;
   const absent = indexIds.size > 0
     ? bag.reduce((n, e) => (indexIds.has(e.videoId) ? n : n + 1), 0) : 0;
   const pruning = absent > 0 && absent <= Math.max(1, Math.floor(bag.length * 0.1));
@@ -754,7 +853,7 @@ export function reconcileShuffleBag(
     else kept.push(entry);
   }
   if (revived.length === 0 && dropped === 0) return { ...none, absent };
-  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify([...kept, ...revived], null, 2));
+  writeShuffleBag([...kept, ...revived]);
   return { returned: revived.length, dropped, absent };
 }
 
@@ -773,19 +872,22 @@ export function reconcileShuffleBag(
  * because the ownership guard refuses to convert the row.
  */
 export function syncBagForWatched(videoId: string, watched: boolean): void {
-  if (!fs.existsSync(SHUFFLEBAG_JSON_PATH)) return;
-  const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
+  const read = readShuffleBag();
+  if (read.kind !== 'ok') return;
+  const bag = read.entries;
   const at = bag.findIndex(e => e.videoId === videoId);
   if (watched) {
     if (at < 0) return;
     bag.splice(at, 1);
   } else {
     if (at >= 0) return;
-    const item = loadGrabbyIndex().get(videoId);
+    const index = loadGrabbyIndex();
+    if (index === null) return;
+    const item = index.get(videoId);
     if (!item || !fs.existsSync(resolveGrabbyAudioPath(videoId, item.audioPath))) return;
     bag.push({ videoId, used: false });
   }
-  fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(bag, null, 2));
+  writeShuffleBag(bag);
 }
 
 /**
@@ -803,7 +905,11 @@ export function isGrabbyAuthored(meta: any): boolean {
 
 /**
  * Load grabby-index.json as a map videoId -> metadata, keeping only the
- * entries GrabbyTube authored (see isGrabbyAuthored).
+ * entries GrabbyTube authored (see isGrabbyAuthored). Returns null when the
+ * bytes are there but unparseable: "the catalog is UNKNOWN", which every
+ * caller must treat as "change nothing" — never as "the catalog is empty",
+ * because seeding the bag from or pruning it against unreadable bytes would
+ * wipe rotation state those bytes have no authority to disprove.
  *
  * The cache dir is shared with DrivePod, so an index built by a bare folder
  * sweep lists videos another app owns. Treating those as music is exactly what
@@ -812,9 +918,17 @@ export function isGrabbyAuthored(meta: any): boolean {
  * index — bag seeding, distribution, artist backfill, the startup revert — sees
  * only library tracks.
  */
-function loadGrabbyIndex(): Map<string, any> {
-  if (!fs.existsSync(GRABBY_INDEX_PATH)) return new Map();
-  const grabbyIndex: any[] = JSON.parse(fs.readFileSync(GRABBY_INDEX_PATH, 'utf-8'));
+function loadGrabbyIndex(): Map<string, any> | null {
+  const read = readJsonFile(GRABBY_INDEX_PATH, 'GrabbyIndex');
+  if (read.kind === 'missing') return new Map();
+  if (read.kind !== 'ok' || !Array.isArray(read.data)) {
+    // null means "the catalog is UNKNOWN right now", never "the catalog is
+    // empty": every consumer either seeds shufflebag.json from the index or
+    // prunes against it, and both would wipe rotation state that unparseable
+    // bytes have no authority to disprove.
+    return null;
+  }
+  const grabbyIndex: any[] = read.data;
   const map = new Map<string, any>();
   let foreign = 0;
   for (const item of grabbyIndex) {
@@ -1185,6 +1299,10 @@ export async function distributeGrabbyItems(): Promise<void> {
 
   // Load grabby index for metadata lookups
   const grabbyMap = loadGrabbyIndex();
+  if (grabbyMap === null) {
+    console.log(`⏭️ [ShuffleBag] grabby-index.json unreadable — no distribution this run`);
+    return;
+  }
 
   // Pull only as many candidates as the plan could place: the count deficit, or
   // the fewest items that could still reach the budget with the longest tracks
@@ -3654,16 +3772,10 @@ app.delete('/api/video/:videoId/grabby', async (req, res) => {
   const deleted = await prisma.video.deleteMany({ where: { videoId, isGrabby: true } });
 
   // Remove from shufflebag so it can't be re-distributed
-  if (fs.existsSync(SHUFFLEBAG_JSON_PATH)) {
-    try {
-      const bag: ShuffleBagEntry[] = JSON.parse(fs.readFileSync(SHUFFLEBAG_JSON_PATH, 'utf-8'));
-      const filtered = bag.filter(e => e.videoId !== videoId);
-      if (filtered.length !== bag.length) {
-        fs.writeFileSync(SHUFFLEBAG_JSON_PATH, JSON.stringify(filtered, null, 2));
-      }
-    } catch (e: any) {
-      console.warn(`⚠️ [GRABBY-DELETE] Could not prune shufflebag:`, e.message);
-    }
+  const read = readShuffleBag();
+  if (read.kind === 'ok') {
+    const filtered = read.entries.filter(e => e.videoId !== videoId);
+    if (filtered.length !== read.entries.length) writeShuffleBag(filtered);
   }
 
   await updateIndexFile();
